@@ -2114,6 +2114,28 @@ func TestCoordinatorRecoversQueuedApprovalHandoff(t *testing.T) {
 		first.Close()
 		t.Fatal("等待审批 handoff 测试超时")
 	}
+	// CreateApproval happens before the invocation CAS inside the serialized
+	// approval boundary. Wait for the whole boundary to become durable before
+	// simulating a coordinator crash; observing the repository directly here
+	// bypasses the approval lock used by the public resolution path.
+	boundaryDurable := false
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		current, getErr := repo.GetInvocation(ctx, invocation.ID)
+		if getErr != nil {
+			first.Close()
+			t.Fatal(getErr)
+		}
+		if current.Status == InvocationWaitingApproval && current.ActiveApprovalID == approvalID {
+			boundaryDurable = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !boundaryDurable {
+		first.Close()
+		t.Fatal("审批边界未完整持久化")
+	}
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
