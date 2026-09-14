@@ -2,6 +2,7 @@ package agent
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"google.golang.org/genai"
@@ -136,5 +137,37 @@ func TestToolRegistrySearchOmitsSchema(t *testing.T) {
 	items := registry.Search("计算", nil, ToolSourceBuiltin, "", 10)
 	if len(items) != 1 || items[0].InputSchema != nil || items[0].OutputSchema != nil {
 		t.Fatalf("search result should be bounded descriptor: %#v", items)
+	}
+}
+
+func TestToolSetSnapshotIDIsScopedToInvocation(t *testing.T) {
+	registry := NewToolRegistry()
+	if _, err := registry.Register(ToolDescriptor{ID: "builtin.one", ModelName: "one", Version: "1.0.0", Source: ToolSourceBuiltin}, registryTestTool{name: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	selectFor := func(invocationID string) ToolSetSnapshot {
+		t.Helper()
+		selection, err := registry.Select(ToolSelectionRequest{InvocationID: invocationID, MaxSchemaTokens: 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return selection.Snapshot
+	}
+	first := selectFor("inv-first")
+	second := selectFor("inv-second")
+
+	// 同一份工具集在两次调用里的内容摘要相同，但快照行按 invocation 存储
+	// （InvocationID 是唯一索引）。如果 ID 只由 digest 派生，第二个
+	// Invocation 就会撞主键并整轮失败。
+	if first.Digest != second.Digest {
+		t.Fatalf("相同工具集应得到相同 digest: %s vs %s", first.Digest, second.Digest)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("不同 invocation 的快照 ID 必须不同: %s", first.ID)
+	}
+	for _, item := range []ToolSetSnapshot{first, second} {
+		if !strings.Contains(item.ID, item.InvocationID) {
+			t.Fatalf("快照 ID 必须绑定 invocation: id=%s invocation=%s", item.ID, item.InvocationID)
+		}
 	}
 }

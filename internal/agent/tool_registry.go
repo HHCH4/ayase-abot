@@ -741,7 +741,12 @@ func newToolSetSnapshot(request ToolSelectionRequest, catalogRevision string, in
 	}{catalogRevision, request.PolicyRevision, request.ModelProfile, refs, copyExcluded})
 	sum := sha256.Sum256(basis)
 	digest := hex.EncodeToString(sum[:])
-	return ToolSetSnapshot{ID: "toolset:" + digest[:24], InvocationID: strings.TrimSpace(request.InvocationID), CatalogRevision: catalogRevision, PolicyRevision: strings.TrimSpace(request.PolicyRevision), ModelProfile: strings.TrimSpace(request.ModelProfile), Tools: refs, Excluded: copyExcluded, Digest: digest, CreatedAt: time.Now().UTC()}
+	// The snapshot row is keyed per invocation (InvocationID carries a unique
+	// index), so the identifier must include the invocation. Deriving it from
+	// the tool-set digest alone made every invocation after the first collide on
+	// the primary key whenever the tool set was unchanged.
+	invocationID := strings.TrimSpace(request.InvocationID)
+	return ToolSetSnapshot{ID: "toolset:" + digest[:24] + ":" + invocationID, InvocationID: invocationID, CatalogRevision: catalogRevision, PolicyRevision: strings.TrimSpace(request.PolicyRevision), ModelProfile: strings.TrimSpace(request.ModelProfile), Tools: refs, Excluded: copyExcluded, Digest: digest, CreatedAt: time.Now().UTC()}
 }
 
 func toolDescriptorTokenEstimate(descriptor ToolDescriptor) int {
