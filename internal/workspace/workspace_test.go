@@ -1277,8 +1277,13 @@ func TestCommandRunCapturesConservativeExecutionCapabilities(t *testing.T) {
 	if capabilities.ProfileID != "host-process-l0" || capabilities.IsolationLevel != "l0_host_process" || capabilities.Executor != "local" {
 		t.Fatalf("本地命令能力 profile 不正确: %#v", capabilities)
 	}
-	if capabilities.Filesystem.State != ExecutionCapabilityPartial || capabilities.Network.State != ExecutionCapabilityUnsupported || capabilities.PTY.State != ExecutionCapabilityUnsupported || capabilities.Reattach.State != ExecutionCapabilityUnsupported {
+	if capabilities.Filesystem.State != ExecutionCapabilityPartial || capabilities.Network.State != ExecutionCapabilityUnsupported || capabilities.Reattach.State != ExecutionCapabilityUnsupported {
 		t.Fatalf("本地命令未保守披露能力差异: %#v", capabilities)
+	}
+	// 本地 PTY 已经实现，但只在显式 TTY 请求时启用。声明 supported 时必须把
+	// 这个前提写清楚，否则能力披露会和默认的非交互 pipe 行为不一致。
+	if capabilities.PTY.State != ExecutionCapabilitySupported || !strings.Contains(capabilities.PTY.Detail, "显式 TTY") {
+		t.Fatalf("本地 PTY 能力披露与实现不一致: %#v", capabilities.PTY)
 	}
 	if strings.Contains(strings.ToLower(capabilities.Credentials.Detail), "secret broker") == false {
 		t.Fatalf("凭据能力应明确没有 secret broker: %#v", capabilities.Credentials)

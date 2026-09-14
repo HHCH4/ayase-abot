@@ -431,9 +431,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/workspace-command-runs/{id}/cancel", s.cancelWorkspaceCommandRun)
 	mux.HandleFunc("POST /api/v1/artifacts", s.createArtifact)
 	mux.HandleFunc("GET /api/v1/artifacts", s.listArtifacts)
+	mux.HandleFunc("GET /api/v1/artifacts/usage", s.getArtifactUsage)
+	mux.HandleFunc("POST /api/v1/artifacts/maintenance", s.runArtifactMaintenance)
 	mux.HandleFunc("GET /api/v1/artifacts/{id}", s.getArtifact)
 	mux.HandleFunc("GET /api/v1/artifacts/{id}/content", s.getArtifactContent)
 	mux.HandleFunc("GET /api/v1/artifacts/{id}/preview", s.getArtifactPreview)
+	mux.HandleFunc("POST /api/v1/artifacts/{id}/extract", s.extractArtifact)
 	mux.HandleFunc("DELETE /api/v1/artifacts/{id}", s.deleteArtifact)
 	mux.HandleFunc("GET /api/v1/command-runs", s.listWorkspaceCommandRuns)
 	mux.HandleFunc("GET /api/v1/command-runs/{id}", s.getWorkspaceCommandRun)
@@ -1527,6 +1530,8 @@ func writeError(writer http.ResponseWriter, err error) {
 		status = http.StatusForbidden
 	case errors.Is(err, artifact.ErrTooLarge):
 		status = http.StatusRequestEntityTooLarge
+	case errors.Is(err, artifact.ErrQuotaExceeded):
+		status = http.StatusInsufficientStorage
 	case errors.Is(err, artifact.ErrExpired), errors.Is(err, artifact.ErrObjectMissing):
 		status = http.StatusGone
 	case errors.Is(err, artifact.ErrQuarantined), errors.Is(err, artifact.ErrConflict):

@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -139,6 +140,11 @@ type StoredObject struct {
 	Digest   string
 	Size     int64
 	MIMEType string
+	// Created reports whether this call actually created the object. A store
+	// that cannot tell leaves it false, which makes the cleanup paths keep the
+	// object for the garbage collector instead of risking a concurrent writer's
+	// content-addressed object.
+	Created bool
 }
 
 type ObjectStore interface {
@@ -305,13 +311,16 @@ type Service struct {
 	repository Repository
 	store      ObjectStore
 	now        func() time.Time
+
+	policyMu sync.RWMutex
+	policy   MaintenancePolicy
 }
 
 func NewService(repository Repository, store ObjectStore) (*Service, error) {
 	if repository == nil || store == nil {
 		return nil, fmt.Errorf("%w: artifact repository 和 object store 不能为空", ErrInvalidRequest)
 	}
-	return &Service{repository: repository, store: store, now: func() time.Time { return time.Now().UTC() }}, nil
+	return &Service{repository: repository, store: store, now: func() time.Time { return time.Now().UTC() }, policy: DefaultMaintenancePolicy()}, nil
 }
 
 func (s *Service) Put(ctx context.Context, request PutRequest, reader io.Reader) (Artifact, error) {
@@ -343,6 +352,12 @@ func (s *Service) Put(ctx context.Context, request PutRequest, reader io.Reader)
 		_ = s.repository.Update(context.WithoutCancel(ctx), item, 1)
 		return Artifact{}, err
 	}
+	// The object is on disk before the metadata row exists. Enforce the local
+	// quota here so a refused upload never becomes visible or downloadable.
+	if quotaErr := s.enforceQuota(ctx, object); quotaErr != nil {
+		s.cleanupUncommitted(context.WithoutCancel(ctx), item.ID, object.Key, object.Created)
+		return Artifact{}, quotaErr
+	}
 	item.Digest, item.Size, item.StorageKey = object.Digest, object.Size, object.Key
 	if item.MIMEType == "" {
 		item.MIMEType = object.MIMEType
@@ -358,7 +373,7 @@ func (s *Service) Put(ctx context.Context, request PutRequest, reader io.Reader)
 	item.UpdatedAt = s.now().UTC()
 	if item.ProducerType != "" && item.ProducerID != "" {
 		if existing, findErr := s.repository.FindReadyByProducerDigest(ctx, item.ProducerType, item.ProducerID, item.Digest); findErr == nil && existing.ID != item.ID {
-			if existing.StorageKey != item.StorageKey {
+			if existing.StorageKey != item.StorageKey && object.Created {
 				_ = s.store.Delete(context.WithoutCancel(ctx), item.StorageKey)
 			}
 			_ = s.repository.Delete(context.WithoutCancel(ctx), item.ID)
@@ -376,19 +391,22 @@ func (s *Service) Put(ctx context.Context, request PutRequest, reader io.Reader)
 		}
 	}
 	if err := item.Validate(); err != nil {
-		s.cleanupUncommitted(context.WithoutCancel(ctx), item.ID, item.StorageKey)
+		s.cleanupUncommitted(context.WithoutCancel(ctx), item.ID, item.StorageKey, object.Created)
 		return Artifact{}, err
 	}
 	if err := s.repository.Update(ctx, item, 1); err != nil {
-		s.cleanupUncommitted(context.WithoutCancel(ctx), item.ID, item.StorageKey)
+		s.cleanupUncommitted(context.WithoutCancel(ctx), item.ID, item.StorageKey, object.Created)
 		return Artifact{}, err
 	}
 	return item, nil
 }
 
-func (s *Service) cleanupUncommitted(ctx context.Context, id, storageKey string) {
+func (s *Service) cleanupUncommitted(ctx context.Context, id, storageKey string, created bool) {
 	_ = s.repository.Delete(ctx, id)
-	if strings.TrimSpace(storageKey) == "" {
+	if strings.TrimSpace(storageKey) == "" || !created {
+		// An object this request did not create may belong to a concurrent
+		// writer that has not published its metadata row yet. Leave it for the
+		// garbage collector instead of deleting someone else's content.
 		return
 	}
 	count, err := s.repository.CountByStorageKey(ctx, storageKey)
@@ -397,7 +415,11 @@ func (s *Service) cleanupUncommitted(ctx context.Context, id, storageKey string)
 	}
 }
 
-func (s *Service) Get(ctx context.Context, userID, id string) (Artifact, error) {
+// getOwnedArtifact reads one artifact and enforces ownership. Expiry is only
+// enforced for read paths: an owner must always be able to delete content after
+// its retention window closed, otherwise an expired artifact could never be
+// reclaimed and would keep consuming the storage quota.
+func (s *Service) getOwnedArtifact(ctx context.Context, userID, id string, enforceExpiry bool) (Artifact, error) {
 	item, err := s.repository.Get(ctx, strings.TrimSpace(id))
 	if err != nil {
 		return Artifact{}, err
@@ -405,10 +427,14 @@ func (s *Service) Get(ctx context.Context, userID, id string) (Artifact, error) 
 	if strings.TrimSpace(userID) == "" || item.UserID != strings.TrimSpace(userID) {
 		return Artifact{}, ErrForbidden
 	}
-	if item.ExpiresAt != nil && !item.ExpiresAt.After(s.now().UTC()) {
+	if enforceExpiry && item.ExpiresAt != nil && !item.ExpiresAt.After(s.now().UTC()) {
 		return Artifact{}, ErrExpired
 	}
 	return item, nil
+}
+
+func (s *Service) Get(ctx context.Context, userID, id string) (Artifact, error) {
+	return s.getOwnedArtifact(ctx, userID, id, true)
 }
 
 func (s *Service) List(ctx context.Context, userID, conversationID string) ([]Artifact, error) {
@@ -446,8 +472,15 @@ func (s *Service) Open(ctx context.Context, userID, id string, byteRange ByteRan
 	return reader, info, item, nil
 }
 
+// Delete removes one artifact. The metadata row is the privacy boundary and is
+// always removed once the caller has asked for deletion; a failure to reclaim
+// the content-addressed object is handed to the durable delete outbox instead
+// of rejecting the request. Repositories without the outbox extension keep the
+// previous behaviour and report the storage error.
 func (s *Service) Delete(ctx context.Context, userID, id string) error {
-	item, err := s.Get(ctx, userID, id)
+	// Deletion deliberately ignores the retention window: expiry closes the
+	// read path, it must not make the content immortal.
+	item, err := s.getOwnedArtifact(ctx, userID, id, false)
 	if err != nil {
 		return err
 	}
@@ -466,8 +499,10 @@ func (s *Service) Delete(ctx context.Context, userID, id string) error {
 			return countErr
 		}
 		if count <= 1 {
-			if err := s.store.Delete(ctx, item.StorageKey); err != nil && !errors.Is(err, ErrObjectMissing) {
-				return err
+			if deleteErr := s.store.Delete(ctx, item.StorageKey); deleteErr != nil && !errors.Is(deleteErr, ErrObjectMissing) {
+				if enqueueErr := s.enqueueObjectDeletion(context.WithoutCancel(ctx), item.StorageKey, s.now()); enqueueErr != nil {
+					return deleteErr
+				}
 			}
 		}
 	}
@@ -504,7 +539,11 @@ func (s *Service) DeleteConversation(ctx context.Context, conversationID string)
 		}
 		if count == 0 {
 			if deleteErr := s.store.Delete(ctx, key); deleteErr != nil && !errors.Is(deleteErr, ErrObjectMissing) {
-				return deleteErr
+				// The conversation is already gone; keep the object deletion
+				// durable instead of failing the privacy boundary.
+				if enqueueErr := s.enqueueObjectDeletion(context.WithoutCancel(ctx), key, s.now()); enqueueErr != nil {
+					return deleteErr
+				}
 			}
 		}
 	}

@@ -11,12 +11,13 @@ import (
 // It copies metadata at every boundary so a caller cannot mutate an immutable
 // artifact through a returned map or time pointer.
 type MemoryRepository struct {
-	mu    sync.RWMutex
-	items map[string]Artifact
+	mu              sync.RWMutex
+	items           map[string]Artifact
+	objectDeletions map[string]ObjectDeletion
 }
 
 func NewMemoryRepository() *MemoryRepository {
-	return &MemoryRepository{items: make(map[string]Artifact)}
+	return &MemoryRepository{items: make(map[string]Artifact), objectDeletions: make(map[string]ObjectDeletion)}
 }
 
 func (repository *MemoryRepository) Create(_ context.Context, item Artifact) error {

@@ -100,12 +100,15 @@ func Run(opts bootstrap.Options) error {
 	}
 	configService.SetSystemSettingsApplier(func(_ context.Context, settings configsvc.SystemSettings) error {
 		logLevel.Set(parseLevel(settings.LogLevel))
-		return nil
+		return applyArtifactMaintenancePolicy(artifactService, settings)
 	})
 	if settings, settingsErr := configService.GetSystemSettings(context.Background()); settingsErr != nil {
 		return settingsErr
 	} else {
 		logLevel.Set(parseLevel(settings.LogLevel))
+		if err := applyArtifactMaintenancePolicy(artifactService, settings); err != nil {
+			return err
+		}
 	}
 	workspaceService, err := workspace.NewService(store.WorkspaceRepository())
 	if err != nil {
@@ -430,6 +433,18 @@ func Run(opts bootstrap.Options) error {
 	if _, err := workspaceService.PurgeExpiredCommandOutput(ctx, time.Now().UTC()); err != nil {
 		return fmt.Errorf("清理过期命令日志失败: %w", err)
 	}
+	// Artifact 维护同样是启动触发的幂等回收：关闭未完成上传、重试对象删除、
+	// 回收无引用对象。它只影响可回收空间，不影响已有内容的正确性，因此失败
+	// 记录警告而不阻止启动，下一次启动或显式维护请求会重试。
+	if result, maintenanceErr := artifactService.RunMaintenance(ctx, time.Now().UTC()); maintenanceErr != nil {
+		slog.Warn("Artifact 维护未完成", "error", maintenanceErr)
+	} else {
+		slog.Info("Artifact 维护完成",
+			"uploads_failed", result.UploadSweep.UploadsFailed,
+			"deletions_closed", result.UploadSweep.DeletionsClosed,
+			"objects_deleted", result.GarbageCollection.Deleted,
+			"bytes_reclaimed", result.GarbageCollection.ReclaimedBytes)
+	}
 	if _, ok := runtimeRepo.(agentruntime.InstructionSnapshotRepository); ok {
 		runtimeCoordinator.SetInstructionSnapshotValidator(validateInstructionSnapshot)
 		runtimeCoordinator.SetInstructionSnapshotReconfirmer(reconfirmInstructionSnapshot)
@@ -560,6 +575,20 @@ func runtimeInstructionSnapshotsMatch(left, right []agentruntime.InstructionSnap
 		}
 	}
 	return true
+}
+
+// applyArtifactMaintenancePolicy 把系统设置映射为本地 Artifact 维护策略。
+// 范围校验由配置服务负责，这里只做单位换算，其余字段保留存储层默认值。
+func applyArtifactMaintenancePolicy(service *artifact.Service, settings configsvc.SystemSettings) error {
+	if service == nil {
+		return nil
+	}
+	policy := artifact.DefaultMaintenancePolicy()
+	policy.QuotaBytes = settings.ArtifactQuotaBytes
+	if settings.ArtifactStaleUploadSeconds > 0 {
+		policy.StaleUploadAge = time.Duration(settings.ArtifactStaleUploadSeconds) * time.Second
+	}
+	return service.SetMaintenancePolicy(policy)
 }
 
 func parseLevel(value string) slog.Level {

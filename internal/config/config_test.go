@@ -72,3 +72,49 @@ func TestSlidingCompactionOverlapValidation(t *testing.T) {
 		t.Fatalf("有效滑动窗口配置被拒绝: %v", err)
 	}
 }
+
+func TestSystemSettingsArtifactLifecycleBounds(t *testing.T) {
+	schema := SystemSchema()
+	fields := make(map[string]Field, len(schema.Fields))
+	for _, field := range schema.Fields {
+		fields[field.Key] = field
+	}
+	quota, ok := fields["artifact_quota_bytes"]
+	if !ok || quota.Default != DefaultArtifactQuotaBytes {
+		t.Fatalf("Schema 缺少 Artifact 配额默认值: %+v", quota)
+	}
+	staleUpload, ok := fields["artifact_stale_upload_seconds"]
+	if !ok || staleUpload.Default != DefaultArtifactStaleUploadSeconds {
+		t.Fatalf("Schema 缺少未完成上传保留时长默认值: %+v", staleUpload)
+	}
+
+	// 旧记录和全新配置没有任何 Artifact 字段，此时必须补上保守默认值。
+	defaulted := normalizeSystemSettings(SystemSettings{})
+	if defaulted.ArtifactQuotaBytes != DefaultArtifactQuotaBytes || defaulted.ArtifactStaleUploadSeconds != DefaultArtifactStaleUploadSeconds {
+		t.Fatalf("零值系统设置未补默认 Artifact 边界: %+v", defaulted)
+	}
+	if err := validateSystemSettings(defaulted); err != nil {
+		t.Fatalf("默认 Artifact 边界必须合法: %v", err)
+	}
+
+	// 用户显式关闭配额（0 配额 + 合法保留时长）不能被默认值覆盖。
+	disabled := normalizeSystemSettings(SystemSettings{ArtifactQuotaBytes: 0, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds})
+	if disabled.ArtifactQuotaBytes != 0 {
+		t.Fatalf("显式关闭的配额被默认值覆盖: %+v", disabled)
+	}
+	if err := validateSystemSettings(disabled); err != nil {
+		t.Fatalf("关闭配额必须合法: %v", err)
+	}
+
+	invalid := []SystemSettings{
+		{LogLevel: "info", RequestTimeoutSeconds: 300, ArtifactQuotaBytes: -1, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds},
+		{LogLevel: "info", RequestTimeoutSeconds: 300, ArtifactQuotaBytes: MaxArtifactQuotaBytes + 1, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds},
+		{LogLevel: "info", RequestTimeoutSeconds: 300, ArtifactQuotaBytes: DefaultArtifactQuotaBytes, ArtifactStaleUploadSeconds: MinArtifactStaleUploadSeconds - 1},
+		{LogLevel: "info", RequestTimeoutSeconds: 300, ArtifactQuotaBytes: DefaultArtifactQuotaBytes, ArtifactStaleUploadSeconds: MaxArtifactStaleUploadSeconds + 1},
+	}
+	for index, settings := range invalid {
+		if err := validateSystemSettings(settings); err == nil {
+			t.Fatalf("非法 Artifact 设置 #%d 必须被拒绝: %+v", index, settings)
+		}
+	}
+}

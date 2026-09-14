@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type LocalContentStore struct {
@@ -123,11 +124,12 @@ func (s *LocalContentStore) Put(ctx context.Context, request PutRequest, reader 
 	}
 	if err := os.Rename(temporaryName, target); err != nil {
 		if _, statErr := os.Stat(target); statErr == nil {
+			// Another writer won the race for the same content.
 			return StoredObject{Key: key, Digest: digest, Size: size, MIMEType: contentType}, nil
 		}
 		return StoredObject{}, fmt.Errorf("提交 artifact 对象失败: %w", err)
 	}
-	return StoredObject{Key: key, Digest: digest, Size: size, MIMEType: contentType}, nil
+	return StoredObject{Key: key, Digest: digest, Size: size, MIMEType: contentType, Created: true}, nil
 }
 
 func (s *LocalContentStore) Open(ctx context.Context, key string, byteRange ByteRange) (io.ReadCloser, ObjectInfo, error) {
@@ -187,6 +189,99 @@ func (s *LocalContentStore) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("删除 artifact 对象失败: %w", err)
 	}
 	return nil
+}
+
+// ListObjects enumerates committed content-addressed objects. Keys that do not
+// match the canonical layout are ignored: they were never written by this store
+// and must not be reclaimed by a garbage-collection pass.
+func (s *LocalContentStore) ListObjects(ctx context.Context) ([]StoredObjectMeta, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	objectsRoot := filepath.Join(s.root, "objects")
+	result := make([]StoredObjectMeta, 0)
+	err := filepath.WalkDir(objectsRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, relErr := filepath.Rel(objectsRoot, path)
+		if relErr != nil {
+			return nil
+		}
+		key := filepath.ToSlash(relative)
+		if _, keyErr := s.resolveKey(key); keyErr != nil {
+			return nil
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			if errors.Is(infoErr, os.ErrNotExist) {
+				return nil
+			}
+			return infoErr
+		}
+		result = append(result, StoredObjectMeta{Key: key, Size: info.Size(), ModifiedAt: info.ModTime().UTC()})
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("枚举 artifact 对象失败: %w", err)
+	}
+	return result, nil
+}
+
+// SweepTemporaryObjects removes partially written upload files older than the
+// cutoff. Committed objects live in a different directory and are never
+// touched, so a crash during upload cannot leak temporary bytes forever.
+func (s *LocalContentStore) SweepTemporaryObjects(ctx context.Context, before time.Time) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if before.IsZero() {
+		return 0, fmt.Errorf("%w: 临时对象清理截止时间不能为空", ErrInvalidRequest)
+	}
+	cutoff := before.UTC()
+	entries, err := os.ReadDir(filepath.Join(s.root, "tmp"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("读取 artifact 临时目录失败: %w", err)
+	}
+	removed := 0
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return removed, err
+		}
+		if entry.IsDir() {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			if errors.Is(infoErr, os.ErrNotExist) {
+				continue
+			}
+			return removed, fmt.Errorf("读取 artifact 临时对象失败: %w", infoErr)
+		}
+		if info.ModTime().UTC().After(cutoff) {
+			continue
+		}
+		if removeErr := os.Remove(filepath.Join(s.root, "tmp", entry.Name())); removeErr != nil {
+			if errors.Is(removeErr, os.ErrNotExist) {
+				continue
+			}
+			return removed, fmt.Errorf("删除 artifact 临时对象失败: %w", removeErr)
+		}
+		removed++
+	}
+	return removed, nil
 }
 
 func (s *LocalContentStore) resolveKey(key string) (string, error) {

@@ -2,8 +2,10 @@ package sqlite
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	agentruntime "Abot/internal/agent/runtime"
 	"Abot/internal/artifact"
@@ -17,6 +19,7 @@ import (
 	"google.golang.org/adk/v2/session"
 	adksessiondb "google.golang.org/adk/v2/session/database"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // Store 持有 Abot 业务表和 ADK 会话服务使用的 SQLite 数据库。
@@ -34,16 +37,18 @@ func Open(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("创建数据目录失败: %w", err)
 	}
 	dbPath := filepath.Join(dataDir, "abot.db")
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{Logger: newDatabaseLogger()})
 	if err != nil {
 		return nil, fmt.Errorf("打开 SQLite 失败: %w", err)
 	}
-	if err := db.AutoMigrate(&providerRow{}, &modelRow{}, &capabilityObservationRow{}, &settingRow{}, &workspaceRow{}, &workspaceOperationRow{}, &workspaceCommandRunRow{}, &workspaceCommandOutputChunkRow{}, &remoteTargetRow{}, &conversationRow{}, &botRow{}, &configProfileRow{}, &configRevisionRow{}, &configBindingRow{}, &systemSettingsRow{}, &personaRow{}, &personaRevisionRow{}, &personaBindingRow{}, &memoryRow{}, &invocationRow{}, &invocationResumeRow{}, &invocationResumeOutboxRow{}, &worktreeBaselineRow{}, &agentEventRow{}, &runtimeEventOutboxRow{}, &runtimeEventDeliveryInboxRow{}, &runtimeEventDeliveryTransactionRow{}, &runtimeCheckpointDeliveryInboxRow{}, &runtimeCheckpointDeliveryOutboxRow{}, &runtimeCheckpointDeliveryTransactionRow{}, &runtimeApprovalRejectionDeliveryOutboxRow{}, &runtimeApprovalRejectionDeliveryInboxRow{}, &runtimeApprovalRejectionDeliveryTransactionRow{}, &runtimeConfigDeliveryInboxRow{}, &runtimeConfigDeliveryOutboxRow{}, &runtimeConfigDeliveryTransactionRow{}, &runtimeConfigDirectoryRow{}, &runtimeConfigDirectoryOutboxRow{}, &runtimeConfigDirectoryFanoutRow{}, &runtimeConfigDirectoryRebindPlanRow{}, &runtimeConfigDirectoryRebindConfirmationRow{}, &runtimeConfigDirectoryRebindApplyRow{}, &runtimeConfigDirectoryRebindMultiConfirmationRow{}, &runtimeConfigDirectoryRebindMultiApplyRow{}, &runtimeConfigDirectoryRebindInboxRow{}, &runtimeDeliveryAttemptRow{}, &runtimeDeliveryGroupRow{}, &runtimeDeliveryGroupTransactionRow{}, &runtimeDeliveryGroupFenceRow{}, &runtimeDeliveryGroupSettlementRow{}, &runtimeDeliveryGroupSagaRow{}, &runtimeDeliveryCompensationRow{}, &approvalRow{}, &toolCallRow{}, &taskPlanRow{}, &taskContractRow{}, &instructionSnapshotSetRow{}, &contextManifestRow{}, &workingSetRow{}, &verificationRunRow{}, &runtimeSnapshotRow{}, &toolSetSnapshotRow{}, &modelCapabilitySnapshotRow{}, &evalRunRow{}, &artifactRow{}); err != nil {
+	if err := db.AutoMigrate(&providerRow{}, &modelRow{}, &capabilityObservationRow{}, &settingRow{}, &workspaceRow{}, &workspaceOperationRow{}, &workspaceCommandRunRow{}, &workspaceCommandOutputChunkRow{}, &remoteTargetRow{}, &conversationRow{}, &botRow{}, &configProfileRow{}, &configRevisionRow{}, &configBindingRow{}, &systemSettingsRow{}, &personaRow{}, &personaRevisionRow{}, &personaBindingRow{}, &memoryRow{}, &invocationRow{}, &invocationResumeRow{}, &invocationResumeOutboxRow{}, &worktreeBaselineRow{}, &agentEventRow{}, &runtimeEventOutboxRow{}, &runtimeEventDeliveryInboxRow{}, &runtimeEventDeliveryTransactionRow{}, &runtimeCheckpointDeliveryInboxRow{}, &runtimeCheckpointDeliveryOutboxRow{}, &runtimeCheckpointDeliveryTransactionRow{}, &runtimeApprovalRejectionDeliveryOutboxRow{}, &runtimeApprovalRejectionDeliveryInboxRow{}, &runtimeApprovalRejectionDeliveryTransactionRow{}, &runtimeConfigDeliveryInboxRow{}, &runtimeConfigDeliveryOutboxRow{}, &runtimeConfigDeliveryTransactionRow{}, &runtimeConfigDirectoryRow{}, &runtimeConfigDirectoryOutboxRow{}, &runtimeConfigDirectoryFanoutRow{}, &runtimeConfigDirectoryRebindPlanRow{}, &runtimeConfigDirectoryRebindConfirmationRow{}, &runtimeConfigDirectoryRebindApplyRow{}, &runtimeConfigDirectoryRebindMultiConfirmationRow{}, &runtimeConfigDirectoryRebindMultiApplyRow{}, &runtimeConfigDirectoryRebindInboxRow{}, &runtimeDeliveryAttemptRow{}, &runtimeDeliveryGroupRow{}, &runtimeDeliveryGroupTransactionRow{}, &runtimeDeliveryGroupFenceRow{}, &runtimeDeliveryGroupSettlementRow{}, &runtimeDeliveryGroupSagaRow{}, &runtimeDeliveryCompensationRow{}, &approvalRow{}, &toolCallRow{}, &taskPlanRow{}, &taskContractRow{}, &instructionSnapshotSetRow{}, &contextManifestRow{}, &workingSetRow{}, &verificationRunRow{}, &runtimeSnapshotRow{}, &toolSetSnapshotRow{}, &modelCapabilitySnapshotRow{}, &evalRunRow{}, &artifactRow{}, &artifactObjectDeletionRow{}); err != nil {
 		return nil, fmt.Errorf("迁移 Abot 表失败: %w", err)
 	}
 
 	// ADK 自带的 database.Service 负责会话事件、State 和 EventCompaction 的持久化。
-	sessionService, err := adksessiondb.NewSessionService(sqlite.Open(dbPath))
+	// ADK 自己创建 gorm 实例；把同一个 logger 传进去，否则它的
+	// "record not found" 仍会以错误级别刷屏。
+	sessionService, err := adksessiondb.NewSessionService(sqlite.Open(dbPath), &gorm.Config{Logger: newDatabaseLogger()})
 	if err != nil {
 		return nil, fmt.Errorf("创建 ADK 会话服务失败: %w", err)
 	}
@@ -159,6 +164,19 @@ func (s *Store) MemoryRepository() memory.Repository {
 }
 
 // ArtifactRepository 返回 Artifact 元数据仓储；内容本身由应用按数据目录装配对象存储。
+// newDatabaseLogger keeps expected "record not found" lookups out of the log.
+// Those lookups are normal control flow (first read of an optional row), and
+// printing them as errors buries the failures that matter on an unattended
+// single-board deployment. Slow queries and real driver errors are still shown.
+func newDatabaseLogger() logger.Interface {
+	return logger.New(log.New(os.Stdout, "", log.LstdFlags), logger.Config{
+		SlowThreshold:             500 * time.Millisecond,
+		LogLevel:                  logger.Warn,
+		IgnoreRecordNotFoundError: true,
+		Colorful:                  false,
+	})
+}
+
 func (s *Store) ArtifactRepository() artifact.Repository {
 	return &artifactRepository{db: s.db}
 }

@@ -93,7 +93,22 @@ type RevisionRepository interface {
 type SystemSettings struct {
 	LogLevel              string `json:"log_level"`
 	RequestTimeoutSeconds int    `json:"request_timeout_seconds"`
+	// ArtifactQuotaBytes 是本地内容寻址存储去重后的占用上限。单独出现的 0
+	// 表示用户显式关闭配额；只有两个 Artifact 字段同时为 0 才视为旧数据或
+	// 全新记录，此时由 normalizeSystemSettings 补上保守默认值。
+	ArtifactQuotaBytes         int64 `json:"artifact_quota_bytes"`
+	ArtifactStaleUploadSeconds int   `json:"artifact_stale_upload_seconds"`
 }
+
+// Artifact 存储约束的默认值与边界。这些数值同时用于 Schema 校验和运行时维护
+// 策略，避免配置层与存储层各自维护一份默认值。
+const (
+	DefaultArtifactQuotaBytes         int64 = 4 << 30
+	MaxArtifactQuotaBytes             int64 = 1 << 40
+	DefaultArtifactStaleUploadSeconds       = 24 * 60 * 60
+	MinArtifactStaleUploadSeconds           = 300
+	MaxArtifactStaleUploadSeconds           = 30 * 24 * 60 * 60
+)
 
 // SystemSchema 描述系统设置的校验范围和是否需要重启，供 WebUI 与外部管理客户端复用。
 func SystemSchema() Schema {
@@ -102,6 +117,8 @@ func SystemSchema() Schema {
 			{Value: "debug", Label: "debug"}, {Value: "info", Label: "info"}, {Value: "warn", Label: "warn"}, {Value: "error", Label: "error"},
 		}, Help: "保存后立即影响进程日志输出。"},
 		{Key: "request_timeout_seconds", Group: "system", Label: "全局请求超时（秒）", Type: "integer", Default: 300, Min: floatPtr(30), Max: floatPtr(3600), Help: "限制 WebUI、API 和机器人消息请求的最长运行时间。"},
+		{Key: "artifact_quota_bytes", Group: "system", Label: "Artifact 存储配额（字节）", Type: "integer", Default: DefaultArtifactQuotaBytes, Min: floatPtr(0), Max: floatPtr(float64(MaxArtifactQuotaBytes)), Help: "本地内容寻址存储去重后的总占用上限，0 表示不限制。超过上限时新的上传会被拒绝，已有内容不受影响。"},
+		{Key: "artifact_stale_upload_seconds", Group: "system", Label: "未完成上传保留时长（秒）", Type: "integer", Default: DefaultArtifactStaleUploadSeconds, Min: floatPtr(MinArtifactStaleUploadSeconds), Max: floatPtr(MaxArtifactStaleUploadSeconds), Help: "超过该时长仍未完成的 Artifact 上传会被标记为失败，遗留的临时文件一并回收。"},
 	}}
 }
 
@@ -707,6 +724,12 @@ func normalizeSystemSettings(settings SystemSettings) SystemSettings {
 	if settings.RequestTimeoutSeconds == 0 {
 		settings.RequestTimeoutSeconds = 300
 	}
+	// 旧记录和全新配置没有任何 Artifact 字段，此时补上保守默认值。用户显式
+	// 关闭配额（0 配额加合法保留时长）不会被这里覆盖。
+	if settings.ArtifactQuotaBytes == 0 && settings.ArtifactStaleUploadSeconds == 0 {
+		settings.ArtifactQuotaBytes = DefaultArtifactQuotaBytes
+		settings.ArtifactStaleUploadSeconds = DefaultArtifactStaleUploadSeconds
+	}
 	return settings
 }
 
@@ -718,6 +741,12 @@ func validateSystemSettings(settings SystemSettings) error {
 	}
 	if settings.RequestTimeoutSeconds < 30 || settings.RequestTimeoutSeconds > 3600 {
 		return fmt.Errorf("%w: 全局请求超时必须在 30-3600 秒之间", ErrInvalidRequest)
+	}
+	if settings.ArtifactQuotaBytes < 0 || settings.ArtifactQuotaBytes > MaxArtifactQuotaBytes {
+		return fmt.Errorf("%w: Artifact 存储配额必须在 0 到 %d 字节之间", ErrInvalidRequest, MaxArtifactQuotaBytes)
+	}
+	if settings.ArtifactStaleUploadSeconds < MinArtifactStaleUploadSeconds || settings.ArtifactStaleUploadSeconds > MaxArtifactStaleUploadSeconds {
+		return fmt.Errorf("%w: 未完成上传保留时长必须在 %d-%d 秒之间", ErrInvalidRequest, MinArtifactStaleUploadSeconds, MaxArtifactStaleUploadSeconds)
 	}
 	return nil
 }

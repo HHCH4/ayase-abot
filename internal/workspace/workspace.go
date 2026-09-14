@@ -657,7 +657,9 @@ func DefaultCommandExecutionCapabilities(item Workspace) *CommandExecutionCapabi
 		capabilities.ProcessControl = executionCapability(ExecutionCapabilityPartial, "使用本地进程组和 wall timeout；无法对后台后代提供强隔离保证")
 		capabilities.Resources = executionCapability(ExecutionCapabilityPartial, "仅提供 wall timeout 和有界输出；未强制 CPU、内存、磁盘或进程数配额")
 		capabilities.Credentials = executionCapability(ExecutionCapabilityUnsupported, "没有 secret broker；命令在当前 OS 用户上下文运行，HOME 可能指向宿主路径")
-		capabilities.PTY = executionCapability(ExecutionCapabilityUnsupported, "当前 CommandRun 使用非交互 pipe；PTY 尚未实现")
+		// 本地执行器已实现受控伪终端，但它只在显式 TTY 请求时启用，默认命令
+		// 仍走非交互 pipe，因此这里披露真实能力而不是“尚未实现”。
+		capabilities.PTY = executionCapability(ExecutionCapabilitySupported, "显式 TTY 请求时使用受控伪终端（输入、resize、signal 与单 writer attach）；默认命令仍走非交互 pipe")
 		capabilities.Reattach = executionCapability(ExecutionCapabilityUnsupported, "服务重启后控制句柄不会接管旧进程，运行记录会保守标记 unknown")
 	case TypeSSH, TypeRemote:
 		capabilities.ProfileID = "ssh-host-process"
@@ -668,7 +670,7 @@ func DefaultCommandExecutionCapabilities(item Workspace) *CommandExecutionCapabi
 		capabilities.ProcessControl = executionCapability(ExecutionCapabilityPartial, "尝试发送远程终止信号；断线或目标不支持时结果会保守标记 unknown")
 		capabilities.Resources = executionCapability(ExecutionCapabilityPartial, "仅提供 wall timeout 和有界输出；远端 CPU、内存、磁盘或进程数未由 Abot 强制")
 		capabilities.Credentials = executionCapability(ExecutionCapabilityUnsupported, "命令在远端 SSH 账号上下文运行，没有 Abot secret broker")
-		capabilities.PTY = executionCapability(ExecutionCapabilityUnsupported, "当前 CommandRun 使用非交互 SSH session；PTY 尚未实现")
+		capabilities.PTY = executionCapability(ExecutionCapabilityUnsupported, "SSH session 不提供伪终端；远程 PTY 尚未实现")
 		capabilities.Reattach = executionCapability(ExecutionCapabilityUnsupported, "SSH session 断开后没有 Worker reattach，无法安全承诺进程接管")
 	}
 	return capabilities

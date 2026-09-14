@@ -329,6 +329,17 @@ func (s *Server) getArtifactPreview(writer http.ResponseWriter, request *http.Re
 		return
 	}
 	response := map[string]any{"artifact": item.Ref()}
+	// A persisted bounded extraction is the deterministic projection: it already
+	// applied the format-specific and bomb-protection limits, so it wins over
+	// ad-hoc decoding here.
+	if extraction, ok := item.StoredExtraction(); ok {
+		response["extraction"] = extraction
+		if extraction.Preview != "" {
+			response["preview"] = extraction.Preview
+		}
+		writeJSON(writer, http.StatusOK, response)
+		return
+	}
 	if preview, ok := item.Metadata["preview"].(string); ok {
 		response["preview"] = truncateArtifactPreview(preview)
 		writeJSON(writer, http.StatusOK, response)
@@ -356,6 +367,28 @@ func (s *Server) getArtifactPreview(writer http.ResponseWriter, request *http.Re
 	response["preview"] = string(data)
 	response["truncated"] = item.Size > int64(len(data))
 	writeJSON(writer, http.StatusOK, response)
+}
+
+// extractArtifact runs (or reuses) the bounded extraction for one artifact. The
+// result is persisted, so a repeated call is idempotent and never re-reads the
+// object.
+func (s *Server) extractArtifact(writer http.ResponseWriter, request *http.Request) {
+	service, err := s.requireArtifacts()
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	userID, userErr := artifactUserID(request, "")
+	if userErr != nil {
+		writeError(writer, userErr)
+		return
+	}
+	extraction, err := service.Extract(request.Context(), userID, request.PathValue("id"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, extraction)
 }
 
 func artifactMIMEIsText(value string) bool {
