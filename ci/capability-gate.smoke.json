@@ -1,0 +1,64 @@
+{
+  "candidate_profiles": [
+    {
+      "provider_id": "ci-fixture",
+      "model_id": "ci-fixture-model",
+      "protocol": "openai-compatible",
+      "route": "chat",
+      "tool_calling": {"state": "unknown"},
+      "parallel_tool_calls": {"state": "unknown"},
+      "structured_output": {"state": "unknown"},
+      "structured_output_schema": {"state": "unknown"},
+      "streaming": {"state": "unknown"},
+      "images": {"state": "unknown"},
+      "input_files": {"state": "unknown"},
+      "audio": {"state": "unknown"},
+      "reasoning_effort": {"state": "unknown"},
+      "reasoning_summary": {"state": "unknown"},
+      "prompt_caching": {"state": "unknown"},
+      "native_compaction": {"state": "unknown"},
+      "tokenizer": {
+        "name": "abot-heuristic",
+        "version": "heuristic-v1",
+        "source": "heuristic",
+        "quality": "heuristic",
+        "calibration": {"safety_multiplier": 1}
+      },
+      "updated_at": "2026-09-12T00:00:00Z"
+    }
+  ],
+  "baseline_profiles": [
+    {
+      "provider_id": "ci-fixture",
+      "model_id": "ci-fixture-model",
+      "protocol": "openai-compatible",
+      "route": "chat",
+      "tool_calling": {"state": "unknown"},
+      "parallel_tool_calls": {"state": "unknown"},
+      "structured_output": {"state": "unknown"},
+      "structured_output_schema": {"state": "unknown"},
+      "streaming": {"state": "unknown"},
+      "images": {"state": "unknown"},
+      "input_files": {"state": "unknown"},
+      "audio": {"state": "unknown"},
+      "reasoning_effort": {"state": "unknown"},
+      "reasoning_summary": {"state": "unknown"},
+      "prompt_caching": {"state": "unknown"},
+      "native_compaction": {"state": "unknown"},
+      "tokenizer": {
+        "name": "abot-heuristic",
+        "version": "heuristic-v1",
+        "source": "heuristic",
+        "quality": "heuristic",
+        "calibration": {"safety_multiplier": 1}
+      },
+      "updated_at": "2026-09-12T00:00:00Z"
+    }
+  ],
+  "policy": {
+    "require_baseline": true,
+    "fail_on_downgrade": true,
+    "fail_on_route_change": true,
+    "max_downgrades": 0
+  }
+}

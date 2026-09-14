@@ -1,0 +1,851 @@
+// Package config 提供 Schema 驱动的配置文件、修订、绑定和系统设置服务。
+package config
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+const SchemaVersion = 1
+
+var (
+	ErrNotFound       = errors.New("配置文件不存在")
+	ErrInvalidRequest = errors.New("配置请求无效")
+	ErrConflict       = errors.New("配置名称或 ID 已存在")
+	ErrDefaultProfile = errors.New("默认配置文件不能删除")
+	ErrProfileInUse   = errors.New("配置文件仍被绑定，不能删除")
+	ErrDefaultPersona = errors.New("默认人格不能删除")
+	ErrPersonaInUse   = errors.New("人格仍被绑定，不能删除")
+)
+
+type BindingScope string
+
+const (
+	BindingBot          BindingScope = "bot"
+	BindingConversation BindingScope = "conversation"
+)
+
+// Values 是配置文件的 JSON 对象。键采用稳定的点号路径，便于后续扩展嵌套配置。
+type Values map[string]any
+
+// Profile 是当前配置修订的公开领域对象；Values 中不允许放入未声明的字段。
+type Profile struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Revision  int       `json:"revision"`
+	Values    Values    `json:"values"`
+	IsDefault bool      `json:"is_default"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Revision 是审计用的不可变配置快照，保存配置时递增编号且不覆盖历史记录。
+type Revision struct {
+	ProfileID string    `json:"profile_id"`
+	Number    int       `json:"revision"`
+	Values    Values    `json:"values"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// SchemaOption 是下拉选项；动态供应商和模型由 OptionSource 标注，避免把运行时目录硬编码到 Schema。
+type SchemaOption struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+}
+
+// Field 描述 WebUI 表单和后端校验共用的配置元数据。
+type Field struct {
+	Key             string         `json:"key"`
+	Group           string         `json:"group"`
+	Label           string         `json:"label"`
+	Type            string         `json:"type"`
+	Default         any            `json:"default"`
+	Required        bool           `json:"required"`
+	Min             *float64       `json:"min,omitempty"`
+	Max             *float64       `json:"max,omitempty"`
+	Options         []SchemaOption `json:"options,omitempty"`
+	OptionSource    string         `json:"option_source,omitempty"`
+	DisplayIf       map[string]any `json:"display_if,omitempty"`
+	Secret          bool           `json:"secret"`
+	RestartRequired bool           `json:"restart_required"`
+	Help            string         `json:"help,omitempty"`
+}
+
+type Schema struct {
+	Version int     `json:"version"`
+	Fields  []Field `json:"fields"`
+}
+
+// RevisionRepository 是 SQLite 仓储提供的可选扩展；保留可选接口避免影响外部内存仓储实现。
+type RevisionRepository interface {
+	ListRevisions(context.Context, string) ([]Revision, error)
+}
+
+// SystemSettings 只包含当前已有真实运行时效果的系统设置。
+type SystemSettings struct {
+	LogLevel              string `json:"log_level"`
+	RequestTimeoutSeconds int    `json:"request_timeout_seconds"`
+}
+
+// SystemSchema 描述系统设置的校验范围和是否需要重启，供 WebUI 与外部管理客户端复用。
+func SystemSchema() Schema {
+	return Schema{Version: SchemaVersion, Fields: []Field{
+		{Key: "log_level", Group: "system", Label: "日志等级", Type: "select", Default: "info", Options: []SchemaOption{
+			{Value: "debug", Label: "debug"}, {Value: "info", Label: "info"}, {Value: "warn", Label: "warn"}, {Value: "error", Label: "error"},
+		}, Help: "保存后立即影响进程日志输出。"},
+		{Key: "request_timeout_seconds", Group: "system", Label: "全局请求超时（秒）", Type: "integer", Default: 300, Min: floatPtr(30), Max: floatPtr(3600), Help: "限制 WebUI、API 和机器人消息请求的最长运行时间。"},
+	}}
+}
+
+// Runtime 是配置解析后的 Agent 运行参数，不向 HTTP 层暴露内部实现细节。
+type Runtime struct {
+	AIEnabled                     bool
+	ProviderID                    string
+	ModelID                       string
+	AITemperature                 float64
+	AITopP                        float64
+	AIMaxOutputTokens             int
+	AIRequestRetries              int
+	PersonaID                     string
+	Instruction                   string
+	CompactionEnabled             bool
+	CompactionRatio               float64
+	CompactionSafetyTokens        int
+	CompactionRetentionEvents     int
+	CompactionInterval            int
+	CompactionOverlap             int
+	CompactionUnknownWindowTokens int
+	AgentMaxToolCalls             int
+	ToolSchemaBudgetTokens        int
+	WorkspaceEnabled              bool
+	WorkspaceReadEnabled          bool
+	WorkspaceWriteEnabled         bool
+	WorkspaceExecEnabled          bool
+	WorkspaceGitEnabled           bool
+	WorkspaceCommandTimeoutSecs   int
+	MessageStreamingEnabled       bool
+	MessagePromptPrefix           string
+	MemoryEnabled                 bool
+	MemoryAutoRetrieve            bool
+	MemoryMaxResults              int
+}
+
+// Repository 是配置中心需要的持久化能力，SQLite 实现位于 storage/sqlite，便于单元测试替换。
+type Repository interface {
+	ListProfiles(context.Context) ([]Profile, error)
+	GetProfile(context.Context, string) (Profile, error)
+	SaveProfile(context.Context, Profile, Revision) error
+	DeleteProfile(context.Context, string) error
+	SetDefaultProfile(context.Context, string) error
+	DefaultProfileID(context.Context) (string, error)
+	Bind(context.Context, BindingScope, string, string) error
+	GetBinding(context.Context, BindingScope, string) (string, error)
+	SaveSystemSettings(context.Context, SystemSettings) error
+	GetSystemSettings(context.Context) (SystemSettings, error)
+}
+
+// ModelValidator 只验证供应商引用是否存在；模型 ID 允许目录外手动模型，符合现有供应商配置语义。
+type ModelValidator func(context.Context, string, string) error
+
+// SystemSettingsApplier 在系统设置写入后立即更新进程中的可热更新模块。
+type SystemSettingsApplier func(context.Context, SystemSettings) error
+
+// Service 是配置中心唯一的业务入口，负责默认值、Schema 校验、修订和继承解析。
+type Service struct {
+	repository     Repository
+	modelValidator ModelValidator
+
+	mu            sync.RWMutex
+	systemApplier SystemSettingsApplier
+	defaultValues Values
+	schema        Schema
+	fields        map[string]Field
+}
+
+// NewService 创建配置服务；创建时不依赖任何平台或插件，因此可以零供应商启动。
+func NewService(repository Repository, validator ModelValidator) (*Service, error) {
+	if repository == nil {
+		return nil, errors.New("配置 Repository 不能为空")
+	}
+	schema := buildSchema()
+	fields := make(map[string]Field, len(schema.Fields))
+	defaults := make(Values, len(schema.Fields))
+	for _, field := range schema.Fields {
+		fields[field.Key] = field
+		defaults[field.Key] = cloneValue(field.Default)
+	}
+	return &Service{repository: repository, modelValidator: validator, defaultValues: defaults, schema: schema, fields: fields}, nil
+}
+
+// SetSystemSettingsApplier 设置日志等级等系统设置的运行时应用回调。
+func (s *Service) SetSystemSettingsApplier(applier SystemSettingsApplier) {
+	s.mu.Lock()
+	s.systemApplier = applier
+	s.mu.Unlock()
+}
+
+// EnsureDefault 保证系统至少有一个配置文件，但不会创建任何用户指定的工作区或项目目录。
+func (s *Service) EnsureDefault(ctx context.Context) error {
+	profiles, err := s.repository.ListProfiles(ctx)
+	if err != nil {
+		return fmt.Errorf("加载配置文件失败: %w", err)
+	}
+	if len(profiles) == 0 {
+		now := time.Now().UTC()
+		item := Profile{ID: "default", Name: "默认配置", Revision: 1, Values: s.DefaultValues(), IsDefault: true, CreatedAt: now, UpdatedAt: now}
+		return s.repository.SaveProfile(ctx, item, Revision{ProfileID: item.ID, Number: item.Revision, Values: item.Values, CreatedAt: now})
+	}
+	for _, item := range profiles {
+		if item.IsDefault {
+			return nil
+		}
+	}
+	// 兼容早期手工数据库：没有默认标记时选排序后的第一项。
+	sort.Slice(profiles, func(i, j int) bool { return profiles[i].ID < profiles[j].ID })
+	return s.repository.SetDefaultProfile(ctx, profiles[0].ID)
+}
+
+func (s *Service) Schema() Schema {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneSchema(s.schema)
+}
+
+func (s *Service) DefaultValues() Values {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneValues(s.defaultValues)
+}
+
+func (s *Service) ListProfiles(ctx context.Context) ([]Profile, error) {
+	items, err := s.repository.ListProfiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		items[i] = normalizeProfile(items[i])
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].IsDefault != items[j].IsDefault {
+			return items[i].IsDefault
+		}
+		return items[i].Name < items[j].Name
+	})
+	return items, nil
+}
+
+func (s *Service) GetProfile(ctx context.Context, id string) (Profile, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Profile{}, fmt.Errorf("%w: profile_id 不能为空", ErrInvalidRequest)
+	}
+	item, err := s.repository.GetProfile(ctx, id)
+	if err != nil {
+		return Profile{}, err
+	}
+	return normalizeProfile(item), nil
+}
+
+// ListRevisions 返回指定配置文件的历史快照，最新修订排在最前面。
+func (s *Service) ListRevisions(ctx context.Context, id string) ([]Revision, error) {
+	item, err := s.GetProfile(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	repository, ok := s.repository.(RevisionRepository)
+	if !ok {
+		return []Revision{{ProfileID: item.ID, Number: item.Revision, Values: s.publicValues(item.Values), CreatedAt: item.UpdatedAt}}, nil
+	}
+	items, err := repository.ListRevisions(ctx, item.ID)
+	if err != nil {
+		return nil, err
+	}
+	for index := range items {
+		items[index].ProfileID = item.ID
+		// 修订接口也不能绕过敏感字段脱敏规则。
+		items[index].Values = s.publicValues(items[index].Values)
+	}
+	if len(items) == 0 {
+		// 兼容只有当前配置行、没有历史表数据的早期数据库。
+		return []Revision{{ProfileID: item.ID, Number: item.Revision, Values: s.publicValues(item.Values), CreatedAt: item.UpdatedAt}}, nil
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Number > items[j].Number })
+	return items, nil
+}
+
+// SaveProfile 校验草稿后生成新修订；失败时不会写入或切换当前有效配置。
+func (s *Service) SaveProfile(ctx context.Context, id, name string, values Values) (Profile, error) {
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	if id == "" {
+		id = newID("profile")
+	}
+	if err := validateID(id); err != nil {
+		return Profile{}, err
+	}
+	if name == "" {
+		return Profile{}, fmt.Errorf("%w: 配置名称不能为空", ErrInvalidRequest)
+	}
+	if err := s.ValidateValues(ctx, values); err != nil {
+		return Profile{}, err
+	}
+	old, oldErr := s.repository.GetProfile(ctx, id)
+	if oldErr != nil && !errors.Is(oldErr, ErrNotFound) {
+		return Profile{}, oldErr
+	}
+	if oldErr == nil {
+		// 更新同一 ID 时保留创建时间、默认标记和已有修订序列。
+		if old.Name != name {
+			if conflict, err := s.nameConflict(ctx, name, id); err != nil {
+				return Profile{}, err
+			} else if conflict {
+				return Profile{}, fmt.Errorf("%w: 配置名称 %q 已存在", ErrConflict, name)
+			}
+		}
+	} else if conflict, err := s.nameConflict(ctx, name, id); err != nil {
+		return Profile{}, err
+	} else if conflict {
+		return Profile{}, fmt.Errorf("%w: 配置名称 %q 已存在", ErrConflict, name)
+	}
+	now := time.Now().UTC()
+	revision := 1
+	createdAt := now
+	isDefault := false
+	if oldErr == nil {
+		revision = old.Revision + 1
+		createdAt = old.CreatedAt
+		isDefault = old.IsDefault
+	}
+	item := Profile{ID: id, Name: name, Revision: revision, Values: cloneValues(values), IsDefault: isDefault, CreatedAt: createdAt, UpdatedAt: now}
+	if err := s.repository.SaveProfile(ctx, item, Revision{ProfileID: id, Number: revision, Values: values, CreatedAt: now}); err != nil {
+		return Profile{}, fmt.Errorf("保存配置文件失败: %w", err)
+	}
+	return item, nil
+}
+
+// ValidateValues 是可视化表单和 JSON 编辑器共用的后端验证入口。
+func (s *Service) ValidateValues(ctx context.Context, values Values) error {
+	for key := range values {
+		if _, ok := s.fields[key]; !ok {
+			return fmt.Errorf("%w: 未知配置项 %q", ErrInvalidRequest, key)
+		}
+	}
+	for _, field := range s.Schema().Fields {
+		value, exists := values[field.Key]
+		if !exists {
+			continue
+		}
+		switch field.Type {
+		case "boolean":
+			if _, ok := boolValue(value); !ok {
+				return fmt.Errorf("%w: %s 必须是布尔值", ErrInvalidRequest, field.Label)
+			}
+		case "integer":
+			number, ok := integerValue(value)
+			if !ok {
+				return fmt.Errorf("%w: %s 必须是整数", ErrInvalidRequest, field.Label)
+			}
+			if field.Min != nil && float64(number) < *field.Min || field.Max != nil && float64(number) > *field.Max {
+				return fmt.Errorf("%w: %s 超出允许范围", ErrInvalidRequest, field.Label)
+			}
+		case "number":
+			number, ok := numberValue(value)
+			if !ok || math.IsNaN(number) || math.IsInf(number, 0) {
+				return fmt.Errorf("%w: %s 必须是数字", ErrInvalidRequest, field.Label)
+			}
+			if field.Min != nil && number < *field.Min || field.Max != nil && number > *field.Max {
+				return fmt.Errorf("%w: %s 超出允许范围", ErrInvalidRequest, field.Label)
+			}
+		case "string", "textarea", "select":
+			text, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("%w: %s 必须是字符串", ErrInvalidRequest, field.Label)
+			}
+			if field.Required && strings.TrimSpace(text) == "" {
+				return fmt.Errorf("%w: %s 不能为空", ErrInvalidRequest, field.Label)
+			}
+		}
+	}
+	if err := validateSlidingCompactionValues(values); err != nil {
+		return err
+	}
+	providerID, _ := values["ai.default_provider_id"].(string)
+	modelID, _ := values["ai.default_model_id"].(string)
+	if s.modelValidator != nil {
+		if err := s.modelValidator(ctx, strings.TrimSpace(providerID), strings.TrimSpace(modelID)); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	}
+	return nil
+}
+
+// validateSlidingCompactionValues enforces the relationship between the two
+// sliding-window knobs. It is kept separate so direct callers and tests can
+// exercise the cross-field rule without needing a persistence implementation.
+func validateSlidingCompactionValues(values Values) error {
+	interval := intOr(values["context.compaction.sliding_interval"], 0)
+	overlap := intOr(values["context.compaction.sliding_overlap"], 0)
+	if overlap > 0 && interval == 0 {
+		return fmt.Errorf("%w: 滑动窗口重叠轮次必须在启用压缩间隔后设置", ErrInvalidRequest)
+	}
+	if overlap > interval {
+		return fmt.Errorf("%w: 滑动窗口重叠轮次不能大于压缩间隔", ErrInvalidRequest)
+	}
+	return nil
+}
+
+// ValidateDraft 校验未保存的配置草稿，不产生修订，也不改变当前运行配置。
+func (s *Service) ValidateDraft(ctx context.Context, id, name string, values Values) error {
+	if strings.TrimSpace(id) != "" {
+		if err := validateID(strings.TrimSpace(id)); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("%w: 配置名称不能为空", ErrInvalidRequest)
+	}
+	if err := s.ValidateValues(ctx, values); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Service) DeleteProfile(ctx context.Context, id string) error {
+	item, err := s.GetProfile(ctx, id)
+	if err != nil {
+		return err
+	}
+	if item.IsDefault {
+		return ErrDefaultProfile
+	}
+	return s.repository.DeleteProfile(ctx, item.ID)
+}
+
+func (s *Service) SetDefaultProfile(ctx context.Context, id string) error {
+	if _, err := s.GetProfile(ctx, id); err != nil {
+		return err
+	}
+	return s.repository.SetDefaultProfile(ctx, strings.TrimSpace(id))
+}
+
+func (s *Service) DefaultProfileID(ctx context.Context) (string, error) {
+	id, err := s.repository.DefaultProfileID(ctx)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(id), nil
+}
+
+// EffectiveValues 合并内置默认值和选定配置文件，供运行时和调试页面使用。
+func (s *Service) EffectiveValues(ctx context.Context, id string) (Values, error) {
+	values := s.DefaultValues()
+	if strings.TrimSpace(id) == "" {
+		return values, nil
+	}
+	item, err := s.GetProfile(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range item.Values {
+		values[key] = cloneValue(value)
+	}
+	return values, nil
+}
+
+// Resolve 按系统默认 → 机器人 → 对话的优先级解析配置；会话显式 State 由 Agent 层继续覆盖。
+func (s *Service) Resolve(ctx context.Context, botID, conversationID string) (Runtime, error) {
+	profileID, err := s.DefaultProfileID(ctx)
+	if err != nil {
+		return Runtime{}, err
+	}
+	if strings.TrimSpace(botID) != "" {
+		if bound, bindErr := s.repository.GetBinding(ctx, BindingBot, strings.TrimSpace(botID)); bindErr != nil {
+			return Runtime{}, bindErr
+		} else if bound != "" {
+			profileID = bound
+		}
+	}
+	if strings.TrimSpace(conversationID) != "" {
+		if bound, bindErr := s.repository.GetBinding(ctx, BindingConversation, strings.TrimSpace(conversationID)); bindErr != nil {
+			return Runtime{}, bindErr
+		} else if bound != "" {
+			profileID = bound
+		}
+	}
+	values, err := s.EffectiveValues(ctx, profileID)
+	if err != nil {
+		return Runtime{}, err
+	}
+	return runtimeFromValues(values), nil
+}
+
+func (s *Service) Bind(ctx context.Context, scope BindingScope, targetID, profileID string) error {
+	if scope != BindingBot && scope != BindingConversation {
+		return fmt.Errorf("%w: 绑定范围无效", ErrInvalidRequest)
+	}
+	targetID = strings.TrimSpace(targetID)
+	profileID = strings.TrimSpace(profileID)
+	if targetID == "" {
+		return fmt.Errorf("%w: 绑定目标不能为空", ErrInvalidRequest)
+	}
+	if profileID != "" {
+		if _, err := s.GetProfile(ctx, profileID); err != nil {
+			return err
+		}
+	}
+	return s.repository.Bind(ctx, scope, targetID, profileID)
+}
+
+func (s *Service) Binding(ctx context.Context, scope BindingScope, targetID string) (string, error) {
+	return s.repository.GetBinding(ctx, scope, strings.TrimSpace(targetID))
+}
+
+// Export 只导出 Schema 已知字段；当前没有可读敏感字段，未来加入敏感字段时统一在这里剔除。
+func (s *Service) Export(ctx context.Context, id string) (map[string]any, error) {
+	item, err := s.GetProfile(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"version": SchemaVersion, "id": item.ID, "name": item.Name, "revision": item.Revision, "values": s.publicValues(item.Values)}, nil
+}
+
+// publicValues 统一处理配置读取和导出时的敏感字段过滤。
+func (s *Service) publicValues(values Values) Values {
+	result := Values{}
+	for key, value := range values {
+		field, ok := s.fields[key]
+		if ok && field.Secret {
+			continue
+		}
+		result[key] = cloneValue(value)
+	}
+	return result
+}
+
+// Import 导入时默认生成新 ID；只有明确 overwrite=true 才允许覆盖同 ID 或同名配置。
+func (s *Service) Import(ctx context.Context, id, name string, values Values, overwrite bool) (Profile, error) {
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	if id == "" {
+		id = newID("profile")
+	}
+	if !overwrite {
+		if _, err := s.repository.GetProfile(ctx, id); err == nil {
+			return Profile{}, fmt.Errorf("%w: 配置 ID %q 已存在", ErrConflict, id)
+		} else if !errors.Is(err, ErrNotFound) {
+			return Profile{}, err
+		}
+		if conflict, err := s.nameConflict(ctx, name, ""); err != nil {
+			return Profile{}, err
+		} else if conflict {
+			return Profile{}, fmt.Errorf("%w: 配置名称 %q 已存在，请明确覆盖", ErrConflict, name)
+		}
+	}
+	if overwrite {
+		if existing, err := s.repository.GetProfile(ctx, id); err == nil {
+			return s.SaveProfile(ctx, existing.ID, nameOr(name, existing.Name), values)
+		} else if !errors.Is(err, ErrNotFound) {
+			return Profile{}, err
+		}
+	}
+	return s.SaveProfile(ctx, id, name, values)
+}
+
+func (s *Service) GetSystemSettings(ctx context.Context) (SystemSettings, error) {
+	settings, err := s.repository.GetSystemSettings(ctx)
+	if err != nil {
+		return SystemSettings{}, err
+	}
+	return normalizeSystemSettings(settings), nil
+}
+
+func (s *Service) SaveSystemSettings(ctx context.Context, settings SystemSettings) (SystemSettings, error) {
+	settings = normalizeSystemSettings(settings)
+	if err := validateSystemSettings(settings); err != nil {
+		return SystemSettings{}, err
+	}
+	old, err := s.GetSystemSettings(ctx)
+	if err != nil {
+		return SystemSettings{}, err
+	}
+	if err := s.repository.SaveSystemSettings(ctx, settings); err != nil {
+		return SystemSettings{}, fmt.Errorf("保存系统设置失败: %w", err)
+	}
+	s.mu.RLock()
+	applier := s.systemApplier
+	s.mu.RUnlock()
+	if applier != nil {
+		if err := applier(ctx, settings); err != nil {
+			// 运行时应用失败时回写上一份设置，避免数据库和进程状态分裂。
+			_ = s.repository.SaveSystemSettings(ctx, old)
+			return SystemSettings{}, fmt.Errorf("应用系统设置失败: %w", err)
+		}
+	}
+	return settings, nil
+}
+
+func buildSchema() Schema {
+	return Schema{Version: SchemaVersion, Fields: []Field{
+		{Key: "ai.enabled", Group: "ai", Label: "启用 AI", Type: "boolean", Default: true, Help: "关闭后 Agent 会拒绝新的 AI 请求，但历史对话仍可查看。"},
+		{Key: "ai.default_provider_id", Group: "ai", Label: "默认供应商", Type: "select", Default: "", OptionSource: "providers", Help: "为空时沿用供应商注册表的兼容默认值。"},
+		{Key: "ai.default_model_id", Group: "ai", Label: "默认模型", Type: "string", Default: "", Help: "支持模型目录外的手动模型 ID。"},
+		{Key: "ai.temperature", Group: "ai", Label: "温度", Type: "number", Default: 0.7, Min: floatPtr(0), Max: floatPtr(2), Help: "控制输出随机性；较低值更稳定，较高值更有创造性。"},
+		{Key: "ai.top_p", Group: "ai", Label: "Top P", Type: "number", Default: 1.0, Min: floatPtr(0.01), Max: floatPtr(1), Help: "限制采样候选范围；通常与温度二选一调整。"},
+		{Key: "ai.max_output_tokens", Group: "ai", Label: "最大输出 token", Type: "integer", Default: 0, Min: floatPtr(0), Max: floatPtr(1000000), Help: "0 表示使用模型目录或上游接口默认值。"},
+		{Key: "ai.request_retries", Group: "ai", Label: "请求失败重试次数", Type: "integer", Default: 2, Min: floatPtr(0), Max: floatPtr(5), Help: "仅在模型尚未返回任何内容时重试，避免流式输出重复。"},
+		{Key: "persona.id", Group: "persona", Label: "人格 ID", Type: "select", Default: "", OptionSource: "personas", Help: "选择人格目录中的稳定 ID；为空时继续使用当前配置中的系统提示词。"},
+		{Key: "persona.system_prompt", Group: "persona", Label: "系统提示词", Type: "textarea", Default: "你是 Abot，一个可靠、简洁、遵守用户意图的中文 AI 助手。", Help: "兼容旧配置；选择人格 ID 后由人格目录中的指令覆盖。"},
+		{Key: "context.compaction.enabled", Group: "context", Label: "启用上下文压缩", Type: "boolean", Default: true, Help: "使用 ADK 原生压缩保留长对话的最近事件。"},
+		{Key: "context.compaction.trigger_ratio", Group: "context", Label: "压缩触发比例", Type: "number", Default: 0.8, Min: floatPtr(0.1), Max: floatPtr(0.99), Help: "上下文窗口达到该比例时触发压缩。"},
+		{Key: "context.compaction.safety_tokens", Group: "context", Label: "压缩安全余量", Type: "integer", Default: 512, Min: floatPtr(0), Max: floatPtr(100000), Help: "为模型输出预算保留的 token 余量。"},
+		{Key: "context.compaction.retention_events", Group: "context", Label: "压缩后保留事件数", Type: "integer", Default: 10, Min: floatPtr(1), Max: floatPtr(1000), Help: "压缩后保留的最近会话事件数量。"},
+		{Key: "context.compaction.sliding_interval", Group: "context", Label: "滑动窗口压缩间隔", Type: "integer", Default: 0, Min: floatPtr(0), Max: floatPtr(1000), Help: "每完成指定数量的用户轮次后生成一次滑动窗口摘要；0 表示关闭。"},
+		{Key: "context.compaction.sliding_overlap", Group: "context", Label: "滑动窗口重叠轮次", Type: "integer", Default: 0, Min: floatPtr(0), Max: floatPtr(100), Help: "下一次滑动窗口重复携带的已摘要轮次数；必须不大于压缩间隔。"},
+		{Key: "context.compaction.unknown_window_tokens", Group: "context", Label: "未知窗口兜底 token", Type: "integer", Default: 8192, Min: floatPtr(1024), Max: floatPtr(1000000), Help: "模型目录没有上下文窗口时使用的保守估计。"},
+		{Key: "agent.max_tool_calls", Group: "agent", Label: "单轮最大工具调用数", Type: "integer", Default: 20, Min: floatPtr(1), Max: floatPtr(100), Help: "达到上限后 Agent 会暂时移除工具声明，要求模型先给出当前结果。"},
+		{Key: "agent.tool_schema_budget_tokens", Group: "agent", Label: "工具 Schema token 预算", Type: "integer", Default: 4096, Min: floatPtr(256), Max: floatPtr(100000), Help: "限制单次模型请求携带的工具 Schema 大小；超出时按确定性评分裁剪可选工具。"},
+		{Key: "workspace.enabled", Group: "workspace", Label: "启用项目能力", Type: "boolean", Default: true, Help: "关闭后 Agent 不会加载当前项目工具。"},
+		{Key: "workspace.read_enabled", Group: "workspace", Label: "允许读取项目", Type: "boolean", Default: true, DisplayIf: map[string]any{"workspace.enabled": true}, Help: "控制列目录、读文件、搜索和 Git 状态工具。"},
+		{Key: "workspace.write_enabled", Group: "workspace", Label: "允许申请写入", Type: "boolean", Default: true, DisplayIf: map[string]any{"workspace.enabled": true}, Help: "写入仍然必须在工作区页面中由用户批准。"},
+		{Key: "workspace.exec_enabled", Group: "workspace", Label: "允许申请执行命令", Type: "boolean", Default: true, DisplayIf: map[string]any{"workspace.enabled": true}, Help: "命令仍然必须由用户批准，且只在项目目录边界内执行。"},
+		{Key: "workspace.git_enabled", Group: "workspace", Label: "允许读取 Git 状态", Type: "boolean", Default: true, DisplayIf: map[string]any{"workspace.enabled": true, "workspace.read_enabled": true}, Help: "控制 Agent 是否能调用项目 Git 状态工具；页面上的手动查看仍可用。"},
+		{Key: "workspace.command_timeout_seconds", Group: "workspace", Label: "命令超时秒数", Type: "integer", Default: 60, Min: floatPtr(1), Max: floatPtr(120), DisplayIf: map[string]any{"workspace.exec_enabled": true}, Help: "限制 Agent 申请的单次项目命令运行时间。"},
+		{Key: "message.streaming_enabled", Group: "message", Label: "启用流式输出", Type: "boolean", Default: true, Help: "关闭后 WebUI 仍会等待同一轮结果，但不会逐片推送；平台消息不受影响。"},
+		{Key: "message.prompt_prefix", Group: "message", Label: "用户提示词前缀", Type: "string", Default: "", Help: "在每条用户消息前加入固定前缀；留空表示不注入。"},
+		{Key: "memory.enabled", Group: "memory", Label: "启用长期记忆", Type: "boolean", Default: false, Help: "开启后 Agent 可以检索并在用户明确要求时保存跨会话记忆。"},
+		{Key: "memory.auto_retrieve", Group: "memory", Label: "每轮自动检索", Type: "boolean", Default: false, DisplayIf: map[string]any{"memory.enabled": true}, Help: "每轮请求自动把相关记忆放入提示词；关闭时仍可由 Agent 按需检索。"},
+		{Key: "memory.max_results", Group: "memory", Label: "最多检索记忆数", Type: "integer", Default: 8, Min: floatPtr(1), Max: floatPtr(50), DisplayIf: map[string]any{"memory.enabled": true}, Help: "限制单轮注入或返回给 Agent 的记忆数量。"},
+	}}
+}
+
+func runtimeFromValues(values Values) Runtime {
+	return Runtime{
+		AIEnabled:                     boolOr(values["ai.enabled"], true),
+		ProviderID:                    stringOr(values["ai.default_provider_id"]),
+		ModelID:                       stringOr(values["ai.default_model_id"]),
+		AITemperature:                 numberOr(values["ai.temperature"], 0.7),
+		AITopP:                        numberOr(values["ai.top_p"], 1.0),
+		AIMaxOutputTokens:             intOr(values["ai.max_output_tokens"], 0),
+		AIRequestRetries:              intOr(values["ai.request_retries"], 2),
+		PersonaID:                     stringOr(values["persona.id"]),
+		Instruction:                   stringOrDefault(values["persona.system_prompt"], "你是 Abot，一个可靠、简洁、遵守用户意图的中文 AI 助手。"),
+		CompactionEnabled:             boolOr(values["context.compaction.enabled"], true),
+		CompactionRatio:               numberOr(values["context.compaction.trigger_ratio"], 0.8),
+		CompactionSafetyTokens:        intOr(values["context.compaction.safety_tokens"], 512),
+		CompactionRetentionEvents:     intOr(values["context.compaction.retention_events"], 10),
+		CompactionInterval:            intOr(values["context.compaction.sliding_interval"], 0),
+		CompactionOverlap:             intOr(values["context.compaction.sliding_overlap"], 0),
+		CompactionUnknownWindowTokens: intOr(values["context.compaction.unknown_window_tokens"], 8192),
+		AgentMaxToolCalls:             intOr(values["agent.max_tool_calls"], 20),
+		ToolSchemaBudgetTokens:        intOr(values["agent.tool_schema_budget_tokens"], 4096),
+		WorkspaceEnabled:              boolOr(values["workspace.enabled"], true),
+		WorkspaceReadEnabled:          boolOr(values["workspace.read_enabled"], true),
+		WorkspaceWriteEnabled:         boolOr(values["workspace.write_enabled"], true),
+		WorkspaceExecEnabled:          boolOr(values["workspace.exec_enabled"], true),
+		WorkspaceGitEnabled:           boolOr(values["workspace.git_enabled"], true),
+		WorkspaceCommandTimeoutSecs:   intOr(values["workspace.command_timeout_seconds"], 60),
+		MessageStreamingEnabled:       boolOr(values["message.streaming_enabled"], true),
+		MessagePromptPrefix:           stringOr(values["message.prompt_prefix"]),
+		MemoryEnabled:                 boolOr(values["memory.enabled"], false),
+		MemoryAutoRetrieve:            boolOr(values["memory.auto_retrieve"], false),
+		MemoryMaxResults:              intOr(values["memory.max_results"], 8),
+	}
+}
+
+func normalizeProfile(item Profile) Profile {
+	item.ID = strings.TrimSpace(item.ID)
+	item.Name = strings.TrimSpace(item.Name)
+	if item.Values == nil {
+		item.Values = Values{}
+	}
+	item.Values = cloneValues(item.Values)
+	return item
+}
+
+func validateID(id string) error {
+	if id == "" || len(id) > 64 || id[0] < 'a' || id[0] > 'z' {
+		return fmt.Errorf("%w: 配置 ID 必须以小写字母开头且不超过 64 个字符", ErrInvalidRequest)
+	}
+	for _, value := range id {
+		if value != '_' && value != '-' && (value < 'a' || value > 'z') && (value < '0' || value > '9') {
+			return fmt.Errorf("%w: 配置 ID 只能使用小写字母、数字、_、-", ErrInvalidRequest)
+		}
+	}
+	return nil
+}
+
+func (s *Service) nameConflict(ctx context.Context, name, exceptID string) (bool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false, nil
+	}
+	items, err := s.repository.ListProfiles(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, item := range items {
+		if item.ID != exceptID && strings.EqualFold(strings.TrimSpace(item.Name), name) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func normalizeSystemSettings(settings SystemSettings) SystemSettings {
+	if strings.TrimSpace(settings.LogLevel) == "" {
+		settings.LogLevel = "info"
+	}
+	settings.LogLevel = strings.ToLower(strings.TrimSpace(settings.LogLevel))
+	if settings.RequestTimeoutSeconds == 0 {
+		settings.RequestTimeoutSeconds = 300
+	}
+	return settings
+}
+
+func validateSystemSettings(settings SystemSettings) error {
+	switch settings.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("%w: 日志等级必须是 debug、info、warn 或 error", ErrInvalidRequest)
+	}
+	if settings.RequestTimeoutSeconds < 30 || settings.RequestTimeoutSeconds > 3600 {
+		return fmt.Errorf("%w: 全局请求超时必须在 30-3600 秒之间", ErrInvalidRequest)
+	}
+	return nil
+}
+
+func cloneValues(values Values) Values {
+	result := make(Values, len(values))
+	for key, value := range values {
+		result[key] = cloneValue(value)
+	}
+	return result
+}
+
+func cloneValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(typed))
+		for key, child := range typed {
+			result[key] = cloneValue(child)
+		}
+		return result
+	case []any:
+		result := make([]any, len(typed))
+		for index, child := range typed {
+			result[index] = cloneValue(child)
+		}
+		return result
+	default:
+		return value
+	}
+}
+
+func cloneSchema(schema Schema) Schema {
+	schema.Fields = append([]Field(nil), schema.Fields...)
+	for index := range schema.Fields {
+		schema.Fields[index].Options = append([]SchemaOption(nil), schema.Fields[index].Options...)
+		if schema.Fields[index].DisplayIf != nil {
+			schema.Fields[index].DisplayIf = cloneValues(schema.Fields[index].DisplayIf)
+		}
+	}
+	return schema
+}
+
+func boolValue(value any) (bool, bool) {
+	result, ok := value.(bool)
+	return result, ok
+}
+
+func boolOr(value any, fallback bool) bool {
+	if result, ok := boolValue(value); ok {
+		return result
+	}
+	return fallback
+}
+
+func numberValue(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case int32:
+		return float64(typed), true
+	case uint:
+		return float64(typed), true
+	case uint64:
+		return float64(typed), true
+	case jsonNumber:
+		number, err := typed.Float64()
+		return number, err == nil
+	default:
+		return 0, false
+	}
+}
+
+// jsonNumber 是一个很小的适配接口，避免配置包必须暴露 encoding/json 的实现类型。
+type jsonNumber interface{ Float64() (float64, error) }
+
+func integerValue(value any) (int, bool) {
+	number, ok := numberValue(value)
+	if !ok || math.Trunc(number) != number || number < float64(-int(^uint(0)>>1)-1) || number > float64(int(^uint(0)>>1)) {
+		return 0, false
+	}
+	return int(number), true
+}
+
+func intOr(value any, fallback int) int {
+	if result, ok := integerValue(value); ok {
+		return result
+	}
+	return fallback
+}
+
+func numberOr(value any, fallback float64) float64 {
+	if result, ok := numberValue(value); ok {
+		return result
+	}
+	return fallback
+}
+
+func stringOr(value any) string {
+	result, _ := value.(string)
+	return strings.TrimSpace(result)
+}
+
+func stringOrDefault(value any, fallback string) string {
+	if result := stringOr(value); result != "" {
+		return result
+	}
+	return fallback
+}
+
+func nameOr(value, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
+	}
+	return fallback
+}
+
+func floatPtr(value float64) *float64 { return &value }
+
+func newID(prefix string) string {
+	var buffer [6]byte
+	if _, err := rand.Read(buffer[:]); err != nil {
+		return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	}
+	return prefix + "-" + hex.EncodeToString(buffer[:])
+}

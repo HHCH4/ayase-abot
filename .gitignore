@@ -1,0 +1,47 @@
+# 本地运行数据与数据库
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# 本地密钥与凭据
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials.json
+credentials.*.json
+service-account*.json
+.netrc
+.npmrc
+.pypirc
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+
+# 日志与本地开发环境
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# 本地构建产物与依赖
+/abot
+/ayase-abot
+/web/node_modules/
+
+# 内部文档
+/docs/

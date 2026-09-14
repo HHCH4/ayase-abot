@@ -1,0 +1,144 @@
+{
+  "scenario": "reject",
+  "note": "Phase 0 HITL 基线：暂停 + 拒绝恢复。拒绝结果由 ADK 以错误 FunctionResponse 形式给出。",
+  "turns": [
+    {
+      "name": "pause",
+      "events": [
+        {
+          "author": "user",
+          "invocation_id": "id#1",
+          "state_delta": {
+            "abot_invocation_id": "abot-inv-1"
+          },
+          "parts": [
+            {
+              "kind": "text",
+              "text": "请修改 notes.txt"
+            }
+          ]
+        },
+        {
+          "author": "abot_spike_agent",
+          "invocation_id": "id#1",
+          "parts": [
+            {
+              "kind": "function_call",
+              "name": "workspace_patch",
+              "id": "id#2",
+              "args": {
+                "content": "hello",
+                "path": "notes.txt"
+              }
+            }
+          ]
+        },
+        {
+          "author": "abot_spike_agent",
+          "invocation_id": "id#1",
+          "skip_summarization": true,
+          "requested_tool_confirmations": {
+            "id#2": {
+              "confirmed": false,
+              "hint": "请审批对 notes.txt 的写入（digest d821b74035d6752c）",
+              "payload": {
+                "approval_id": "apv_d821b74035d6",
+                "digest": "d821b74035d6752c",
+                "operation_id": "op_d821b74035d6"
+              }
+            }
+          },
+          "parts": [
+            {
+              "kind": "function_response",
+              "name": "workspace_patch",
+              "id": "id#2",
+              "response": {
+                "approval_id": "apv_d821b74035d6",
+                "digest": "d821b74035d6752c",
+                "operation_id": "op_d821b74035d6",
+                "status": "waiting_approval"
+              }
+            }
+          ]
+        },
+        {
+          "author": "abot_spike_agent",
+          "invocation_id": "id#1",
+          "long_running_tool_ids": [
+            "id#3"
+          ],
+          "parts": [
+            {
+              "kind": "function_call",
+              "name": "adk_request_confirmation",
+              "id": "id#3",
+              "args": {
+                "originalFunctionCall": {
+                  "args": {
+                    "content": "hello",
+                    "path": "notes.txt"
+                  },
+                  "id": "id#2",
+                  "name": "workspace_patch"
+                },
+                "toolConfirmation": {
+                  "confirmed": false,
+                  "hint": "请审批对 notes.txt 的写入（digest d821b74035d6752c）",
+                  "payload": {
+                    "approval_id": "apv_d821b74035d6",
+                    "digest": "d821b74035d6752c",
+                    "operation_id": "op_d821b74035d6"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "reject_resume",
+      "events": [
+        {
+          "author": "user",
+          "invocation_id": "id#1",
+          "parts": [
+            {
+              "kind": "function_response",
+              "name": "adk_request_confirmation",
+              "id": "id#3",
+              "response": {
+                "confirmed": false
+              }
+            }
+          ]
+        },
+        {
+          "author": "abot_spike_agent",
+          "invocation_id": "id#1",
+          "parts": [
+            {
+              "kind": "function_response",
+              "name": "workspace_patch",
+              "id": "id#2",
+              "response": {
+                "error": "error tool \"workspace_patch\" call is rejected"
+              }
+            }
+          ]
+        },
+        {
+          "author": "abot_spike_agent",
+          "invocation_id": "id#1",
+          "parts": [
+            {
+              "kind": "text",
+              "text": "已按拒绝取消修改。"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
