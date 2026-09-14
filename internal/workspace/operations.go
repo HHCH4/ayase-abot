@@ -1140,23 +1140,36 @@ func executeWorkspaceCommandForService(service *Service, ctx context.Context, it
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		// 只传递构建工具常用的基础环境，避免把 Abot 的 API Key 等秘密交给项目命令。
 		cmd.Env = workspaceCommandEnvironment()
-		stdoutPipe, pipeErr := cmd.StdoutPipe()
+		// 使用显式 pipe，避免 cmd.Wait 在读取 goroutine 排空前关闭
+		// StdoutPipe/StderrPipe 的读取端，导致短命令的尾部输出丢失。
+		stdoutRead, stdoutWrite, pipeErr := os.Pipe()
 		if pipeErr != nil {
 			return CommandResult{ExitCode: -1, StartFailed: true, DurationMS: time.Since(started).Milliseconds()}, fmt.Errorf("创建 stdout 管道失败: %w", pipeErr)
 		}
-		stderrPipe, pipeErr := cmd.StderrPipe()
+		stderrRead, stderrWrite, pipeErr := os.Pipe()
 		if pipeErr != nil {
+			_ = stdoutRead.Close()
+			_ = stdoutWrite.Close()
 			return CommandResult{ExitCode: -1, StartFailed: true, DurationMS: time.Since(started).Milliseconds()}, fmt.Errorf("创建 stderr 管道失败: %w", pipeErr)
 		}
+		cmd.Stdout = stdoutWrite
+		cmd.Stderr = stderrWrite
 		if err = cmd.Start(); err != nil {
+			_ = stdoutRead.Close()
+			_ = stdoutWrite.Close()
+			_ = stderrRead.Close()
+			_ = stderrWrite.Close()
 			return CommandResult{ExitCode: -1, StartFailed: true, DurationMS: time.Since(started).Milliseconds()}, fmt.Errorf("启动命令失败: %w", err)
 		}
+		// 父进程不写输出 pipe；启动后立即关闭写端，否则读端无法收到 EOF。
+		_ = stdoutWrite.Close()
+		_ = stderrWrite.Close()
 		stdout := newObservedBuffer(ctx, "stdout")
 		stderr := newObservedBuffer(ctx, "stderr")
 		var drain sync.WaitGroup
 		drain.Add(2)
-		go drainCommandPipe(stdoutPipe, stdout, &drain)
-		go drainCommandPipe(stderrPipe, stderr, &drain)
+		go drainCommandPipe(stdoutRead, stdout, &drain)
+		go drainCommandPipe(stderrRead, stderr, &drain)
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
 		waitErr := error(nil)
@@ -1175,9 +1188,14 @@ func executeWorkspaceCommandForService(service *Service, ctx context.Context, it
 				unknown = true
 			}
 		}
-		if !unknown {
-			drain.Wait()
+		if unknown {
+			// 命令状态无法确认时主动解除读取阻塞，避免泄漏 drain goroutine。
+			_ = stdoutRead.Close()
+			_ = stderrRead.Close()
 		}
+		drain.Wait()
+		_ = stdoutRead.Close()
+		_ = stderrRead.Close()
 		result := CommandResult{Output: stdout.String() + stderr.String(), Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: exitCode(waitErr), Truncated: stdout.Truncated() || stderr.Truncated(), TimedOut: timedOut, Unknown: unknown, Started: true, DurationMS: time.Since(started).Milliseconds(), StdoutBytes: stdout.BytesWritten(), StderrBytes: stderr.BytesWritten()}
 		if unknown {
 			return result, fmt.Errorf("命令结束状态未知")
