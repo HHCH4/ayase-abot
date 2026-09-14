@@ -60,7 +60,6 @@ func TestOneBotReverseWebSocketReceivesAndSends(t *testing.T) {
 		if message.ChatID != "2002" || message.UserID != "1001" || message.Text != "你好" || message.ChatType != "group" {
 			t.Fatalf("OneBot 入站消息解析错误: %#v", message)
 		}
-		cancel()
 	case <-time.After(3 * time.Second):
 		t.Fatal("等待 OneBot 入站消息超时")
 	}
@@ -74,6 +73,9 @@ func TestOneBotReverseWebSocketReceivesAndSends(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("等待 OneBot 出站动作超时")
 	}
+	// handler 只有在 Send 完成后才会返回读取循环；提前取消
+	// context 会关闭 WebSocket，使本测试在 -race 慢路径上丢失出站动作。
+	cancel()
 	select {
 	case err := <-runDone:
 		if err != nil {
