@@ -158,10 +158,10 @@ func TestNonzeroExitIsNotRuntimeFailure(t *testing.T) {
 
 // TestSelfSignaledProcessReportsSignal 区分“进程自己被信号终止”和“被 Runtime 取消”。
 func TestSelfSignaledProcessReportsSignal(t *testing.T) {
-	dir := t.TempDir()
-	script := writeScript(t, dir, "run.sh", "kill -TERM $$\n")
-
-	result, _, err := runWithDeadline(context.Background(), processSpec{Script: script})
+	// 让 startLocalProcess 直接启动的 shell 给自己发信号。如果改为先启动
+	// 脚本子进程，dash 会将子进程的 SIGTERM 折算为正常退出码 143，
+	// 无法验证被观察进程的 WaitStatus.Signaled 语义。
+	result, _, err := runWithDeadline(context.Background(), processSpec{Script: "kill -TERM $$"})
 	if err != nil {
 		t.Fatalf("执行失败: %v", err)
 	}
