@@ -70,6 +70,7 @@ type workspaceOperationRow struct {
 	DurationMS         int64
 	TimedOut           bool
 	Unknown            bool
+	RetryOf            string `gorm:"index;size:80"`
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 }
@@ -235,7 +236,7 @@ func (r *workspaceRepository) SaveOperation(ctx context.Context, item workspace.
 		PatchesJSON: marshalPatches(item.Patches), ExpectedDigest: item.ExpectedDigest,
 		Diff: item.Diff, DiffArtifactJSON: marshalArtifactRef(item.DiffArtifact), OutputArtifactJSON: marshalArtifactRef(item.OutputArtifact), ArtifactError: item.ArtifactError, Status: string(item.Status), Result: item.Result, Error: item.Error,
 		ExitCode: item.ExitCode, CommandOutcome: item.CommandOutcome, OutputDigest: item.OutputDigest, OutputTruncated: item.OutputTruncated,
-		DurationMS: item.DurationMS, TimedOut: item.TimedOut, Unknown: item.Unknown,
+		DurationMS: item.DurationMS, TimedOut: item.TimedOut, Unknown: item.Unknown, RetryOf: item.RetryOf,
 		CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 	}
 	return r.db.WithContext(ctx).Save(&row).Error
@@ -276,7 +277,7 @@ func operationFromRow(row workspaceOperationRow) workspace.Operation {
 		Patches: unmarshalPatches(row.PatchesJSON), ExpectedDigest: row.ExpectedDigest,
 		Timeout: row.Timeout, TTY: unmarshalTTYSpec(row.TTYJSON), Preview: preview, Diff: row.Diff, DiffArtifact: unmarshalArtifactRef(row.DiffArtifactJSON), OutputArtifact: unmarshalArtifactRef(row.OutputArtifactJSON), ArtifactError: row.ArtifactError, Status: workspace.OperationStatus(row.Status), Result: row.Result,
 		Error: row.Error, ExitCode: row.ExitCode, CommandOutcome: row.CommandOutcome, OutputDigest: row.OutputDigest, OutputTruncated: row.OutputTruncated,
-		DurationMS: row.DurationMS, TimedOut: row.TimedOut, Unknown: row.Unknown, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+		DurationMS: row.DurationMS, TimedOut: row.TimedOut, Unknown: row.Unknown, RetryOf: row.RetryOf, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}
 }
 

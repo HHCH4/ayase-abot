@@ -75,6 +75,11 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .empty-panel code { color: var(--brand); }
 .muted { color: var(--muted); font-size: 12px; line-height: 1.55; }
 .error-text { color: #d14343; font-size: 12px; }
+/* unknown 终态提示：说明副作用未知且不会自动重跑，与普通错误区分开。 */
+.unknown-note { margin: 4px 0 0; padding: 6px 9px; border-left: 3px solid #e6a23c; border-radius: 6px; background: #fff8ec; color: #8a6116; font-size: 12px; line-height: 1.55; }
+.artifact-summary { display: grid; gap: 8px; }
+.artifact-summary p { margin: 0; color: #4a5563; font-size: 12px; line-height: 1.6; }
+.artifact-summary .diff-viewer { max-height: 46vh; }
 .full-width { width: 100%; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; clip-path: inset(50%); }
 

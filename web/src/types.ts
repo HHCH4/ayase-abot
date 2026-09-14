@@ -489,6 +489,32 @@ export interface SystemSettingsResponse extends SystemSettings {
   schema?: ConfigField[]
 }
 
+/**
+ * ArtifactExtraction 是有界、仅元数据的提取结果。它不含对象正文，
+ * warnings 会说明提取器做不到什么。
+ */
+export interface ArtifactExtraction {
+  kind: string
+  extractor: string
+  version: string
+  source_digest: string
+  source_size: number
+  preview?: string
+  truncated?: boolean
+  image?: { format: string; width?: number; height?: number }
+  pdf?: { version?: string; pages?: number; encrypted?: boolean }
+  archive?: {
+    format: string
+    entries: number
+    total_uncompressed?: number
+    truncated?: boolean
+    names?: string[]
+    suspicious_paths?: string[]
+  }
+  warnings?: string[]
+  extracted_at: string
+}
+
 export interface ArtifactRef {
   id: string
   version: number
@@ -541,6 +567,8 @@ export interface Operation {
   duration_ms?: number
   timed_out?: boolean
   unknown?: boolean
+  /** 重试操作指向的源操作 ID；只有人工重试才会设置。 */
+  retry_of?: string
   status: string
   created_at?: string
 }

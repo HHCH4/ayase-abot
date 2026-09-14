@@ -4,7 +4,7 @@ import { NAlert, NButton, NCard, NEmpty, NForm, NFormItem, NInput, NInputNumber,
 import { artifactContentURL, cancelCommandRun, commandOutputDownloadURL, readCommandRuns, readLocalDirectories, readOperations, readRemoteDirectories, readWorkspaceFiles, request } from '@/api'
 import { useAppStore } from '@/stores/app'
 import { useRoute, useRouter } from 'vue-router'
-import type { ArtifactRef, CommandRun, Conversation, DirectoryListing, Operation, TestResult, Workspace } from '@/types'
+import type { ArtifactExtraction, ArtifactRef, CommandRun, Conversation, DirectoryListing, Operation, TestResult, Workspace } from '@/types'
 
 const store = useAppStore()
 const message = useMessage()
@@ -43,6 +43,11 @@ const showDiff = ref(false)
 const selectedDiff = ref('')
 const selectedDiffTitle = ref('')
 const workspaceUserID = 'webui-user'
+const retryingOperationID = ref('')
+const showArtifactSummary = ref(false)
+const artifactSummaryTitle = ref('')
+const artifactSummaryRef = ref<ArtifactRef | null>(null)
+const artifactSummary = ref<ArtifactExtraction | null>(null)
 
 const form = reactive({
   id: '', name: '', type: 'local', root_path: '', remote_target_id: '', host: '', port: 22, user: '', auth_type: 'agent', key_path: '', password: '', host_key_fingerprint: '', enabled: true,
@@ -250,6 +255,49 @@ function commandCapabilityTooltip(operation: Operation) {
   return [capabilities.filesystem.detail, capabilities.network.detail, capabilities.process_control.detail, capabilities.credentials.detail, capabilities.reattach.detail].filter(Boolean).join('；')
 }
 
+// 只有“没有可信结果”的两个终态才允许人工重试；重试永远创建新操作，
+// 且必须再次批准，因此不会自动重放未知副作用的进程。
+function operationNeedsRetry(operation: Operation) {
+  if (operation.type !== 'execute_command') return false
+  if (operation.status === 'unknown' || operation.status === 'failed') return true
+  // 命令正常退出但退出码非零：操作状态是 completed，结果却是失败的。
+  return operation.status === 'completed' && operation.command_outcome === 'nonzero'
+}
+
+function operationOutcomeNotice(operation: Operation) {
+  const reason = operation.error || '命令的进程控制句柄已丢失，副作用未知。'
+  return `${reason} Abot 不会自动重跑这条命令。`
+}
+
+function operationRetryLabel(operation: Operation) {
+  return operation.retry_of ? `重试自 ${operation.retry_of}` : ''
+}
+
+async function retryOperation(operation: Operation) {
+  retryingOperationID.value = operation.id
+  try {
+    const created = await request<Operation>(`/api/v1/workspace-operations/${encodeURIComponent(operation.id)}/retry`, { method: 'POST', body: '{}' })
+    await loadOperations()
+    message.success(created.status === 'prepared' ? '已创建新的待批准操作，批准后才会执行' : '已创建重试操作')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '重试失败')
+  } finally {
+    retryingOperationID.value = ''
+  }
+}
+
+async function openArtifactSummary(ref: ArtifactRef, title: string) {
+  try {
+    const extraction = await request<ArtifactExtraction>(`/api/v1/artifacts/${encodeURIComponent(ref.id)}/extract`, { method: 'POST', body: '{}' })
+    artifactSummaryRef.value = ref
+    artifactSummary.value = extraction
+    artifactSummaryTitle.value = `${title} · ${ref.name || ref.id}`
+    showArtifactSummary.value = true
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '读取摘要失败')
+  }
+}
+
 async function cancelCommand(operation: Operation) {
   const run = commandRunFor(operation)
   if (!run) return
@@ -399,7 +447,7 @@ onMounted(() => {
     <NCard class="operations-card" :bordered="false">
       <template #header><div class="section-heading-row"><div><h3>待审批与最近操作</h3><p>Agent 的文件变更和命令操作仍需用户明确批准。</p></div><NButton secondary @click="loadOperations">刷新</NButton></div></template>
       <NEmpty v-if="!operations.length" description="暂无操作" />
-      <div v-for="operation in operations" :key="operation.id" class="operation-row"><div><strong>{{ operationLabel(operation.type) }}</strong><span>{{ operation.path || operation.cwd || '.' }}</span><code>{{ operation.command || operation.preview || operation.path || '' }}</code><p v-if="operation.error" class="error-text">{{ operation.error }}</p><p v-if="operation.artifact_error" class="error-text">{{ operation.artifact_error }}</p></div><NSpace align="center"><NTag size="small">{{ operation.status }}</NTag><NTag v-if="commandRunFor(operation)" size="small" :type="commandRunFor(operation)?.status === 'exited' && commandRunFor(operation)?.outcome === 'success' ? 'success' : commandRunFor(operation)?.status === 'unknown' ? 'error' : 'warning'">命令 {{ commandRunFor(operation)?.status }}<template v-if="commandRunFor(operation)?.outcome"> · {{ commandRunFor(operation)?.outcome }}</template></NTag><NTag v-if="commandCapabilitySummary(operation)" size="small" type="warning" :title="commandCapabilityTooltip(operation)">{{ commandCapabilitySummary(operation) }}</NTag><NTag v-if="commandRunFor(operation)?.output_retention_state === 'purged'" size="small" type="default">完整日志已过期</NTag><NButton v-if="commandRunFor(operation)" size="small" tertiary :disabled="commandRunFor(operation)?.output_retention_state === 'purged' && !commandRunFor(operation)?.output_artifact" @click="downloadCommand(operation)">{{ commandRunFor(operation)?.output_artifact ? '下载 Artifact 日志' : commandRunFor(operation)?.output_retention_state === 'purged' ? '日志已过期' : '下载日志' }}</NButton><NButton v-if="commandRunActive(operation)" size="small" tertiary type="warning" @click="cancelCommand(operation)">取消命令</NButton><NButton v-if="operation.diff" size="small" secondary @click="openOperationDiff(operation)">查看 diff</NButton><NButton v-if="operation.diff_artifact" tag="a" size="small" secondary :href="artifactDownloadURL(operation.diff_artifact)" :download="operation.diff_artifact.name || `diff-${operation.id}.patch`" target="_blank" rel="noopener">下载 Artifact diff</NButton><template v-if="operation.status === 'pending' || operation.status === 'prepared'"><NButton size="small" type="primary" @click="decide(operation, true)">批准</NButton><NButton size="small" tertiary type="error" @click="decide(operation, false)">拒绝</NButton></template></NSpace></div>
+      <div v-for="operation in operations" :key="operation.id" class="operation-row"><div><strong>{{ operationLabel(operation.type) }}</strong><span>{{ operation.path || operation.cwd || '.' }}</span><code>{{ operation.command || operation.preview || operation.path || '' }}</code><p v-if="operation.error" class="error-text">{{ operation.error }}</p><p v-if="operation.artifact_error" class="error-text">{{ operation.artifact_error }}</p><p v-if="operationRetryLabel(operation)" class="muted">{{ operationRetryLabel(operation) }}</p><p v-if="operationNeedsRetry(operation)" class="unknown-note">{{ operationOutcomeNotice(operation) }}</p></div><NSpace align="center"><NTag size="small">{{ operation.status }}</NTag><NTag v-if="commandRunFor(operation)" size="small" :type="commandRunFor(operation)?.status === 'exited' && commandRunFor(operation)?.outcome === 'success' ? 'success' : commandRunFor(operation)?.status === 'unknown' ? 'error' : 'warning'">命令 {{ commandRunFor(operation)?.status }}<template v-if="commandRunFor(operation)?.outcome"> · {{ commandRunFor(operation)?.outcome }}</template></NTag><NTag v-if="commandCapabilitySummary(operation)" size="small" type="warning" :title="commandCapabilityTooltip(operation)">{{ commandCapabilitySummary(operation) }}</NTag><NTag v-if="commandRunFor(operation)?.output_retention_state === 'purged'" size="small" type="default">完整日志已过期</NTag><NButton v-if="commandRunFor(operation)" size="small" tertiary :disabled="commandRunFor(operation)?.output_retention_state === 'purged' && !commandRunFor(operation)?.output_artifact" @click="downloadCommand(operation)">{{ commandRunFor(operation)?.output_artifact ? '下载 Artifact 日志' : commandRunFor(operation)?.output_retention_state === 'purged' ? '日志已过期' : '下载日志' }}</NButton><NButton v-if="commandRunActive(operation)" size="small" tertiary type="warning" @click="cancelCommand(operation)">取消命令</NButton><NButton v-if="operation.diff" size="small" secondary @click="openOperationDiff(operation)">查看 diff</NButton><NButton v-if="operation.diff_artifact" tag="a" size="small" secondary :href="artifactDownloadURL(operation.diff_artifact)" :download="operation.diff_artifact.name || `diff-${operation.id}.patch`" target="_blank" rel="noopener">下载 Artifact diff</NButton><NButton v-if="operation.output_artifact" size="small" tertiary @click="openArtifactSummary(operation.output_artifact, '命令日志摘要')">查看日志摘要</NButton><NButton v-if="operation.diff_artifact" size="small" tertiary @click="openArtifactSummary(operation.diff_artifact, 'diff 摘要')">查看 diff 摘要</NButton><NButton v-if="operationNeedsRetry(operation)" size="small" type="warning" secondary :loading="retryingOperationID === operation.id" :title="'创建一条新的同参数命令，需重新批准'" @click="retryOperation(operation)">人工重试</NButton><template v-if="operation.status === 'pending' || operation.status === 'prepared'"><NButton size="small" type="primary" @click="decide(operation, true)">批准</NButton><NButton size="small" tertiary type="error" @click="decide(operation, false)">拒绝</NButton></template></NSpace></div>
     </NCard>
 
     <NModal v-model:show="showForm" preset="card" style="width: min(760px, calc(100vw - 32px))" :title="editingID ? '编辑项目' : '创建项目'" :mask-closable="false">
@@ -435,6 +483,24 @@ onMounted(() => {
 
     <NModal v-model:show="showDiff" preset="card" style="width: min(980px, calc(100vw - 32px))" :title="selectedDiffTitle || '变更 diff'">
       <pre class="diff-viewer">{{ selectedDiff }}</pre>
+    </NModal>
+
+    <NModal v-model:show="showArtifactSummary" preset="card" style="width: min(880px, calc(100vw - 32px))" :title="artifactSummaryTitle || 'Artifact 摘要'">
+      <div v-if="artifactSummary" class="artifact-summary">
+        <NSpace align="center">
+          <NTag size="small">{{ artifactSummary.kind }}</NTag>
+          <span class="muted">提取器 {{ artifactSummary.extractor }} · v{{ artifactSummary.version }}</span>
+          <span v-if="artifactSummaryRef" class="muted">{{ artifactSummaryRef.mime_type }} · {{ artifactSummaryRef.size }} bytes</span>
+        </NSpace>
+        <p v-if="artifactSummary.image">图片 {{ artifactSummary.image.format }} · {{ artifactSummary.image.width }} × {{ artifactSummary.image.height }}</p>
+        <p v-if="artifactSummary.pdf">PDF {{ artifactSummary.pdf.version }} · {{ artifactSummary.pdf.pages || '未知' }} 页<template v-if="artifactSummary.pdf.encrypted"> · 已加密</template></p>
+        <p v-if="artifactSummary.archive">归档 {{ artifactSummary.archive.format }} · {{ artifactSummary.archive.entries }} 个条目<template v-if="artifactSummary.archive.total_uncompressed"> · 解压约 {{ artifactSummary.archive.total_uncompressed }} bytes</template><template v-if="artifactSummary.archive.truncated"> · 清单已截断</template></p>
+        <p v-for="warning in artifactSummary.warnings" :key="warning" class="muted">· {{ warning }}</p>
+        <p v-if="artifactSummary.archive?.suspicious_paths?.length" class="error-text">包含可逃逸根目录的成员名：{{ artifactSummary.archive?.suspicious_paths?.join('、') }}</p>
+        <pre v-if="artifactSummary.preview" class="diff-viewer">{{ artifactSummary.preview }}</pre>
+        <p v-if="artifactSummary.truncated" class="muted">预览已截断，下载原件可查看完整内容。</p>
+        <p v-if="!artifactSummary.preview && artifactSummary.kind === 'metadata'" class="muted">该格式只提供元数据，不提取正文内容。</p>
+      </div>
     </NModal>
   </div>
 </template>

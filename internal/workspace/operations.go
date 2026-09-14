@@ -209,7 +209,7 @@ func (s *Service) CreateOperation(ctx context.Context, request OperationRequest)
 		Path: request.Path, Content: request.Content, PatchOld: request.OldText, PatchNew: request.NewText, Command: request.Command,
 		Patches:        append([]FilePatch(nil), request.Patches...),
 		ExpectedDigest: request.ExpectedDigest,
-		CWD:            request.CWD, Timeout: request.Timeout, TTY: cloneTTYSpec(request.TTY), Status: OperationPrepared,
+		CWD:            request.CWD, Timeout: request.Timeout, TTY: cloneTTYSpec(request.TTY), RetryOf: request.RetryOf, Status: OperationPrepared,
 		CreatedAt: now, UpdatedAt: now,
 	}
 	if operation.Type == OperationWriteFile {
@@ -607,6 +607,7 @@ func operationRequestFromOperation(operation Operation) OperationRequest {
 		OldText: operation.PatchOld, NewText: operation.PatchNew,
 		Patches: append([]FilePatch(nil), operation.Patches...), ExpectedDigest: operation.ExpectedDigest,
 		Command: operation.Command, CWD: operation.CWD, Timeout: operation.Timeout, TTY: cloneTTYSpec(operation.TTY),
+		RetryOf: operation.RetryOf,
 	}
 }
 

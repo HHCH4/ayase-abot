@@ -936,6 +936,23 @@ func (s *Server) approveWorkspaceOperation(writer http.ResponseWriter, request *
 	writeJSON(writer, http.StatusOK, operation)
 }
 
+// retryWorkspaceOperation creates a new operation for a failed or unknown
+// command. The response is a fresh prepared operation, so nothing runs until a
+// human approves it.
+func (s *Server) retryWorkspaceOperation(writer http.ResponseWriter, request *http.Request) {
+	service, err := s.requireWorkspaces()
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	operation, err := service.RetryOperation(request.Context(), request.PathValue("id"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, operation)
+}
+
 func (s *Server) rejectWorkspaceOperation(writer http.ResponseWriter, request *http.Request) {
 	service, err := s.requireWorkspaces()
 	if err != nil {

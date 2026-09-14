@@ -485,15 +485,19 @@ type Operation struct {
 	// Command outcome metadata is populated only after an execute_command
 	// operation reaches a terminal state. Keeping the exit code as a pointer
 	// distinguishes a real zero exit code from a non-command/unknown outcome.
-	ExitCode        *int      `json:"exit_code,omitempty"`
-	CommandOutcome  string    `json:"command_outcome,omitempty"`
-	OutputDigest    string    `json:"output_digest,omitempty"`
-	OutputTruncated bool      `json:"output_truncated,omitempty"`
-	DurationMS      int64     `json:"duration_ms,omitempty"`
-	TimedOut        bool      `json:"timed_out,omitempty"`
-	Unknown         bool      `json:"unknown,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ExitCode        *int   `json:"exit_code,omitempty"`
+	CommandOutcome  string `json:"command_outcome,omitempty"`
+	OutputDigest    string `json:"output_digest,omitempty"`
+	OutputTruncated bool   `json:"output_truncated,omitempty"`
+	DurationMS      int64  `json:"duration_ms,omitempty"`
+	TimedOut        bool   `json:"timed_out,omitempty"`
+	Unknown         bool   `json:"unknown,omitempty"`
+	// RetryOf points at the failed or unknown operation this one was created
+	// from. A retry is always a new operation: the original attempt may still
+	// be running outside Abot's control, so it is never replayed.
+	RetryOf   string    `json:"retry_of,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // CommandRunStatus is the independent lifecycle of one real command
@@ -835,6 +839,10 @@ type OperationRequest struct {
 	CWD            string   `json:"cwd,omitempty"`
 	Timeout        int      `json:"timeout_seconds,omitempty"`
 	TTY            *TTYSpec `json:"tty,omitempty"`
+	// RetryOf is accepted only from the retry path inside the service. The HTTP
+	// create endpoint maps an explicit payload and never forwards it, so a
+	// client cannot claim an operation is a retry of something else.
+	RetryOf string `json:"retry_of,omitempty"`
 }
 
 // FilePatch is one exact text replacement inside a ChangeSet. ExpectedDigest

@@ -446,6 +446,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/command-runs/{id}/cancel", s.cancelWorkspaceCommandRun)
 	mux.HandleFunc("POST /api/v1/workspace-operations/{id}/approve", s.approveWorkspaceOperation)
 	mux.HandleFunc("POST /api/v1/workspace-operations/{id}/reject", s.rejectWorkspaceOperation)
+	mux.HandleFunc("POST /api/v1/workspace-operations/{id}/retry", s.retryWorkspaceOperation)
 	mux.HandleFunc("GET /api/v1/conversations", s.listConversations)
 	mux.HandleFunc("POST /api/v1/conversations", s.createConversation)
 	mux.HandleFunc("GET /api/v1/conversations/{id}", s.getConversation)
