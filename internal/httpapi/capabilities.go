@@ -38,6 +38,7 @@ type capabilityProbePayload struct {
 	IncludeStructuredSchema *bool `json:"include_structured_schema"`
 	IncludeReasoning        *bool `json:"include_reasoning"`
 	IncludeImages           *bool `json:"include_images"`
+	IncludeAudio            *bool `json:"include_audio"`
 	IncludeInputFiles       *bool `json:"include_input_files"`
 	MaxOutputTokens         int   `json:"max_output_tokens"`
 }
@@ -70,6 +71,9 @@ func (p capabilityProbePayload) domain() provider.CapabilityProbeOptions {
 	}
 	if p.IncludeImages != nil {
 		options.IncludeImages = *p.IncludeImages
+	}
+	if p.IncludeAudio != nil {
+		options.IncludeAudio = *p.IncludeAudio
 	}
 	if p.IncludeInputFiles != nil {
 		options.IncludeInputFiles = *p.IncludeInputFiles

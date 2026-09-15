@@ -1631,6 +1631,39 @@ func NewCoordinator(kernel *agent.Kernel, repo Repository) (*Coordinator, error)
 			ID: newID("event"), InvocationID: invocationID, Type: EventUsageUpdated, Timestamp: time.Now().UTC(), Data: data,
 		})
 	})
+	kernel.SetModalFallbackUsageObserver(func(ctx context.Context, invocationID string, metadata map[string]any) {
+		invocationID = strings.TrimSpace(invocationID)
+		if invocationID == "" {
+			return
+		}
+		data := map[string]any{"scope": "modal_fallback"}
+		for key, value := range metadata {
+			if key == "scope" {
+				continue
+			}
+			data[key] = value
+		}
+		_, _ = coordinator.appendAndPublish(context.WithoutCancel(ctx), AgentEvent{
+			ID: newID("event"), InvocationID: invocationID, Type: EventUsageUpdated, Timestamp: time.Now().UTC(), Data: data,
+		})
+	})
+	kernel.SetModalFallbackOutputObserver(func(ctx context.Context, invocationID, text string, metadata map[string]any) {
+		invocationID = strings.TrimSpace(invocationID)
+		text = strings.TrimSpace(text)
+		if invocationID == "" || text == "" {
+			return
+		}
+		data := map[string]any{"text": text, "scope": "modal_fallback", "source": "modal_fallback"}
+		for key, value := range metadata {
+			if key == "text" || key == "scope" || key == "source" {
+				continue
+			}
+			data[key] = value
+		}
+		_, _ = coordinator.appendAndPublish(context.WithoutCancel(ctx), AgentEvent{
+			ID: newID("event"), InvocationID: invocationID, Type: EventAssistantMessage, Timestamp: time.Now().UTC(), Data: data,
+		})
+	})
 	kernel.SetToolExecutionObserver(func(ctx context.Context, record agent.ToolExecutionRecord) {
 		invocationID := workspace.InvocationIDFromContext(ctx)
 		// The ADK context does not expose the product Invocation ID directly;
@@ -4511,7 +4544,7 @@ func (c *Coordinator) validateResumeSnapshots(ctx context.Context, invocation In
 			workspaceID = &value
 		}
 		_, currentConfig, currentErr := c.kernel.ResolveRuntimeConfigSnapshot(ctx, agent.ChatRequest{
-			UserID: invocation.UserID, BotID: invocation.BotID, ConversationID: invocation.ConversationID,
+			UserID: invocation.UserID, BotID: invocation.BotID, InvocationID: invocation.ID, ConversationID: invocation.ConversationID,
 			SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID,
 			WorkspaceID: workspaceID, TargetPath: invocation.TargetPath,
 		})
@@ -7025,7 +7058,7 @@ func (c *Coordinator) run(ctx context.Context, id string, request agent.ChatRequ
 				}
 				c.recordWorkflowToolEvidence(ctx, id, *item)
 				c.recordRuntimeCapabilityEvidence(context.WithoutCancel(ctx), id, runtimeCapabilityEvidenceFromEvent(*item), capabilityEvidenceSeen)
-				if item.Type == EventUsageUpdated && usageEventScope(*item) != "compaction" {
+				if item.Type == EventUsageUpdated && usageEventScope(*item) == "" {
 					c.recordManifestUsage(context.WithoutCancel(ctx), id, item.Data)
 				}
 			}
@@ -7476,7 +7509,7 @@ func (c *Coordinator) updateToolCallStatus(ctx context.Context, toolCallID strin
 // usage is intentionally left unknown; it must never be coerced to zero.
 func (c *Coordinator) recordManifestUsage(ctx context.Context, invocationID string, data map[string]any) {
 	manifestRepo, ok := c.repo.(ContextManifestRepository)
-	if !ok || data == nil {
+	if !ok || data == nil || usageEventScope(AgentEvent{Data: data}) != "" {
 		return
 	}
 	items, err := manifestRepo.ListContextManifests(ctx, invocationID)
@@ -8047,6 +8080,11 @@ func cloneAttachments(source []agent.Attachment) []agent.Attachment {
 		result[index].Data = append([]byte(nil), item.Data...)
 		if item.Ref != nil {
 			ref := *item.Ref
+			// Preview is a UI convenience projection and may contain extracted
+			// user content. Runtime's durable invocation envelope is intentionally
+			// metadata-only; callers can fetch a preview through the Artifact
+			// boundary when they explicitly need it.
+			ref.Preview = ""
 			result[index].Ref = &ref
 		}
 	}

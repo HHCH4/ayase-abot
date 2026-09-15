@@ -21,6 +21,7 @@ type BotForm = {
   listen_host: string
   listen_port: number | null
   listen_path: string
+  group_trigger_mode: string
   telegram_token: string
   onebot_access_token: string
   enabled: boolean
@@ -45,7 +46,7 @@ const statusMap: Record<string, { label: string; type: 'success' | 'warning' | '
 function emptyForm(): BotForm {
   return {
     id: '', name: '', type: 'onebot11', endpoint: '', onebot_mode: 'reverse-server', listen_host: '0.0.0.0', listen_port: 6199,
-    listen_path: '/ws', telegram_token: '', onebot_access_token: '', enabled: true, config_profile_id: '',
+    listen_path: '/ws', group_trigger_mode: 'mention', telegram_token: '', onebot_access_token: '', enabled: true, config_profile_id: '',
   }
 }
 
@@ -57,6 +58,7 @@ function fillForm(bot?: Bot) {
   Object.assign(form, bot ? {
     id: bot.id, name: bot.name, type: bot.type, endpoint: bot.endpoint || '', onebot_mode: bot.onebot_mode || (bot.endpoint ? 'client' : 'reverse-server'),
     listen_host: bot.listen_host || '0.0.0.0', listen_port: bot.listen_port || 6199, listen_path: bot.listen_path || '/ws',
+    group_trigger_mode: bot.group_trigger_mode || 'mention',
     telegram_token: '', onebot_access_token: '', enabled: bot.enabled !== false, config_profile_id: '',
   } : emptyForm())
 }
@@ -82,7 +84,7 @@ function createBot() {
 function payload() {
   const value: Record<string, unknown> = {
     id: form.id.trim(), name: form.name.trim(), type: form.type, endpoint: form.endpoint.trim(), onebot_mode: form.onebot_mode,
-    listen_host: form.listen_host.trim(), listen_port: form.listen_port || 0, listen_path: form.listen_path.trim(), enabled: form.enabled,
+    listen_host: form.listen_host.trim(), listen_port: form.listen_port || 0, listen_path: form.listen_path.trim(), group_trigger_mode: form.group_trigger_mode, enabled: form.enabled,
   }
   if (form.telegram_token.trim()) value.telegram_token = form.telegram_token.trim()
   if (form.onebot_access_token.trim()) value.onebot_access_token = form.onebot_access_token.trim()
@@ -230,6 +232,7 @@ onMounted(async () => {
             <NFormItem label="OneBot Access Token"><NInput v-model:value="form.onebot_access_token" type="password" show-password-on="click" :placeholder="editing ? '留空表示保留旧 Token' : '可选'" /></NFormItem>
           </template>
           <NFormItem v-else label="Telegram Bot Token"><NInput v-model:value="form.telegram_token" type="password" show-password-on="click" :placeholder="editing ? '留空表示保留旧 Token' : '请输入 Bot Token'" /></NFormItem>
+          <NFormItem label="群聊触发方式"><NSelect v-model:value="form.group_trigger_mode" :options="[{ label: '仅 @ 机器人时触发（推荐）', value: 'mention' }, { label: '群内所有消息都触发', value: 'all' }]" /></NFormItem>
 
           <div class="setting-section">
             <div class="section-heading-row"><div><h3>会话配置</h3><p>机器人创建的对话默认使用此配置；单个对话可以在 chat 页面单独绑定。</p></div></div>

@@ -48,6 +48,50 @@ func TestMemoryRepositorySequencesAndCAS(t *testing.T) {
 	}
 }
 
+func TestCoordinatorDurableInvocationStripsAttachmentPreview(t *testing.T) {
+	kernel, err := agent.NewKernel(agent.Config{
+		AppName:        "runtime-attachment-preview",
+		SessionService: session.InMemoryService(),
+		Providers: func() *provider.Registry {
+			registry, registryErr := provider.NewRegistry(context.Background(), &runtimeProviderRepository{providers: map[string]provider.Provider{}}, map[provider.Protocol]provider.Adapter{})
+			if registryErr != nil {
+				t.Fatalf("创建 provider registry 失败: %v", registryErr)
+			}
+			return registry
+		}(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := NewMemoryRepository()
+	coordinator, err := NewCoordinator(kernel, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer coordinator.Close()
+	ref := agent.AttachmentRef{ID: "artifact-1", Version: 1, Digest: "sha256:content", Kind: "input_attachment", MIMEType: "text/plain", Size: 7, Name: "note.txt", Preview: "private content"}
+	invocation, err := coordinator.StartInvocation(context.Background(), agent.ChatRequest{
+		UserID: "user-1", ConversationID: "conversation-1", SessionID: "conversation-1", Message: "读取附件",
+		Attachments: []agent.Attachment{{Name: ref.Name, MIMEType: ref.MIMEType, Ref: &ref}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invocation.Attachments[0].Ref == nil || invocation.Attachments[0].Ref.Preview != "" {
+		t.Fatalf("返回的 durable invocation 不应携带 preview: %#v", invocation.Attachments)
+	}
+	stored, err := repo.GetInvocation(context.Background(), invocation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Attachments[0].Ref == nil || stored.Attachments[0].Ref.Preview != "" {
+		t.Fatalf("持久化 invocation 不应携带 preview: %#v", stored.Attachments)
+	}
+}
+
 func TestMemoryWorkspaceBaselineIsImmutableAndDefensive(t *testing.T) {
 	repo := NewMemoryRepository()
 	now := time.Now().UTC().Truncate(time.Microsecond)
@@ -1880,6 +1924,12 @@ func TestCoordinatorRecordManifestUsageCorrelatesAndDoesNotGuessKnownSamples(t *
 	second, _ = repo.GetContextManifest(context.Background(), "call-2")
 	if *first.ActualInput != firstActual || *second.ActualInput != 22 {
 		t.Fatalf("缺少 correlation 时不应覆盖已知 usage: first=%v second=%v", *first.ActualInput, *second.ActualInput)
+	}
+	coordinator.recordManifestUsage(context.Background(), invocation.ID, map[string]any{"scope": "modal_fallback", "usage": map[string]any{"promptTokenCount": 88}})
+	first, _ = repo.GetContextManifest(context.Background(), "call-1")
+	second, _ = repo.GetContextManifest(context.Background(), "call-2")
+	if *first.ActualInput != firstActual || *second.ActualInput != 22 {
+		t.Fatalf("模态降级 usage 不应回填主模型上下文 manifest: first=%v second=%v", *first.ActualInput, *second.ActualInput)
 	}
 }
 

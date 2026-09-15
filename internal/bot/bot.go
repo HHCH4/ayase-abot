@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"Abot/internal/agent"
+	agentruntime "Abot/internal/agent/runtime"
 	"Abot/internal/conversation"
 	"Abot/internal/eventbus"
 )
@@ -70,6 +71,7 @@ type Bot struct {
 	ListenHost        string     `json:"listen_host,omitempty"`
 	ListenPort        int        `json:"listen_port,omitempty"`
 	ListenPath        string     `json:"listen_path,omitempty"`
+	GroupTriggerMode  string     `json:"group_trigger_mode,omitempty"`
 	TelegramToken     string     `json:"-"`
 	OneBotAccessToken string     `json:"-"`
 	Enabled           bool       `json:"enabled"`
@@ -111,6 +113,30 @@ type Message struct {
 	ChatType    string
 	Text        string
 	Attachments []agent.Attachment
+	// Mentioned is set by a platform adapter when a group message explicitly
+	// addresses this bot. Private messages are treated as addressed.
+	Mentioned bool
+	// Control is an adapter-produced approval decision and never enters the
+	// model prompt.
+	Control *MessageControl
+}
+
+type MessageControl struct {
+	Kind       string
+	ApprovalID string
+	Decision   bool
+	CallbackID string
+}
+
+type ApprovalPrompt struct {
+	ApprovalID string
+	ToolName   string
+	Hint       string
+	ExpiresAt  *time.Time
+}
+
+type ApprovalSender interface {
+	SendApproval(context.Context, Message, ApprovalPrompt) error
 }
 
 // Handler 是平台适配器发布消息时调用的统一回调。
@@ -118,6 +144,33 @@ type Handler func(context.Context, Message) error
 
 // RequestTimeoutResolver 读取当前全局请求超时；配置中心更新后下一条平台消息即可使用新值。
 type RequestTimeoutResolver func(context.Context) (time.Duration, error)
+
+// AttachmentStoreRequest is the narrow Bot→Artifact boundary. The callback
+// must return an Attachment containing only an immutable Ref; inline bytes are
+// never handed to Runtime in the production wiring.
+type AttachmentStoreRequest struct {
+	UserID         string
+	ConversationID string
+	ProducerType   string
+	ProducerID     string
+	Attachment     agent.Attachment
+}
+
+type AttachmentStorer func(context.Context, AttachmentStoreRequest) (agent.Attachment, error)
+
+// RuntimeCoordinator is the subset of durable Runtime used by Bot delivery.
+// Keeping this interface small makes the message boundary testable without a
+// live provider or database worker.
+type RuntimeCoordinator interface {
+	StartInvocation(context.Context, agent.ChatRequest) (agentruntime.Invocation, error)
+	GetInvocation(context.Context, string) (agentruntime.Invocation, error)
+	GetApproval(context.Context, string) (agentruntime.Approval, error)
+	ListApprovals(context.Context, string, agentruntime.ApprovalStatus) ([]agentruntime.Approval, error)
+	ListInvocations(context.Context, string, []agentruntime.InvocationStatus) ([]agentruntime.Invocation, error)
+	Subscribe(context.Context, string, int64) ([]agentruntime.AgentEvent, <-chan agentruntime.AgentEvent, func(), error)
+	CancelInvocation(context.Context, string) (agentruntime.Invocation, error)
+	ResolveApproval(context.Context, string, bool, string) (agentruntime.Approval, error)
+}
 
 // platform 是 Telegram、OneBot 等连接实现必须满足的最小接口。
 type platform interface {
@@ -134,6 +187,10 @@ func (b Bot) Validate() error {
 	b.ID = strings.TrimSpace(b.ID)
 	b.Name = strings.TrimSpace(b.Name)
 	b.Endpoint = strings.TrimSpace(b.Endpoint)
+	b.GroupTriggerMode = strings.ToLower(strings.TrimSpace(b.GroupTriggerMode))
+	if b.GroupTriggerMode != "" && b.GroupTriggerMode != "mention" && b.GroupTriggerMode != "all" {
+		return fmt.Errorf("%w: 群聊触发模式 %q 无效", ErrInvalid, b.GroupTriggerMode)
+	}
 	if !botIDPattern.MatchString(b.ID) {
 		return fmt.Errorf("%w: adapter ID 必须匹配 [a-z][a-z0-9_-]{0,63}", ErrInvalid)
 	}
@@ -219,15 +276,22 @@ type Manager struct {
 	// requestTimeoutResolver 不缓存设置，避免系统设置修改后必须重启机器人管理器。
 	requestTimeoutResolver RequestTimeoutResolver
 
-	mu        sync.RWMutex
-	saveMu    sync.Mutex
-	bots      map[string]Bot
-	runtimes  map[string]runtimeEntry
-	locks     map[string]*sync.Mutex
-	sequence  uint64
-	baseCtx   context.Context
-	closed    bool
-	waitGroup sync.WaitGroup
+	mu                  sync.RWMutex
+	saveMu              sync.Mutex
+	bots                map[string]Bot
+	runtimes            map[string]runtimeEntry
+	locks               map[string]*sync.Mutex
+	sequence            uint64
+	baseCtx             context.Context
+	closed              bool
+	waitGroup           sync.WaitGroup
+	runtimeCoordinator  RuntimeCoordinator
+	attachmentStorer    AttachmentStorer
+	activeConversations map[string]string
+	activeInvocations   map[string]string
+	observedInvocations map[string]struct{}
+	pendingApprovals    map[string][]approvalTicket
+	progressInterval    time.Duration
 }
 
 type runtimeEntry struct {
@@ -258,6 +322,8 @@ func NewManager(ctx context.Context, repository Repository, kernel *agent.Kernel
 		repository: repository, kernel: kernel, conversations: conversations,
 		bus: eventbus.New(), bots: make(map[string]Bot), runtimes: make(map[string]runtimeEntry),
 		locks: make(map[string]*sync.Mutex), baseCtx: ctx,
+		activeConversations: make(map[string]string), activeInvocations: make(map[string]string), observedInvocations: make(map[string]struct{}), pendingApprovals: make(map[string][]approvalTicket),
+		progressInterval: 30 * time.Second,
 	}
 	for _, item := range items {
 		if item.Status == "" {
@@ -290,6 +356,30 @@ func (m *Manager) Bus() *eventbus.Bus { return m.bus }
 func (m *Manager) SetRequestTimeoutResolver(resolver RequestTimeoutResolver) {
 	m.mu.Lock()
 	m.requestTimeoutResolver = resolver
+	m.mu.Unlock()
+}
+
+// SetRuntimeCoordinator switches Bot message execution to durable Runtime.
+func (m *Manager) SetRuntimeCoordinator(coordinator RuntimeCoordinator) {
+	m.mu.Lock()
+	m.runtimeCoordinator = coordinator
+	m.mu.Unlock()
+}
+
+// SetAttachmentStorer installs the Artifact boundary for platform uploads.
+func (m *Manager) SetAttachmentStorer(storer AttachmentStorer) {
+	m.mu.Lock()
+	m.attachmentStorer = storer
+	m.mu.Unlock()
+}
+
+// SetProgressInterval is primarily useful to embedders and deterministic
+// tests; production defaults to one visible heartbeat every 30 seconds.
+func (m *Manager) SetProgressInterval(interval time.Duration) {
+	m.mu.Lock()
+	if interval > 0 {
+		m.progressInterval = interval
+	}
 	m.mu.Unlock()
 }
 
@@ -354,6 +444,7 @@ func (m *Manager) Save(ctx context.Context, request SaveRequest) (Bot, error) {
 	candidate.ID = strings.TrimSpace(candidate.ID)
 	candidate.Name = strings.TrimSpace(candidate.Name)
 	candidate.Endpoint = strings.TrimSpace(candidate.Endpoint)
+	candidate.GroupTriggerMode = strings.ToLower(strings.TrimSpace(candidate.GroupTriggerMode))
 	old, oldErr := m.Get(candidate.ID)
 	if request.TelegramToken != nil {
 		candidate.TelegramToken = strings.TrimSpace(*request.TelegramToken)
@@ -651,52 +742,7 @@ func (m *Manager) handleEvent(ctx context.Context, event eventbus.Event) error {
 
 // handleMessage 为每个平台聊天建立稳定会话，并调用同一套 Agent 内核。
 func (m *Manager) handleMessage(ctx context.Context, message Message) error {
-	message.Text = strings.TrimSpace(message.Text)
-	if message.Text == "" && len(message.Attachments) == 0 {
-		return nil
-	}
-	userID, conversationID := bindingFor(message)
-	lock := m.bindingLock(conversationID)
-	lock.Lock()
-	defer lock.Unlock()
-	item, err := m.conversations.Get(ctx, userID, conversationID)
-	if errors.Is(err, conversation.ErrNotFound) {
-		item, err = m.conversations.Create(ctx, conversation.CreateRequest{
-			ID: conversationID, UserID: userID, Title: fmt.Sprintf("%s · %s", message.Platform, message.ChatID),
-		})
-	}
-	if err != nil {
-		return fmt.Errorf("创建机器人会话失败: %w", err)
-	}
-	if item.Status != conversation.StatusActive {
-		return conversation.ErrArchived
-	}
-	// 平台消息没有独立的模型选择，遵循全局默认或会话已保存的模型状态。
-	timeout, timeoutErr := m.resolveRequestTimeout(ctx)
-	if timeoutErr != nil {
-		return fmt.Errorf("读取全局请求超时失败: %w", timeoutErr)
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	var response string
-	for event, runErr := range m.kernel.Run(ctx, agent.ChatRequest{
-		UserID: userID, BotID: message.AdapterID, ConversationID: conversationID, SessionID: conversationID,
-		Message: message.Text, Attachments: message.Attachments,
-	}) {
-		if runErr != nil {
-			return fmt.Errorf("Agent 处理机器人消息失败: %w", runErr)
-		}
-		if event == nil || event.Partial || event.Content == nil || event.Author == "user" {
-			continue
-		}
-		if text := agent.TextFromContent(event.Content); text != "" {
-			response = text
-		}
-	}
-	if strings.TrimSpace(response) == "" {
-		return nil
-	}
-	return m.send(ctx, message, response)
+	return m.handleMessageWithRuntime(ctx, message)
 }
 
 // resolveRequestTimeout 返回机器人消息的兼容默认值或配置中心的当前值。

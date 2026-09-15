@@ -222,6 +222,33 @@ func TestRunCapabilityProbeOptionalSchemaReasoningAndMultimodal(t *testing.T) {
 	}
 }
 
+func TestRunCapabilityProbeAudioUsesBoundedWAVInput(t *testing.T) {
+	model := &probeTestLLM{}
+	profile := DefaultCapabilities(Provider{ID: "probe", Protocol: ProtocolOpenAICompatible}, Model{ID: "audio-model"})
+	profile.Audio = Support{State: SupportUnknown, Source: "catalog"}
+	result, err := RunCapabilityProbe(context.Background(), model, profile, CapabilityProbeOptions{
+		ExplicitOptionalSelection: true,
+		IncludeAudio:              true,
+	})
+	if err != nil {
+		t.Fatalf("audio 能力探测失败: %v", err)
+	}
+	if result.Profile.Audio.State != SupportSupported || findProbeObservation(result, "audio").State != SupportSupported {
+		t.Fatalf("audio 能力证据错误: profile=%#v observations=%#v", result.Profile.Audio, result.Observations)
+	}
+	model.mu.Lock()
+	calls := append([]probeCall(nil), model.calls...)
+	model.mu.Unlock()
+	if len(calls) != 2 {
+		t.Fatalf("audio probe 调用次数=%d，期望基础文本+audio 两次", len(calls))
+	}
+	audioRequest := probeAudioRequest(profile.ModelID, 16)
+	part := audioRequest.Contents[0].Parts[1]
+	if part.InlineData == nil || part.InlineData.MIMEType != "audio/wav" || len(part.InlineData.Data) < 12 || string(part.InlineData.Data[:4]) != "RIFF" {
+		t.Fatalf("audio probe 载荷不是受限 WAV: %#v", part.InlineData)
+	}
+}
+
 func TestRunCapabilityProbeMapsProviderSubsetRejectionsWithoutDowngradingTransientErrors(t *testing.T) {
 	model := &probeTestLLM{
 		schemaErr: errors.New("HTTP 400: unsupported response_format json_schema"),

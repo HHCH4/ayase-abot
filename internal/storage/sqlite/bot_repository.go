@@ -19,6 +19,7 @@ type botRow struct {
 	ListenHost        string `gorm:"size:255"`
 	ListenPort        int
 	ListenPath        string `gorm:"size:500"`
+	GroupTriggerMode  string `gorm:"size:16"`
 	TelegramToken     string `gorm:"size:4000"`
 	OneBotAccessToken string `gorm:"size:4000"`
 	Enabled           bool
@@ -62,7 +63,8 @@ func (r *botRepository) Save(ctx context.Context, item bot.Bot) error {
 	row := botRow{
 		ID: item.ID, Name: item.Name, Type: string(item.Type), Endpoint: item.Endpoint,
 		OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath,
-		TelegramToken: item.TelegramToken, OneBotAccessToken: item.OneBotAccessToken,
+		GroupTriggerMode: item.GroupTriggerMode,
+		TelegramToken:    item.TelegramToken, OneBotAccessToken: item.OneBotAccessToken,
 		Enabled: item.Enabled, Status: string(item.Status), StatusMessage: item.StatusMessage,
 		LastCheckedAt: item.LastCheckedAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 	}
@@ -90,7 +92,8 @@ func botFromRow(row botRow) bot.Bot {
 	return bot.Bot{
 		ID: row.ID, Name: row.Name, Type: bot.Type(row.Type), Endpoint: row.Endpoint,
 		OneBotMode: row.OneBotMode, ListenHost: row.ListenHost, ListenPort: row.ListenPort, ListenPath: row.ListenPath,
-		TelegramToken: row.TelegramToken, OneBotAccessToken: row.OneBotAccessToken,
+		GroupTriggerMode: row.GroupTriggerMode,
+		TelegramToken:    row.TelegramToken, OneBotAccessToken: row.OneBotAccessToken,
 		Enabled: row.Enabled, Status: bot.Status(row.Status), StatusMessage: row.StatusMessage,
 		LastCheckedAt: row.LastCheckedAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}

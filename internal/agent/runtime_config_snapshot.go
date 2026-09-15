@@ -85,6 +85,10 @@ type RuntimeOptionsSnapshot struct {
 	MemoryEnabled                 bool    `json:"memory_enabled"`
 	MemoryAutoRetrieve            bool    `json:"memory_auto_retrieve"`
 	MemoryMaxResults              int     `json:"memory_max_results"`
+	ModalFallbackEnabled          bool    `json:"modal_fallback_enabled"`
+	ModalFallbackProviderID       string  `json:"modal_fallback_provider_id,omitempty"`
+	ModalFallbackVisionModel      string  `json:"modal_fallback_vision_model,omitempty"`
+	ModalFallbackAudioModel       string  `json:"modal_fallback_audio_model,omitempty"`
 }
 
 // BuildRuntimeConfigSnapshot creates a deterministic projection from the
@@ -150,6 +154,10 @@ func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
 		MemoryEnabled:                 runtime.MemoryEnabled,
 		MemoryAutoRetrieve:            runtime.MemoryAutoRetrieve,
 		MemoryMaxResults:              runtime.MemoryMaxResults,
+		ModalFallbackEnabled:          runtime.ModalFallbackEnabled,
+		ModalFallbackProviderID:       strings.TrimSpace(runtime.ModalFallbackProviderID),
+		ModalFallbackVisionModel:      strings.TrimSpace(runtime.ModalFallbackVisionModel),
+		ModalFallbackAudioModel:       strings.TrimSpace(runtime.ModalFallbackAudioModel),
 	}
 }
 
@@ -253,6 +261,15 @@ func validateRuntimeOptionsSnapshot(options RuntimeOptionsSnapshot) error {
 	}
 	if options.CompactionOverlap > options.CompactionInterval {
 		return fmt.Errorf("%w: compaction overlap 不能大于 interval", ErrInvalidRuntimeConfigSnapshot)
+	}
+	for name, value := range map[string]string{
+		"modal_fallback_provider_id":  options.ModalFallbackProviderID,
+		"modal_fallback_vision_model": options.ModalFallbackVisionModel,
+		"modal_fallback_audio_model":  options.ModalFallbackAudioModel,
+	} {
+		if len(value) > 128 {
+			return fmt.Errorf("%w: %s 超出长度限制", ErrInvalidRuntimeConfigSnapshot, name)
+		}
 	}
 	return nil
 }

@@ -940,6 +940,18 @@ func (s *Server) streamRuntimeChat(writer http.ResponseWriter, request *http.Req
 			}
 		case agentruntime.EventAssistantMessage:
 			if textValue != "" {
+				// Modal fallback output is an intermediate, user-visible
+				// explanation. It must not be folded into the final answer,
+				// otherwise a streamed primary response would be prefixed by
+				// fallback text and the non-stream projection could return the
+				// fallback instead of the primary answer.
+				if scope, _ := event.Data["scope"].(string); scope == "modal_fallback" {
+					if err := writeSSE(writer, "message", map[string]any{"type": "message", "delta": textValue}); err != nil {
+						return false
+					}
+					flusher.Flush()
+					return true
+				}
 				if !sawDelta {
 					finalText.Reset()
 					finalText.WriteString(textValue)
@@ -1036,6 +1048,9 @@ func (s *Server) waitRuntimeChat(writer http.ResponseWriter, request *http.Reque
 			}
 		case agentruntime.EventAssistantMessage:
 			if textValue, ok := event.Data["text"].(string); ok && finalText.Len() == 0 {
+				if scope, _ := event.Data["scope"].(string); scope == "modal_fallback" {
+					break
+				}
 				finalText.WriteString(textValue)
 			}
 		case agentruntime.EventInvocationCompleted:

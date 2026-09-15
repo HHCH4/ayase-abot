@@ -98,6 +98,13 @@ type SystemSettings struct {
 	// 全新记录，此时由 normalizeSystemSettings 补上保守默认值。
 	ArtifactQuotaBytes         int64 `json:"artifact_quota_bytes"`
 	ArtifactStaleUploadSeconds int   `json:"artifact_stale_upload_seconds"`
+	// Modal fallback is a system-wide safety valve. Empty provider means the
+	// primary provider; empty per-modality model means that modality is not
+	// downgraded through another model.
+	ModalFallbackEnabled     bool   `json:"modal_fallback_enabled"`
+	ModalFallbackProviderID  string `json:"modal_fallback_provider_id"`
+	ModalFallbackVisionModel string `json:"modal_fallback_vision_model"`
+	ModalFallbackAudioModel  string `json:"modal_fallback_audio_model"`
 }
 
 // Artifact 存储约束的默认值与边界。这些数值同时用于 Schema 校验和运行时维护
@@ -119,6 +126,10 @@ func SystemSchema() Schema {
 		{Key: "request_timeout_seconds", Group: "system", Label: "全局请求超时（秒）", Type: "integer", Default: 300, Min: floatPtr(30), Max: floatPtr(3600), Help: "限制 WebUI、API 和机器人消息请求的最长运行时间。"},
 		{Key: "artifact_quota_bytes", Group: "system", Label: "Artifact 存储配额（字节）", Type: "integer", Default: DefaultArtifactQuotaBytes, Min: floatPtr(0), Max: floatPtr(float64(MaxArtifactQuotaBytes)), Help: "本地内容寻址存储去重后的总占用上限，0 表示不限制。超过上限时新的上传会被拒绝，已有内容不受影响。"},
 		{Key: "artifact_stale_upload_seconds", Group: "system", Label: "未完成上传保留时长（秒）", Type: "integer", Default: DefaultArtifactStaleUploadSeconds, Min: floatPtr(MinArtifactStaleUploadSeconds), Max: floatPtr(MaxArtifactStaleUploadSeconds), Help: "超过该时长仍未完成的 Artifact 上传会被标记为失败，遗留的临时文件一并回收。"},
+		{Key: "modal_fallback_enabled", Group: "system", Label: "启用多模态降级", Type: "boolean", Default: false, Help: "主模型不支持图片或音频时，使用配置的模型生成文字转述；失败时仍会以说明文字完成本轮。"},
+		{Key: "modal_fallback_provider_id", Group: "system", Label: "多模态降级供应商", Type: "string", Default: "", Help: "留空表示沿用主模型供应商；供应商不可用时自动降级为说明文字。"},
+		{Key: "modal_fallback_vision_model", Group: "system", Label: "图片降级模型", Type: "string", Default: "", Help: "留空表示不对图片执行模型转述；模型必须实际支持图片输入。"},
+		{Key: "modal_fallback_audio_model", Group: "system", Label: "音频降级模型", Type: "string", Default: "", Help: "留空表示不对音频执行模型转述；模型必须实际支持音频输入。"},
 	}}
 }
 
@@ -721,6 +732,9 @@ func normalizeSystemSettings(settings SystemSettings) SystemSettings {
 		settings.LogLevel = "info"
 	}
 	settings.LogLevel = strings.ToLower(strings.TrimSpace(settings.LogLevel))
+	settings.ModalFallbackProviderID = strings.TrimSpace(settings.ModalFallbackProviderID)
+	settings.ModalFallbackVisionModel = strings.TrimSpace(settings.ModalFallbackVisionModel)
+	settings.ModalFallbackAudioModel = strings.TrimSpace(settings.ModalFallbackAudioModel)
 	if settings.RequestTimeoutSeconds == 0 {
 		settings.RequestTimeoutSeconds = 300
 	}
@@ -747,6 +761,15 @@ func validateSystemSettings(settings SystemSettings) error {
 	}
 	if settings.ArtifactStaleUploadSeconds < MinArtifactStaleUploadSeconds || settings.ArtifactStaleUploadSeconds > MaxArtifactStaleUploadSeconds {
 		return fmt.Errorf("%w: 未完成上传保留时长必须在 %d-%d 秒之间", ErrInvalidRequest, MinArtifactStaleUploadSeconds, MaxArtifactStaleUploadSeconds)
+	}
+	for key, value := range map[string]string{
+		"modal_fallback_provider_id":  settings.ModalFallbackProviderID,
+		"modal_fallback_vision_model": settings.ModalFallbackVisionModel,
+		"modal_fallback_audio_model":  settings.ModalFallbackAudioModel,
+	} {
+		if len(value) > 128 {
+			return fmt.Errorf("%w: %s 长度不能超过 128 个字符", ErrInvalidRequest, key)
+		}
 	}
 	return nil
 }

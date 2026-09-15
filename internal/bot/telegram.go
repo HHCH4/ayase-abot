@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"Abot/internal/agent"
 )
@@ -27,9 +28,10 @@ const (
 
 // telegramPlatform 使用官方 getUpdates 长轮询，不要求 Abot 暴露公网端口。
 type telegramPlatform struct {
-	bot    Bot
-	client *http.Client
-	base   string
+	bot      Bot
+	client   *http.Client
+	base     string
+	username string
 }
 
 type telegramEnvelope[T any] struct {
@@ -40,22 +42,41 @@ type telegramEnvelope[T any] struct {
 }
 
 type telegramUpdate struct {
-	UpdateID int64            `json:"update_id"`
-	Message  *telegramMessage `json:"message"`
+	UpdateID      int64                  `json:"update_id"`
+	Message       *telegramMessage       `json:"message"`
+	CallbackQuery *telegramCallbackQuery `json:"callback_query"`
 }
 
 type telegramMessage struct {
-	MessageID int64             `json:"message_id"`
-	From      *telegramUser     `json:"from"`
-	Chat      telegramChat      `json:"chat"`
-	Text      string            `json:"text"`
-	Caption   string            `json:"caption"`
-	Photo     []telegramPhoto   `json:"photo"`
-	Document  *telegramDocument `json:"document"`
+	MessageID       int64             `json:"message_id"`
+	From            *telegramUser     `json:"from"`
+	Chat            telegramChat      `json:"chat"`
+	Text            string            `json:"text"`
+	Caption         string            `json:"caption"`
+	Entities        []telegramEntity  `json:"entities"`
+	CaptionEntities []telegramEntity  `json:"caption_entities"`
+	Photo           []telegramPhoto   `json:"photo"`
+	Document        *telegramDocument `json:"document"`
+	Voice           *telegramVoice    `json:"voice"`
+	Audio           *telegramAudio    `json:"audio"`
 }
 
 type telegramUser struct {
-	ID int64 `json:"id"`
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+}
+
+type telegramEntity struct {
+	Type   string `json:"type"`
+	Offset int    `json:"offset"`
+	Length int    `json:"length"`
+}
+
+type telegramCallbackQuery struct {
+	ID      string           `json:"id"`
+	From    *telegramUser    `json:"from"`
+	Data    string           `json:"data"`
+	Message *telegramMessage `json:"message"`
 }
 
 type telegramChat struct {
@@ -77,6 +98,19 @@ type telegramDocument struct {
 	FileSize int64  `json:"file_size"`
 }
 
+type telegramVoice struct {
+	FileID   string `json:"file_id"`
+	MIMEType string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+}
+
+type telegramAudio struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MIMEType string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+}
+
 type telegramFile struct {
 	FilePath string `json:"file_path"`
 }
@@ -91,6 +125,14 @@ func newTelegramPlatform(item Bot) (*telegramPlatform, error) {
 
 // Run 持续拉取更新，并保证 offset 只向前推进，避免同一条消息在一次运行中重复处理。
 func (p *telegramPlatform) Run(ctx context.Context, handler Handler) error {
+	if p.username == "" {
+		// Gateways and test doubles may omit getMe; without a known username only
+		// Telegram's explicit bare bot-command entity is accepted as a trigger.
+		var result telegramEnvelope[telegramUser]
+		if err := p.call(ctx, "getMe", nil, &result); err == nil && result.OK {
+			p.username = strings.TrimSpace(result.Result.Username)
+		}
+	}
 	var offset int64
 	for {
 		updates, err := p.getUpdates(ctx, offset)
@@ -104,15 +146,24 @@ func (p *telegramPlatform) Run(ctx context.Context, handler Handler) error {
 			if update.UpdateID >= offset {
 				offset = update.UpdateID + 1
 			}
-			if update.Message == nil {
+			if update.Message == nil && update.CallbackQuery == nil {
 				continue
 			}
 			message, err := p.messageFromUpdate(ctx, update)
 			if err != nil {
 				// 附件下载失败不应让 Telegram 长轮询整体退出；文字仍然可以交给 Agent。
+				if update.CallbackQuery != nil {
+					_ = p.answerCallbackQuery(ctx, update.CallbackQuery.ID)
+				}
 				continue
 			}
-			if handlerErr := handler(ctx, message); handlerErr != nil {
+			handlerErr := handler(ctx, message)
+			if update.CallbackQuery != nil {
+				// Always dismiss Telegram's callback spinner, even when the command
+				// itself is rejected by the Manager.
+				_ = p.answerCallbackQuery(ctx, update.CallbackQuery.ID)
+			}
+			if handlerErr != nil {
 				// 单条消息失败由 Manager 记录，平台连接继续服务其他聊天。
 				continue
 			}
@@ -151,11 +202,47 @@ func (p *telegramPlatform) Send(ctx context.Context, message Message, text strin
 	return nil
 }
 
+func (p *telegramPlatform) SendApproval(ctx context.Context, message Message, prompt ApprovalPrompt) error {
+	chatID := strings.TrimSpace(message.ChatID)
+	if chatID == "" {
+		return errors.New("Telegram 目标聊天 ID 为空")
+	}
+	toolName := strings.TrimSpace(prompt.ToolName)
+	if toolName == "" {
+		toolName = "当前操作"
+	}
+	hint := strings.TrimSpace(prompt.Hint)
+	if hint == "" {
+		hint = "需要确认后才能继续。"
+	}
+	callbackPrefix := "abot:approval:" + strings.TrimSpace(prompt.ApprovalID) + ":"
+	text := fmt.Sprintf("需要审批：%s\n%s", toolName, hint)
+	if prompt.ExpiresAt != nil {
+		text += "\n有效期至：" + prompt.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	payload := map[string]any{
+		"chat_id": chatID,
+		"text":    text,
+		"reply_markup": map[string]any{"inline_keyboard": [][]map[string]string{{
+			{"text": "批准", "callback_data": callbackPrefix + "approve"},
+			{"text": "拒绝", "callback_data": callbackPrefix + "reject"},
+		}}},
+	}
+	var result telegramEnvelope[telegramMessage]
+	if err := p.call(ctx, "sendMessage", payload, &result); err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("Telegram 发送审批消息失败: %s", result.Description)
+	}
+	return nil
+}
+
 // Close 通过取消 Run 的 context 结束请求；这里无需持有额外长连接。
 func (p *telegramPlatform) Close() error { return nil }
 
 func (p *telegramPlatform) getUpdates(ctx context.Context, offset int64) ([]telegramUpdate, error) {
-	payload := map[string]any{"timeout": telegramPollTimeout, "allowed_updates": []string{"message"}}
+	payload := map[string]any{"timeout": telegramPollTimeout, "allowed_updates": []string{"message", "callback_query"}}
 	if offset > 0 {
 		payload["offset"] = offset
 	}
@@ -170,18 +257,25 @@ func (p *telegramPlatform) getUpdates(ctx context.Context, offset int64) ([]tele
 }
 
 func (p *telegramPlatform) messageFromUpdate(ctx context.Context, update telegramUpdate) (Message, error) {
+	if update.CallbackQuery != nil {
+		return p.messageFromCallback(update.CallbackQuery)
+	}
 	item := update.Message
+	if item == nil {
+		return Message{}, errors.New("Telegram 更新不包含消息")
+	}
 	userID := strconv.FormatInt(item.Chat.ID, 10)
 	if item.From != nil && item.From.ID != 0 {
 		userID = strconv.FormatInt(item.From.ID, 10)
 	}
 	message := Message{
-		ID:       strconv.FormatInt(update.UpdateID, 10),
-		Platform: TypeTelegram,
-		UserID:   userID,
-		ChatID:   strconv.FormatInt(item.Chat.ID, 10),
-		ChatType: item.Chat.Type,
-		Text:     strings.TrimSpace(item.Text),
+		ID:        strconv.FormatInt(update.UpdateID, 10),
+		Platform:  TypeTelegram,
+		UserID:    userID,
+		ChatID:    strconv.FormatInt(item.Chat.ID, 10),
+		ChatType:  item.Chat.Type,
+		Text:      strings.TrimSpace(item.Text),
+		Mentioned: p.telegramMessageMentioned(item),
 	}
 	if message.Text == "" {
 		message.Text = strings.TrimSpace(item.Caption)
@@ -189,7 +283,7 @@ func (p *telegramPlatform) messageFromUpdate(ctx context.Context, update telegra
 	if len(item.Photo) > 0 {
 		photo := item.Photo[len(item.Photo)-1]
 		if attachment, err := p.downloadFile(ctx, photo.FileID, fmt.Sprintf("telegram-photo-%d.jpg", item.MessageID), "image/jpeg"); err == nil {
-			message.Attachments = append(message.Attachments, attachment)
+			message.Attachments = appendTelegramAttachment(message.Attachments, attachment)
 		}
 	}
 	if item.Document != nil {
@@ -199,15 +293,132 @@ func (p *telegramPlatform) messageFromUpdate(ctx context.Context, update telegra
 		}
 		mimeType := normalizeFileMIME(name, item.Document.MIMEType)
 		if attachment, err := p.downloadFile(ctx, item.Document.FileID, name, mimeType); err == nil {
-			if attachmentBytes(message.Attachments)+int64(len(attachment.Data)) <= platformAttachmentSum {
-				message.Attachments = append(message.Attachments, attachment)
-			}
+			message.Attachments = appendTelegramAttachment(message.Attachments, attachment)
+		}
+	}
+	if item.Voice != nil {
+		mimeType := normalizeFileMIME("telegram-voice.ogg", item.Voice.MIMEType)
+		if mimeType == "application/octet-stream" {
+			mimeType = "audio/ogg"
+		}
+		if attachment, err := p.downloadFile(ctx, item.Voice.FileID, fmt.Sprintf("telegram-voice-%d.ogg", item.MessageID), mimeType); err == nil {
+			message.Attachments = appendTelegramAttachment(message.Attachments, attachment)
+		}
+	}
+	if item.Audio != nil {
+		name := cleanFileName(item.Audio.FileName)
+		if name == "" {
+			name = fmt.Sprintf("telegram-audio-%d", item.MessageID)
+		}
+		mimeType := normalizeFileMIME(name, item.Audio.MIMEType)
+		if attachment, err := p.downloadFile(ctx, item.Audio.FileID, name, mimeType); err == nil {
+			message.Attachments = appendTelegramAttachment(message.Attachments, attachment)
 		}
 	}
 	if message.Text == "" && len(message.Attachments) == 0 {
 		return Message{}, errors.New("Telegram 更新不包含文本或支持的附件")
 	}
 	return message, nil
+}
+
+func appendTelegramAttachment(items []agent.Attachment, attachment agent.Attachment) []agent.Attachment {
+	if len(attachment.Data) == 0 || attachmentBytes(items)+int64(len(attachment.Data)) > platformAttachmentSum {
+		return items
+	}
+	return append(items, attachment)
+}
+
+func (p *telegramPlatform) messageFromCallback(callback *telegramCallbackQuery) (Message, error) {
+	if callback == nil || callback.Message == nil || strings.TrimSpace(callback.ID) == "" {
+		return Message{}, errors.New("Telegram 审批回调不完整")
+	}
+	parts := strings.Split(callback.Data, ":")
+	if len(parts) != 4 || parts[0] != "abot" || parts[1] != "approval" || strings.TrimSpace(parts[2]) == "" {
+		return Message{}, errors.New("Telegram 审批回调格式无效")
+	}
+	decision := false
+	switch parts[3] {
+	case "approve":
+		decision = true
+	case "reject":
+	default:
+		return Message{}, errors.New("Telegram 审批决定无效")
+	}
+	userID := strconv.FormatInt(callback.Message.Chat.ID, 10)
+	if callback.From != nil && callback.From.ID != 0 {
+		userID = strconv.FormatInt(callback.From.ID, 10)
+	}
+	return Message{
+		ID: "callback:" + callback.ID, Platform: TypeTelegram, UserID: userID,
+		ChatID: strconv.FormatInt(callback.Message.Chat.ID, 10), ChatType: callback.Message.Chat.Type,
+		Mentioned: true, Control: &MessageControl{Kind: "approval", ApprovalID: parts[2], Decision: decision, CallbackID: callback.ID},
+	}, nil
+}
+
+func (p *telegramPlatform) telegramMessageMentioned(item *telegramMessage) bool {
+	if item == nil {
+		return false
+	}
+	for _, entity := range item.Entities {
+		if telegramEntityTargetsBot(item.Text, entity, p.username) {
+			return true
+		}
+	}
+	for _, entity := range item.CaptionEntities {
+		if telegramEntityTargetsBot(item.Caption, entity, p.username) {
+			return true
+		}
+	}
+	return false
+}
+
+func telegramEntityTargetsBot(text string, entity telegramEntity, username string) bool {
+	if entity.Type != "mention" && entity.Type != "bot_command" {
+		return false
+	}
+	value := strings.TrimSpace(telegramEntityText(text, entity))
+	if value == "" {
+		return false
+	}
+	if strings.TrimSpace(username) == "" {
+		// Without getMe we can still safely recognize a bare bot command, but
+		// an unqualified @mention may target another person and an addressed
+		// command cannot be matched to this bot. Keep group admission closed
+		// until the target is known.
+		return entity.Type == "bot_command" && !strings.Contains(value, "@")
+	}
+	if entity.Type == "bot_command" {
+		at := strings.IndexByte(value, '@')
+		if at < 0 {
+			// A bare command is a direct bot command in Telegram's message
+			// entity model; accepting it also makes /status usable in groups.
+			return true
+		}
+		return strings.EqualFold(strings.TrimPrefix(value[at:], "@"), strings.TrimSpace(username))
+	}
+	return strings.EqualFold(strings.TrimPrefix(value, "@"), strings.TrimSpace(username))
+}
+
+// Telegram entity offsets are UTF-16 code-unit offsets, not Go byte offsets.
+func telegramEntityText(text string, entity telegramEntity) string {
+	if entity.Offset < 0 || entity.Length <= 0 {
+		return ""
+	}
+	units := utf16.Encode([]rune(text))
+	start := entity.Offset
+	end := start + entity.Length
+	if start >= len(units) || end > len(units) || end <= start {
+		return ""
+	}
+	return string(utf16.Decode(units[start:end]))
+}
+
+func (p *telegramPlatform) answerCallbackQuery(ctx context.Context, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	var result telegramEnvelope[bool]
+	return p.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": id}, &result)
 }
 
 func (p *telegramPlatform) downloadFile(ctx context.Context, fileID, name, mimeType string) (agent.Attachment, error) {

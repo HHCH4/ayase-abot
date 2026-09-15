@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -344,6 +345,25 @@ func Run(opts bootstrap.Options) error {
 			reader, _, _, err := artifactService.Open(ctx, userID, item.ID, artifact.ByteRange{})
 			return reader, err
 		},
+		AttachmentListResolver: func(ctx context.Context, userID, invocationID string) ([]agent.Attachment, error) {
+			item, err := runtimeRepo.GetInvocation(ctx, strings.TrimSpace(invocationID))
+			if err != nil {
+				return nil, err
+			}
+			if item.UserID != strings.TrimSpace(userID) {
+				return nil, errors.New("当前用户无权读取该任务附件")
+			}
+			attachments := make([]agent.Attachment, len(item.Attachments))
+			for index, attachment := range item.Attachments {
+				if attachment.Ref == nil || len(attachment.Data) > 0 {
+					return nil, fmt.Errorf("第 %d 个任务附件不是受保护的 Artifact ref", index+1)
+				}
+				attachments[index] = attachment
+				ref := *attachment.Ref
+				attachments[index].Ref = &ref
+			}
+			return attachments, nil
+		},
 		RuntimeConfigResolver: func(ctx context.Context, botID, userID, conversationID string) (agent.RuntimeOptions, error) {
 			runtime, err := configService.Resolve(ctx, botID, conversationID)
 			if err != nil {
@@ -352,6 +372,10 @@ func Run(opts bootstrap.Options) error {
 			runtime, err = resolvePersonaRuntime(ctx, personaService, botID, conversationID, runtime)
 			if err != nil {
 				return agent.RuntimeOptions{}, err
+			}
+			settings, settingsErr := configService.GetSystemSettings(ctx)
+			if settingsErr != nil {
+				return agent.RuntimeOptions{}, settingsErr
 			}
 			return agent.RuntimeOptions{
 				AIEnabled: runtime.AIEnabled, ProviderID: runtime.ProviderID, ModelID: runtime.ModelID,
@@ -366,6 +390,8 @@ func Run(opts bootstrap.Options) error {
 				WorkspaceGitEnabled: runtime.WorkspaceGitEnabled, WorkspaceCommandTimeoutSecs: runtime.WorkspaceCommandTimeoutSecs,
 				MessageStreamingEnabled: runtime.MessageStreamingEnabled, MessagePromptPrefix: runtime.MessagePromptPrefix,
 				MemoryEnabled: runtime.MemoryEnabled, MemoryAutoRetrieve: runtime.MemoryAutoRetrieve, MemoryMaxResults: runtime.MemoryMaxResults,
+				ModalFallbackEnabled: settings.ModalFallbackEnabled, ModalFallbackProviderID: settings.ModalFallbackProviderID,
+				ModalFallbackVisionModel: settings.ModalFallbackVisionModel, ModalFallbackAudioModel: settings.ModalFallbackAudioModel,
 			}, nil
 		},
 		EnableCompaction: true,
@@ -492,6 +518,30 @@ func Run(opts bootstrap.Options) error {
 			return 0, err
 		}
 		return time.Duration(settings.RequestTimeoutSeconds) * time.Second, nil
+	})
+	botManager.SetRuntimeCoordinator(runtimeCoordinator)
+	botManager.SetAttachmentStorer(func(storeCtx context.Context, request bot.AttachmentStoreRequest) (agent.Attachment, error) {
+		input := request.Attachment
+		if input.Ref != nil {
+			if len(input.Data) > 0 {
+				return agent.Attachment{}, fmt.Errorf("附件不能同时包含 ref 和 inline data")
+			}
+			return input, nil
+		}
+		if len(input.Data) == 0 {
+			return agent.Attachment{}, fmt.Errorf("附件内容不能为空")
+		}
+		stored, err := artifactService.Put(storeCtx, artifact.PutRequest{
+			UserID: request.UserID, ConversationID: request.ConversationID,
+			ProducerType: request.ProducerType, ProducerID: request.ProducerID,
+			Kind: artifact.KindInputAttachment, Name: input.Name, MIMEType: input.MIMEType,
+			MaxBytes: 10 << 20,
+		}, bytes.NewReader(input.Data))
+		if err != nil {
+			return agent.Attachment{}, err
+		}
+		ref := agent.AttachmentRef{ID: stored.ID, Version: stored.Version, Digest: stored.Digest, Kind: string(stored.Kind), MIMEType: stored.MIMEType, Size: stored.Size, Name: stored.Name}
+		return agent.Attachment{Name: stored.Name, MIMEType: stored.MIMEType, Ref: &ref}, nil
 	})
 	defer func() { _ = botManager.Close() }()
 	if err := botManager.Start(ctx); err != nil {

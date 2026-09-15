@@ -227,6 +227,11 @@ func (s *Service) Messages(ctx context.Context, userID, id string) ([]Message, e
 			if part.InlineData != nil {
 				message.AttachmentCount++
 			}
+			if part.PartMetadata != nil {
+				if _, ok := part.PartMetadata["abot_attachment_ref"]; ok {
+					message.AttachmentCount++
+				}
+			}
 		}
 		if strings.TrimSpace(message.Text) == "" && message.AttachmentCount == 0 {
 			continue

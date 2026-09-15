@@ -96,6 +96,21 @@ func TestSystemSettingsArtifactLifecycleBounds(t *testing.T) {
 	if err := validateSystemSettings(defaulted); err != nil {
 		t.Fatalf("默认 Artifact 边界必须合法: %v", err)
 	}
+	for _, key := range []string{"modal_fallback_enabled", "modal_fallback_provider_id", "modal_fallback_vision_model", "modal_fallback_audio_model"} {
+		if _, ok := fields[key]; !ok {
+			t.Fatalf("Schema 缺少多模态降级设置 %q", key)
+		}
+	}
+	fallback := normalizeSystemSettings(SystemSettings{
+		LogLevel: "INFO", RequestTimeoutSeconds: 300, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds,
+		ModalFallbackEnabled: true, ModalFallbackProviderID: " fallback ", ModalFallbackVisionModel: " vision ", ModalFallbackAudioModel: " audio ",
+	})
+	if !fallback.ModalFallbackEnabled || fallback.ModalFallbackProviderID != "fallback" || fallback.ModalFallbackVisionModel != "vision" || fallback.ModalFallbackAudioModel != "audio" {
+		t.Fatalf("多模态降级设置未规范化: %+v", fallback)
+	}
+	if err := validateSystemSettings(fallback); err != nil {
+		t.Fatalf("有效多模态降级设置必须通过校验: %v", err)
+	}
 
 	// 用户显式关闭配额（0 配额 + 合法保留时长）不能被默认值覆盖。
 	disabled := normalizeSystemSettings(SystemSettings{ArtifactQuotaBytes: 0, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds})

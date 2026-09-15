@@ -68,6 +68,35 @@ func TestParseOneBotMessage(t *testing.T) {
 	}
 }
 
+func TestOneBotRecordAndMentionAreMapped(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("record bytes"))
+	raw, err := json.Marshal([]map[string]any{
+		{"type": "at", "data": map[string]any{"qq": "12345"}},
+		{"type": "record", "data": map[string]any{"file": "base64://" + encoded}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	platform := &oneBotPlatform{selfID: "12345"}
+	event := oneBotEvent{
+		MessageType: "group", UserID: json.RawMessage(`1001`), GroupID: json.RawMessage(`2002`),
+		MessageID: json.RawMessage(`9`), Message: raw,
+	}
+	message, err := platform.messageFromEvent(context.Background(), event)
+	if err != nil {
+		t.Fatalf("OneBot record 消息解析失败: %v", err)
+	}
+	if !message.Mentioned || len(message.Attachments) != 1 || message.Attachments[0].MIMEType != "audio/ogg" || string(message.Attachments[0].Data) != "record bytes" {
+		t.Fatalf("OneBot record/mention 映射错误: %#v", message)
+	}
+
+	platform.selfID = "99999"
+	message, err = platform.messageFromEvent(context.Background(), event)
+	if err != nil || message.Mentioned {
+		t.Fatalf("指向其他 QQ 的 at 不应标记为当前机器人: message=%#v err=%v", message, err)
+	}
+}
+
 func TestSplitTextDoesNotBreakUTF8(t *testing.T) {
 	chunks := splitText("你好世界", 2)
 	if len(chunks) != 2 || chunks[0] != "你好" || chunks[1] != "世界" {

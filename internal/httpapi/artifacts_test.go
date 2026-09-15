@@ -185,6 +185,9 @@ func TestChatAttachmentRefsValidateOwnershipAndMaterializeInlineToArtifact(t *te
 	if err != nil || len(first) != 1 || first[0].Ref == nil || len(first[0].Data) != 0 {
 		t.Fatalf("inline attachment 未转换为 ref: %#v err=%v", first, err)
 	}
+	if first[0].Ref.Preview != "" {
+		t.Fatalf("durable chat attachment ref 不应携带 preview: %#v", first[0].Ref)
+	}
 	second, err := api.materializeChatAttachments(context.Background(), "user-1", "conversation-1", "request-1:0", inline)
 	if err != nil || second[0].Ref == nil || second[0].Ref.ID != first[0].Ref.ID {
 		t.Fatalf("同一 producer 重试未幂等复用 Artifact: first=%#v second=%#v err=%v", first, second, err)
@@ -197,6 +200,9 @@ func TestChatAttachmentRefsValidateOwnershipAndMaterializeInlineToArtifact(t *te
 	canonical, err := api.materializeChatAttachments(context.Background(), "user-1", "conversation-1", "request-ref", refs)
 	if err != nil || canonical[0].Ref == nil || canonical[0].Ref.Digest != first[0].Ref.Digest || len(canonical[0].Data) != 0 {
 		t.Fatalf("合法 ref 未通过 canonical 校验: %#v err=%v", canonical, err)
+	}
+	if canonical[0].Ref.Preview != "" {
+		t.Fatalf("canonical durable chat attachment ref 不应携带 preview: %#v", canonical[0].Ref)
 	}
 	if _, err := api.materializeChatAttachments(context.Background(), "user-2", "conversation-1", "request-ref", refs); !errors.Is(err, artifact.ErrForbidden) && !strings.Contains(err.Error(), "不可访问") {
 		t.Fatalf("跨用户 ref 应拒绝: %v", err)

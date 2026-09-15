@@ -138,6 +138,7 @@ type CapabilityProbeOptions struct {
 	IncludeStructuredSchema bool `json:"include_structured_schema"`
 	IncludeReasoning        bool `json:"include_reasoning"`
 	IncludeImages           bool `json:"include_images"`
+	IncludeAudio            bool `json:"include_audio"`
 	IncludeInputFiles       bool `json:"include_input_files"`
 	MaxOutputTokens         int  `json:"max_output_tokens"`
 	// ExplicitOptionalSelection lets an API caller intentionally disable all

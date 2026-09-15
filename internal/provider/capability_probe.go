@@ -166,6 +166,21 @@ func RunCapabilityProbe(ctx context.Context, llm adkmodel.LLM, profile ModelCapa
 		}
 	}
 
+	if options.IncludeAudio {
+		request := probeAudioRequest(profile.ModelID, options.MaxOutputTokens)
+		responses, audioErr := collectProbeResponses(probeCtx, llm, request, false)
+		switch {
+		case audioErr != nil && capabilityUnsupportedError(audioErr):
+			observe("audio", SupportUnsupported, 0.9, "provider explicitly rejected audio input")
+		case audioErr != nil:
+			observe("audio", SupportUnknown, 0, "probe inconclusive: "+safeProbeError(audioErr))
+		case len(responses) > 0:
+			observe("audio", SupportSupported, 0.8, "small audio input was accepted")
+		default:
+			observe("audio", SupportUnknown, 0, "probe returned no audio response")
+		}
+	}
+
 	if options.IncludeInputFiles {
 		request := probeInputFileRequest(profile.ModelID, options.MaxOutputTokens)
 		responses, fileErr := collectProbeResponses(probeCtx, llm, request, false)
@@ -333,6 +348,24 @@ func probeImageRequest(modelID string, maxOutput int) *adkmodel.LLMRequest {
 	request.Contents = []*genai.Content{genai.NewContentFromParts([]*genai.Part{
 		{Text: "Describe the supplied one-pixel image in one word."},
 		{InlineData: &genai.Blob{MIMEType: "image/png", Data: imageData}},
+	}, genai.RoleUser)}
+	return request
+}
+
+func probeAudioRequest(modelID string, maxOutput int) *adkmodel.LLMRequest {
+	request := probeTextRequest(modelID, maxOutput)
+	// A minimal PCM WAV: mono, 8 kHz, 8-bit, one silent sample. It is large
+	// enough to exercise the provider's audio-content path but contains no
+	// user data and is safe to persist nowhere.
+	audioData := []byte{
+		'R', 'I', 'F', 'F', 0x26, 0x00, 0x00, 0x00, 'W', 'A', 'V', 'E',
+		'f', 'm', 't', ' ', 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+		0x40, 0x1f, 0x00, 0x00, 0x40, 0x1f, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00,
+		'd', 'a', 't', 'a', 0x01, 0x00, 0x00, 0x00, 0x80,
+	}
+	request.Contents = []*genai.Content{genai.NewContentFromParts([]*genai.Part{
+		{Text: "Transcribe the supplied silent audio in one word."},
+		{InlineData: &genai.Blob{MIMEType: "audio/wav", DisplayName: "probe.wav", Data: audioData}},
 	}, genai.RoleUser)}
 	return request
 }

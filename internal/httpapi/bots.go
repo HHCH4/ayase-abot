@@ -18,6 +18,7 @@ type botPayload struct {
 	ListenHost        string   `json:"listen_host"`
 	ListenPort        int      `json:"listen_port"`
 	ListenPath        string   `json:"listen_path"`
+	GroupTriggerMode  string   `json:"group_trigger_mode"`
 	TelegramToken     *string  `json:"telegram_token"`
 	OneBotAccessToken *string  `json:"onebot_access_token"`
 	Enabled           *bool    `json:"enabled"`
@@ -32,6 +33,7 @@ type botView struct {
 	ListenHost              string     `json:"listen_host,omitempty"`
 	ListenPort              int        `json:"listen_port,omitempty"`
 	ListenPath              string     `json:"listen_path,omitempty"`
+	GroupTriggerMode        string     `json:"group_trigger_mode,omitempty"`
 	TelegramTokenConfigured bool       `json:"telegram_token_configured"`
 	OneBotTokenConfigured   bool       `json:"onebot_access_token_configured"`
 	Enabled                 bool       `json:"enabled"`
@@ -136,8 +138,11 @@ func (s *Server) saveBot(writer http.ResponseWriter, request *http.Request, path
 		payload.ListenPort = old.ListenPort
 		payload.ListenPath = old.ListenPath
 	}
+	if haveOld && strings.TrimSpace(payload.GroupTriggerMode) == "" {
+		payload.GroupTriggerMode = old.GroupTriggerMode
+	}
 	item, err := service.Save(request.Context(), bot.SaveRequest{
-		Bot:           bot.Bot{ID: payload.ID, Name: payload.Name, Type: payload.Type, Endpoint: payload.Endpoint, OneBotMode: payload.OneBotMode, ListenHost: payload.ListenHost, ListenPort: payload.ListenPort, ListenPath: payload.ListenPath, Enabled: enabled},
+		Bot:           bot.Bot{ID: payload.ID, Name: payload.Name, Type: payload.Type, Endpoint: payload.Endpoint, OneBotMode: payload.OneBotMode, ListenHost: payload.ListenHost, ListenPort: payload.ListenPort, ListenPath: payload.ListenPath, GroupTriggerMode: payload.GroupTriggerMode, Enabled: enabled},
 		TelegramToken: payload.TelegramToken, OneBotAccessToken: payload.OneBotAccessToken,
 	})
 	if err != nil {
@@ -185,7 +190,7 @@ func (s *Server) previewBotTest(writer http.ResponseWriter, request *http.Reques
 		writeError(writer, fmt.Errorf("请求体无效: %w", err))
 		return
 	}
-	item := bot.Bot{ID: payload.ID, Name: payload.Name, Type: payload.Type, Endpoint: payload.Endpoint, OneBotMode: payload.OneBotMode, ListenHost: payload.ListenHost, ListenPort: payload.ListenPort, ListenPath: payload.ListenPath}
+	item := bot.Bot{ID: payload.ID, Name: payload.Name, Type: payload.Type, Endpoint: payload.Endpoint, OneBotMode: payload.OneBotMode, ListenHost: payload.ListenHost, ListenPort: payload.ListenPort, ListenPath: payload.ListenPath, GroupTriggerMode: payload.GroupTriggerMode}
 	if payload.TelegramToken != nil {
 		item.TelegramToken = strings.TrimSpace(*payload.TelegramToken)
 	}
@@ -271,7 +276,7 @@ func (s *Server) restartBot(writer http.ResponseWriter, request *http.Request) {
 
 func publicBot(item bot.Bot) botView {
 	return botView{
-		ID: item.ID, Name: item.Name, Type: item.Type, Endpoint: item.Endpoint, OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath,
+		ID: item.ID, Name: item.Name, Type: item.Type, Endpoint: item.Endpoint, OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath, GroupTriggerMode: item.GroupTriggerMode,
 		TelegramTokenConfigured: strings.TrimSpace(item.TelegramToken) != "",
 		OneBotTokenConfigured:   strings.TrimSpace(item.OneBotAccessToken) != "",
 		Enabled:                 item.Enabled, Status: item.Status, StatusMessage: item.StatusMessage,

@@ -51,6 +51,7 @@ func TestBotRepositoryPersistsOneBotReverseWebSocketConfig(t *testing.T) {
 	item := bot.Bot{
 		ID: "qq-server", Name: "QQ 反向连接", Type: bot.TypeOneBot11,
 		OneBotMode: bot.OneBotModeReverseServer, ListenHost: "0.0.0.0", ListenPort: 6199, ListenPath: "/ws",
+		GroupTriggerMode:  "all",
 		OneBotAccessToken: "onebot-secret", Enabled: true, Status: bot.StatusConfigured,
 	}
 	if err := store.BotRepository().Save(context.Background(), item); err != nil {
@@ -60,7 +61,7 @@ func TestBotRepositoryPersistsOneBotReverseWebSocketConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取 OneBot 反向连接失败: %v", err)
 	}
-	if got.OneBotMode != item.OneBotMode || got.ListenHost != item.ListenHost || got.ListenPort != item.ListenPort || got.ListenPath != item.ListenPath || got.OneBotAccessToken != item.OneBotAccessToken {
+	if got.OneBotMode != item.OneBotMode || got.ListenHost != item.ListenHost || got.ListenPort != item.ListenPort || got.ListenPath != item.ListenPath || got.GroupTriggerMode != item.GroupTriggerMode || got.OneBotAccessToken != item.OneBotAccessToken {
 		t.Fatalf("OneBot 反向连接配置持久化不完整: %#v", got)
 	}
 }

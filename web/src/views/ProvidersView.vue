@@ -154,6 +154,7 @@ async function probeModel(model: ProviderModel, deep = false) {
       include_structured_schema: true,
       include_reasoning: true,
       include_images: true,
+      include_audio: true,
       include_input_files: true,
     }) : '{}'
     const result = await request<CapabilityProbeResult>(`/api/v1/providers/${encodeURIComponent(providerID)}/models/${encodeURIComponent(modelID)}/probe`, { method: 'POST', body })
@@ -377,6 +378,7 @@ async function remove(provider: Provider) {
                   <NTag size="small" :type="supportType(model.capabilities.structured_output)">JSON {{ supportLabel(model.capabilities.structured_output) }}</NTag>
                   <NTag size="small" :type="supportType(model.capabilities.structured_output_schema)">Schema {{ supportLabel(model.capabilities.structured_output_schema) }}</NTag>
                   <NTag size="small" :type="supportType(model.capabilities.images)">图片 {{ supportLabel(model.capabilities.images) }}</NTag>
+                  <NTag size="small" :type="supportType(model.capabilities.audio)">音频 {{ supportLabel(model.capabilities.audio) }}</NTag>
                   <NTag size="small" :type="supportType(model.capabilities.input_files)">文件 {{ supportLabel(model.capabilities.input_files) }}</NTag>
                   <NTag size="small" :type="supportType(model.capabilities.reasoning_effort)">推理 {{ supportLabel(model.capabilities.reasoning_effort) }}</NTag>
                   <NTag size="small" :type="model.capabilities.tokenizer?.known ? 'success' : 'default'">Token 计数 {{ model.capabilities.tokenizer?.known ? '精确' : '启发式' }}</NTag>

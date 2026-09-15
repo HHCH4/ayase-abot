@@ -111,6 +111,7 @@ export interface Bot {
   listen_host?: string
   listen_port?: number
   listen_path?: string
+  group_trigger_mode?: 'mention' | 'all' | string
   telegram_token_configured?: boolean
   onebot_access_token_configured?: boolean
   enabled: boolean
@@ -483,6 +484,12 @@ export interface ConfigRevision {
 export interface SystemSettings {
   log_level: string
   request_timeout_seconds: number
+  artifact_quota_bytes: number
+  artifact_stale_upload_seconds: number
+  modal_fallback_enabled: boolean
+  modal_fallback_provider_id: string
+  modal_fallback_vision_model: string
+  modal_fallback_audio_model: string
 }
 
 export interface SystemSettingsResponse extends SystemSettings {

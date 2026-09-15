@@ -14,7 +14,11 @@ const group = ref('ai')
 const search = ref('')
 const profileName = ref('')
 const draft = reactive<Record<string, unknown>>({})
-const systemDraft = reactive({ log_level: 'info', request_timeout_seconds: 300 })
+const systemDraft = reactive<Record<string, unknown>>({
+  log_level: 'info', request_timeout_seconds: 300,
+  artifact_quota_bytes: 4 * 1024 * 1024 * 1024, artifact_stale_upload_seconds: 86400,
+  modal_fallback_enabled: false, modal_fallback_provider_id: '', modal_fallback_vision_model: '', modal_fallback_audio_model: '',
+})
 const revisions = ref<ConfigRevision[]>([])
 const dirty = ref(false)
 const jsonText = ref('{}')
@@ -58,6 +62,35 @@ function textValue(field: ConfigField) {
 function numberValue(field: ConfigField) {
   const value = fieldValue(field)
   return typeof value === 'number' ? value : Number(value || 0)
+}
+
+function systemFieldValue(field: ConfigField) {
+  return Object.prototype.hasOwnProperty.call(systemDraft, field.key) ? systemDraft[field.key] : field.default
+}
+
+function systemTextValue(field: ConfigField) {
+  const value = systemFieldValue(field)
+  return typeof value === 'string' ? value : value == null ? '' : String(value)
+}
+
+function systemNumberValue(field: ConfigField) {
+  const value = systemFieldValue(field)
+  return typeof value === 'number' ? value : Number(value || 0)
+}
+
+function setSystemValue(field: ConfigField, value: unknown) {
+  systemDraft[field.key] = value
+}
+
+function syncSystemDraft() {
+  const value = store.systemSettings
+  Object.keys(systemDraft).forEach((key) => { delete systemDraft[key] })
+  Object.assign(systemDraft, {
+    log_level: value.log_level, request_timeout_seconds: value.request_timeout_seconds,
+    artifact_quota_bytes: value.artifact_quota_bytes, artifact_stale_upload_seconds: value.artifact_stale_upload_seconds,
+    modal_fallback_enabled: value.modal_fallback_enabled, modal_fallback_provider_id: value.modal_fallback_provider_id,
+    modal_fallback_vision_model: value.modal_fallback_vision_model, modal_fallback_audio_model: value.modal_fallback_audio_model,
+  })
 }
 
 function displayMatches(field: ConfigField) {
@@ -107,8 +140,7 @@ async function reloadConfig(preferredID = selectedID.value) {
   await store.loadConfig()
   selectedID.value = preferredID || store.defaultProfileID || store.configProfiles[0]?.id || ''
   resetDraft(store.configProfiles.find((item) => item.id === selectedID.value))
-  systemDraft.log_level = store.systemSettings.log_level
-  systemDraft.request_timeout_seconds = store.systemSettings.request_timeout_seconds
+  syncSystemDraft()
   await loadHistory()
 }
 
@@ -227,8 +259,8 @@ async function importProfile(event: Event) {
 async function saveSystem() {
   try {
     const value = await request<typeof systemDraft>('/api/v1/system-settings', { method: 'PUT', body: JSON.stringify(systemDraft) })
-    store.systemSettings.log_level = value.log_level
-    store.systemSettings.request_timeout_seconds = value.request_timeout_seconds
+    Object.assign(store.systemSettings, value)
+    syncSystemDraft()
     message.success('系统设置已保存并立即生效')
   } catch (error) {
     message.error(error instanceof Error ? error.message : '保存系统设置失败')
@@ -239,8 +271,7 @@ onMounted(async () => {
   await store.loadAll()
   selectedID.value = store.defaultProfileID || store.configProfiles[0]?.id || ''
   resetDraft(currentProfile.value)
-  systemDraft.log_level = store.systemSettings.log_level
-  systemDraft.request_timeout_seconds = store.systemSettings.request_timeout_seconds
+  syncSystemDraft()
   await loadHistory()
 })
 </script>
@@ -286,10 +317,15 @@ onMounted(async () => {
         </NTabPane>
         <NTabPane name="system" tab="系统设置">
           <div class="system-settings-panel">
-            <div class="section-heading-row"><div><h3>系统设置</h3><p>日志等级和全局请求超时保存后立即生效，覆盖 WebUI、API 和机器人消息。</p></div></div>
+            <div class="section-heading-row"><div><h3>系统设置</h3><p>日志等级、全局请求超时、Artifact 维护和多模态降级保存后立即生效。</p></div></div>
             <div v-for="field in (store.systemSettings.schema || [])" :key="field.key" class="config-field-row">
               <div class="field-copy"><strong>{{ field.label }}</strong><code>system.{{ field.key }}</code><span>{{ field.help }}</span><NTag v-if="field.restart_required" size="small" type="warning">需重启</NTag></div>
-              <div class="field-control"><NSelect v-if="field.type === 'select'" v-model:value="systemDraft.log_level" :options="field.options || []" /><NInputNumber v-else v-model:value="systemDraft.request_timeout_seconds" :min="field.min" :max="field.max" :show-button="false" /></div>
+              <div class="field-control">
+                <NCheckbox v-if="field.type === 'boolean'" :checked="systemFieldValue(field) === true" @update:checked="setSystemValue(field, $event)" />
+                <NSelect v-else-if="field.type === 'select'" :value="String(systemFieldValue(field) ?? '')" :options="field.options || []" @update:value="setSystemValue(field, $event)" />
+                <NInputNumber v-else-if="field.type === 'integer' || field.type === 'number'" :value="systemNumberValue(field)" :min="field.min" :max="field.max" :step="field.type === 'number' ? 0.01 : 1" :show-button="false" @update:value="setSystemValue(field, $event)" />
+                <NInput v-else :value="systemTextValue(field)" :type="field.secret ? 'password' : 'text'" @update:value="setSystemValue(field, $event)" />
+              </div>
             </div>
             <div class="save-bar"><span>保存后立即应用</span><NButton type="primary" @click="saveSystem">保存系统设置</NButton></div>
           </div>

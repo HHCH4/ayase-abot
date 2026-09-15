@@ -172,6 +172,23 @@ func TestUsageSeparatesCompactionCallsFromUserModelCalls(t *testing.T) {
 	}
 }
 
+func TestUsageSeparatesModalFallbackCallsFromUserModelCalls(t *testing.T) {
+	usage := usageFromEvents([]AgentEvent{
+		{Type: EventUsageUpdated, Data: map[string]any{"usage": map[string]any{"input_tokens": 10, "output_tokens": 4, "total_tokens": 14}}},
+		{Type: EventUsageUpdated, Data: map[string]any{"scope": "modal_fallback", "usage": map[string]any{"input_tokens": 30, "output_tokens": 6, "total_tokens": 36}}},
+		{Type: EventUsageUpdated, Data: map[string]any{"scope": "MODAL_FALLBACK", "model_call_id": "fallback-without-usage"}},
+	})
+	if usage.ModelCalls != 1 || !usage.PromptTokens.Known || usage.PromptTokens.Value != 10 || !usage.TotalTokens.Known || usage.TotalTokens.Value != 14 {
+		t.Fatalf("模态降级 usage 不应混入主模型统计: %#v", usage)
+	}
+	if usage.ModalFallback.ModelCalls != 2 || usage.ModalFallback.UnknownCalls != 1 {
+		t.Fatalf("模态降级调用次数或 unknown 统计不正确: %#v", usage.ModalFallback)
+	}
+	if !usage.ModalFallback.PromptTokens.Known || usage.ModalFallback.PromptTokens.Value != 30 || !usage.ModalFallback.OutputTokens.Known || usage.ModalFallback.OutputTokens.Value != 6 || !usage.ModalFallback.TotalTokens.Known || usage.ModalFallback.TotalTokens.Value != 36 {
+		t.Fatalf("模态降级 usage 未独立聚合: %#v", usage.ModalFallback)
+	}
+}
+
 func TestCoordinatorTraceAndUsageRejectMissingInvocation(t *testing.T) {
 	coordinator := &Coordinator{repo: NewMemoryRepository()}
 	if _, err := coordinator.GetInvocationTrace(context.Background(), "missing"); err == nil {

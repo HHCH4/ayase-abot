@@ -787,6 +787,7 @@ type kernelTestLLM struct {
 	name          string
 	instruction   string
 	requestConfig *genai.GenerateContentConfig
+	request       *adkmodel.LLMRequest
 	calls         int
 }
 
@@ -798,6 +799,7 @@ func (m *kernelTestLLM) GenerateContent(_ context.Context, request *adkmodel.LLM
 		m.instruction = TextFromContent(request.Config.SystemInstruction)
 	}
 	if request != nil {
+		m.request = request
 		m.requestConfig = request.Config
 	}
 	return func(yield func(*adkmodel.LLMResponse, error) bool) {

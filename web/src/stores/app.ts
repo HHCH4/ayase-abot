@@ -15,7 +15,11 @@ export const useAppStore = defineStore('app', {
     configSchema: { version: 1, fields: [] } as ConfigSchema,
     configProfiles: [] as ConfigProfile[],
     defaultProfileID: '',
-    systemSettings: { log_level: 'info', request_timeout_seconds: 300 } as SystemSettingsResponse,
+    systemSettings: {
+      log_level: 'info', request_timeout_seconds: 300,
+      artifact_quota_bytes: 4 * 1024 * 1024 * 1024, artifact_stale_upload_seconds: 86400,
+      modal_fallback_enabled: false, modal_fallback_provider_id: '', modal_fallback_vision_model: '', modal_fallback_audio_model: '',
+    } as SystemSettingsResponse,
     loading: false,
     lastError: '',
     initialized: false,

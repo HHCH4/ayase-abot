@@ -1235,7 +1235,7 @@ func (s *Server) materializeChatAttachments(ctx context.Context, userID, convers
 				return nil, fmt.Errorf("第 %d 个附件 digest/size 不一致: %w", index+1, artifact.ErrConflict)
 			}
 			canonical := item.Ref()
-			result[index] = agent.Attachment{Name: canonical.Name, MIMEType: canonical.MIMEType, Ref: &agent.AttachmentRef{ID: canonical.ID, Version: canonical.Version, Digest: canonical.Digest, Kind: string(canonical.Kind), MIMEType: canonical.MIMEType, Size: canonical.Size, Name: canonical.Name, Preview: canonical.Preview}}
+			result[index] = agent.Attachment{Name: canonical.Name, MIMEType: canonical.MIMEType, Ref: &agent.AttachmentRef{ID: canonical.ID, Version: canonical.Version, Digest: canonical.Digest, Kind: string(canonical.Kind), MIMEType: canonical.MIMEType, Size: canonical.Size, Name: canonical.Name}}
 			continue
 		}
 		if len(attachment.Data) == 0 {
@@ -1253,7 +1253,7 @@ func (s *Server) materializeChatAttachments(ctx context.Context, userID, convers
 			return nil, fmt.Errorf("第 %d 个附件写入 Artifact 失败: %w", index+1, err)
 		}
 		canonical := item.Ref()
-		result[index] = agent.Attachment{Name: canonical.Name, MIMEType: canonical.MIMEType, Ref: &agent.AttachmentRef{ID: canonical.ID, Version: canonical.Version, Digest: canonical.Digest, Kind: string(canonical.Kind), MIMEType: canonical.MIMEType, Size: canonical.Size, Name: canonical.Name, Preview: canonical.Preview}}
+		result[index] = agent.Attachment{Name: canonical.Name, MIMEType: canonical.MIMEType, Ref: &agent.AttachmentRef{ID: canonical.ID, Version: canonical.Version, Digest: canonical.Digest, Kind: string(canonical.Kind), MIMEType: canonical.MIMEType, Size: canonical.Size, Name: canonical.Name}}
 	}
 	return result, nil
 }

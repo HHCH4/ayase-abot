@@ -126,6 +126,34 @@ func TestNegotiateRejectsRequiredUnknownAndDowngradesOptional(t *testing.T) {
 	}
 }
 
+func TestNegotiateAudioRequirementAndRequestPlan(t *testing.T) {
+	profile := DefaultCapabilities(Provider{ID: "audio", Protocol: ProtocolOpenAICompatible}, Model{ID: "model", ContextWindow: 8192})
+	unknown, err := Negotiate(profile, ModelRequirements{RequiresAudio: true}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknown.Compatible || unknown.FailureCode != "model_incompatible_audio" {
+		t.Fatalf("未知 audio 能力必须 fail-closed: %#v", unknown)
+	}
+
+	profile.Audio = Support{State: SupportSupported, Source: "probe"}
+	supported, err := Negotiate(profile, ModelRequirements{RequiresAudio: true}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !supported.Compatible || !supported.RequestPlan.Audio {
+		t.Fatalf("audio requirement 未进入 RequestPlan: %#v", supported)
+	}
+	if err := supported.RequestPlan.Validate(profile); err != nil {
+		t.Fatalf("支持 audio 的 RequestPlan 不应无效: %v", err)
+	}
+
+	profile.Audio = Support{State: SupportUnknown}
+	if err := (RequestPlan{Audio: true}).Validate(profile); err == nil {
+		t.Fatal("RequestPlan 不应在 audio unknown 时手工启用 audio")
+	}
+}
+
 func TestNegotiateRejectsContextUnknownForMinimum(t *testing.T) {
 	profile := DefaultCapabilities(Provider{ID: "openai", Protocol: ProtocolOpenAICompatible}, Model{ID: "model"})
 	result, err := Negotiate(profile, ModelRequirements{MinimumContextWindow: 4096}, false)
@@ -241,6 +269,7 @@ func TestNegotiationRequiresStructuredSchemaEvidenceAndProjectsDialect(t *testin
 	}
 	legacy := profile
 	legacy.StructuredOutputSchema = Support{}
+	legacy.Audio = Support{}
 	if result, err := Negotiate(legacy, ModelRequirements{}, false); err != nil || result.Profile.StructuredOutputSchema.State != SupportUnknown {
 		t.Fatalf("旧 profile 的 schema 字段应安全归一化: result=%#v err=%v", result, err)
 	}

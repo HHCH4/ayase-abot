@@ -230,6 +230,7 @@ type ModelRequirements struct {
 	RequiresStructuredOut    bool
 	RequiresStructuredSchema bool
 	RequiresImages           bool
+	RequiresAudio            bool
 	RequiresFiles            bool
 	RequiresStreaming        bool
 	RequiresParallelTools    bool
@@ -249,6 +250,7 @@ type RequestPlan struct {
 	StructuredSchema  bool   `json:"structured_schema"`
 	JSONSchemaDialect string `json:"json_schema_dialect,omitempty"`
 	Images            bool   `json:"images"`
+	Audio             bool   `json:"audio"`
 	InputFiles        bool   `json:"input_files"`
 	ReasoningEffort   string `json:"reasoning_effort,omitempty"`
 	ReasoningSummary  bool   `json:"reasoning_summary"`
@@ -334,6 +336,9 @@ func (p RequestPlan) Validate(profile ModelCapabilityProfile) error {
 	if err := check("images", p.Images, profile.Images); err != nil {
 		return err
 	}
+	if err := check("audio", p.Audio, profile.Audio); err != nil {
+		return err
+	}
 	if err := check("input_files", p.InputFiles, profile.InputFiles); err != nil {
 		return err
 	}
@@ -392,6 +397,11 @@ func (p ModelCapabilityProfile) Validate() error {
 	// instead of making old catalog rows unreadable.
 	if p.StructuredOutputSchema.State == "" {
 		p.StructuredOutputSchema = Support{State: SupportUnknown, Source: "legacy_default"}
+	}
+	// Audio was added after the original capability profile schema. Missing
+	// audio evidence is likewise unknown, never an implicit supported claim.
+	if p.Audio.State == "" {
+		p.Audio = Support{State: SupportUnknown, Source: "legacy_default"}
 	}
 	if strings.TrimSpace(p.ProviderID) == "" || strings.TrimSpace(p.ModelID) == "" {
 		return fmt.Errorf("%w: provider_id/model_id 不能为空", ErrInvalidCapabilityProfile)
@@ -724,6 +734,7 @@ func Negotiate(profile ModelCapabilityProfile, requirements ModelRequirements, r
 	checkRequired("structured_output", profile.StructuredOutput, requirements.RequiresStructuredOut)
 	checkRequired("structured_output_schema", profile.StructuredOutputSchema, requirements.RequiresStructuredSchema)
 	checkRequired("images", profile.Images, requirements.RequiresImages)
+	checkRequired("audio", profile.Audio, requirements.RequiresAudio)
 	checkRequired("input_files", profile.InputFiles, requirements.RequiresFiles)
 	checkRequired("streaming", profile.Streaming, requirements.RequiresStreaming)
 	checkRequired("parallel_tool_calls", profile.ParallelToolCalls, requirements.RequiresParallelTools)
@@ -799,6 +810,9 @@ func Negotiate(profile ModelCapabilityProfile, requirements ModelRequirements, r
 	if profile.Images.State == SupportSupported || profile.Images.State == SupportDegraded {
 		result.RequestPlan.Images = requirements.RequiresImages
 	}
+	if profile.Audio.State == SupportSupported || profile.Audio.State == SupportDegraded {
+		result.RequestPlan.Audio = requirements.RequiresAudio
+	}
 	if profile.InputFiles.State == SupportSupported || profile.InputFiles.State == SupportDegraded {
 		result.RequestPlan.InputFiles = requirements.RequiresFiles
 	}
@@ -831,6 +845,9 @@ func Negotiate(profile ModelCapabilityProfile, requirements ModelRequirements, r
 func normalizeCapabilityProfile(profile ModelCapabilityProfile) ModelCapabilityProfile {
 	if profile.StructuredOutputSchema.State == "" {
 		profile.StructuredOutputSchema = Support{State: SupportUnknown, Source: "legacy_default"}
+	}
+	if profile.Audio.State == "" {
+		profile.Audio = Support{State: SupportUnknown, Source: "legacy_default"}
 	}
 	// A successful bounded schema request is also direct evidence that the
 	// provider can produce structured JSON. Promote only an unknown base state;

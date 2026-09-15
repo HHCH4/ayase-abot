@@ -31,6 +31,7 @@ type oneBotPlatform struct {
 
 	mu          sync.Mutex
 	conn        *websocket.Conn
+	selfID      string
 	server      *http.Server
 	listener    net.Listener
 	connections chan *websocket.Conn
@@ -38,6 +39,7 @@ type oneBotPlatform struct {
 
 type oneBotEvent struct {
 	PostType    string          `json:"post_type"`
+	SelfID      json.RawMessage `json:"self_id"`
 	MessageType string          `json:"message_type"`
 	SubType     string          `json:"sub_type"`
 	MessageID   json.RawMessage `json:"message_id"`
@@ -238,6 +240,11 @@ func (p *oneBotPlatform) consumeConnection(ctx context.Context, conn *websocket.
 		if event.PostType != "message" {
 			continue
 		}
+		if value := rawID(event.SelfID); value != "" {
+			p.mu.Lock()
+			p.selfID = value
+			p.mu.Unlock()
+		}
 		message, err := p.messageFromEvent(ctx, event)
 		if err != nil {
 			continue
@@ -376,7 +383,30 @@ func (p *oneBotPlatform) messageFromEvent(ctx context.Context, event oneBotEvent
 		ChatType:    chatType,
 		Text:        strings.TrimSpace(text),
 		Attachments: attachments,
+		Mentioned:   !isGroupChat(chatType) || p.oneBotMessageMentioned(event),
 	}, nil
+}
+
+func (p *oneBotPlatform) oneBotMessageMentioned(event oneBotEvent) bool {
+	p.mu.Lock()
+	selfID := p.selfID
+	p.mu.Unlock()
+	if selfID == "" {
+		return false
+	}
+	var segments []oneBotSegment
+	if json.Unmarshal(event.Message, &segments) != nil {
+		return false
+	}
+	for _, segment := range segments {
+		if segment.Type != "at" {
+			continue
+		}
+		if value := stringValue(segment.Data["qq"]); value != "" && value == selfID {
+			return true
+		}
+	}
+	return false
 }
 
 func parseOneBotMessage(ctx context.Context, client *http.Client, raw json.RawMessage) (string, []agent.Attachment) {
@@ -394,7 +424,7 @@ func parseOneBotMessage(ctx context.Context, client *http.Client, raw json.RawMe
 		switch segment.Type {
 		case "text":
 			text += stringValue(segment.Data["text"])
-		case "image", "file":
+		case "image", "file", "record":
 			if len(attachments) >= 5 {
 				continue
 			}
@@ -414,10 +444,16 @@ func oneBotAttachment(ctx context.Context, client *http.Client, segment oneBotSe
 	name := cleanFileName(stringValue(segment.Data["file"]))
 	if name == "" {
 		name = "onebot-attachment"
+		if segment.Type == "record" {
+			name = "onebot-record"
+		}
 	}
 	mimeType := normalizeFileMIME(name, stringValue(segment.Data["type"]))
 	if segment.Type == "image" && mimeType == "application/octet-stream" {
 		mimeType = "image/jpeg"
+	}
+	if segment.Type == "record" && mimeType == "application/octet-stream" {
+		mimeType = "audio/ogg"
 	}
 	value := stringValue(segment.Data["url"])
 	if value == "" {

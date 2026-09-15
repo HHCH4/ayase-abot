@@ -38,8 +38,8 @@ type UsageValue struct {
 
 // UsageTotals is a bounded usage breakdown for one class of model call. The
 // normal invocation fields remain on UsageSummary for wire compatibility;
-// compaction calls use this nested shape so their cost cannot be mistaken for
-// a user-facing response.
+// compaction and modality-fallback calls use this nested shape so their cost
+// cannot be mistaken for a user-facing response.
 type UsageTotals struct {
 	PromptTokens        UsageValue `json:"prompt_tokens"`
 	CachedInputTokens   UsageValue `json:"cached_input_tokens"`
@@ -65,6 +65,7 @@ type UsageSummary struct {
 	UnknownFields       []string           `json:"unknown_fields,omitempty"`
 	Sources             []string           `json:"sources,omitempty"`
 	Compaction          UsageTotals        `json:"compaction"`
+	ModalFallback       UsageTotals        `json:"modal_fallback"`
 	ContextCalibration  ContextCalibration `json:"context_calibration"`
 }
 
@@ -803,8 +804,10 @@ func usageEventScope(event AgentEvent) string {
 		return ""
 	}
 	for _, key := range []string{"scope", "usage_scope"} {
-		if value, ok := event.Data[key].(string); ok && strings.EqualFold(strings.TrimSpace(value), "compaction") {
-			return "compaction"
+		if value, ok := event.Data[key].(string); ok {
+			if value = strings.ToLower(strings.TrimSpace(value)); value != "" {
+				return value
+			}
 		}
 	}
 	return ""
@@ -813,15 +816,19 @@ func usageEventScope(event AgentEvent) string {
 func usageFromEvents(events []AgentEvent) UsageSummary {
 	normal := newUsageBreakdownAccumulator()
 	compaction := newUsageBreakdownAccumulator()
+	modalFallback := newUsageBreakdownAccumulator()
 	for _, event := range events {
 		if event.Type != EventUsageUpdated || event.Data == nil {
 			continue
 		}
-		if usageEventScope(event) == "compaction" {
+		switch usageEventScope(event) {
+		case "compaction":
 			compaction.add(event)
-			continue
+		case "modal_fallback":
+			modalFallback.add(event)
+		case "":
+			normal.add(event)
 		}
-		normal.add(event)
 	}
 	result := UsageSummary{}
 	normalized := normal.finalize()
@@ -836,6 +843,7 @@ func usageFromEvents(events []AgentEvent) UsageSummary {
 	result.UnknownFields = normalized.UnknownFields
 	result.Sources = normalized.Sources
 	result.Compaction = compaction.finalize()
+	result.ModalFallback = modalFallback.finalize()
 	return result
 }
 
