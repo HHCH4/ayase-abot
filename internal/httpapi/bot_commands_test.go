@@ -180,3 +180,45 @@ func TestBotGroupAdminAPI(t *testing.T) {
 		t.Fatalf("缺少 chat_id 不应成功: %s", missing.Body.String())
 	}
 }
+
+func TestBotGlobalAdministratorsAreConfiguredFromTheConsole(t *testing.T) {
+	handler, _ := newBotCommandHandler(t)
+
+	// 创建时配置管理员，并验证规范化（去重、去空白、排序）。
+	created := callHTTP(handler, http.MethodPost, "/api/v1/bots",
+		`{"id":"admin-bot","name":"管理员机器人","type":"telegram","telegram_token":"token","admin_user_ids":["  20002 ","10001","20002",""],"enabled":false}`)
+	if created.Code != http.StatusOK {
+		t.Fatalf("创建机器人失败: %d %s", created.Code, created.Body.String())
+	}
+	if !strings.Contains(created.Body.String(), `"admin_user_ids":["10001","20002"]`) {
+		t.Fatalf("管理员列表未规范化: %s", created.Body.String())
+	}
+
+	// 局部更新（未提供该字段）必须保留已有管理员，否则一次改名就会锁死自己。
+	renamed := callHTTP(handler, http.MethodPut, "/api/v1/bots/admin-bot", `{"name":"改名后","type":"telegram","enabled":false}`)
+	if renamed.Code != http.StatusOK {
+		t.Fatalf("更新机器人失败: %d %s", renamed.Code, renamed.Body.String())
+	}
+	if !strings.Contains(renamed.Body.String(), `"admin_user_ids":["10001","20002"]`) {
+		t.Fatalf("未提供的字段不应清空管理员: %s", renamed.Body.String())
+	}
+
+	// 显式空数组表示清空。
+	cleared := callHTTP(handler, http.MethodPut, "/api/v1/bots/admin-bot", `{"name":"改名后","type":"telegram","admin_user_ids":[],"enabled":false}`)
+	if cleared.Code != http.StatusOK {
+		t.Fatalf("清空管理员失败: %d %s", cleared.Code, cleared.Body.String())
+	}
+	if strings.Contains(cleared.Body.String(), `"admin_user_ids"`) {
+		t.Fatalf("显式清空后不应返回管理员: %s", cleared.Body.String())
+	}
+
+	// 读取时也应返回当前管理员。
+	withAdmins := callHTTP(handler, http.MethodPut, "/api/v1/bots/admin-bot", `{"name":"改名后","type":"telegram","admin_user_ids":["30003"],"enabled":false}`)
+	if withAdmins.Code != http.StatusOK {
+		t.Fatalf("设置管理员失败: %d %s", withAdmins.Code, withAdmins.Body.String())
+	}
+	fetched := callHTTP(handler, http.MethodGet, "/api/v1/bots/admin-bot", "")
+	if !strings.Contains(fetched.Body.String(), `"admin_user_ids":["30003"]`) {
+		t.Fatalf("读取机器人应返回管理员: %s", fetched.Body.String())
+	}
+}

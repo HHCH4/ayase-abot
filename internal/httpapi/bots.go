@@ -4,24 +4,28 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	"Abot/internal/bot"
 )
 
 type botPayload struct {
-	ID                string   `json:"id"`
-	Name              string   `json:"name"`
-	Type              bot.Type `json:"type"`
-	Endpoint          string   `json:"endpoint"`
-	OneBotMode        string   `json:"onebot_mode"`
-	ListenHost        string   `json:"listen_host"`
-	ListenPort        int      `json:"listen_port"`
-	ListenPath        string   `json:"listen_path"`
-	GroupTriggerMode  string   `json:"group_trigger_mode"`
-	TelegramToken     *string  `json:"telegram_token"`
-	OneBotAccessToken *string  `json:"onebot_access_token"`
-	Enabled           *bool    `json:"enabled"`
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	Type             bot.Type `json:"type"`
+	Endpoint         string   `json:"endpoint"`
+	OneBotMode       string   `json:"onebot_mode"`
+	ListenHost       string   `json:"listen_host"`
+	ListenPort       int      `json:"listen_port"`
+	ListenPath       string   `json:"listen_path"`
+	GroupTriggerMode string   `json:"group_trigger_mode"`
+	// AdminUserIDs is the root of trust for chat commands. It is accepted only
+	// here (the WebUI), never from a chat message.
+	AdminUserIDs      *[]string `json:"admin_user_ids"`
+	TelegramToken     *string   `json:"telegram_token"`
+	OneBotAccessToken *string   `json:"onebot_access_token"`
+	Enabled           *bool     `json:"enabled"`
 }
 
 type botView struct {
@@ -34,6 +38,7 @@ type botView struct {
 	ListenPort              int        `json:"listen_port,omitempty"`
 	ListenPath              string     `json:"listen_path,omitempty"`
 	GroupTriggerMode        string     `json:"group_trigger_mode,omitempty"`
+	AdminUserIDs            []string   `json:"admin_user_ids,omitempty"`
 	TelegramTokenConfigured bool       `json:"telegram_token_configured"`
 	OneBotTokenConfigured   bool       `json:"onebot_access_token_configured"`
 	Enabled                 bool       `json:"enabled"`
@@ -141,8 +146,18 @@ func (s *Server) saveBot(writer http.ResponseWriter, request *http.Request, path
 	if haveOld && strings.TrimSpace(payload.GroupTriggerMode) == "" {
 		payload.GroupTriggerMode = old.GroupTriggerMode
 	}
+	adminUserIDs := []string(nil)
+	if haveOld {
+		// An omitted field keeps the configured administrators; an explicit
+		// empty list clears them. A partial update must never silently drop the
+		// only account that can manage this bot.
+		adminUserIDs = append([]string(nil), old.AdminUserIDs...)
+	}
+	if payload.AdminUserIDs != nil {
+		adminUserIDs = normalizeAdminUserIDs(*payload.AdminUserIDs)
+	}
 	item, err := service.Save(request.Context(), bot.SaveRequest{
-		Bot:           bot.Bot{ID: payload.ID, Name: payload.Name, Type: payload.Type, Endpoint: payload.Endpoint, OneBotMode: payload.OneBotMode, ListenHost: payload.ListenHost, ListenPort: payload.ListenPort, ListenPath: payload.ListenPath, GroupTriggerMode: payload.GroupTriggerMode, Enabled: enabled},
+		Bot:           bot.Bot{ID: payload.ID, Name: payload.Name, Type: payload.Type, Endpoint: payload.Endpoint, OneBotMode: payload.OneBotMode, ListenHost: payload.ListenHost, ListenPort: payload.ListenPort, ListenPath: payload.ListenPath, GroupTriggerMode: payload.GroupTriggerMode, AdminUserIDs: adminUserIDs, Enabled: enabled},
 		TelegramToken: payload.TelegramToken, OneBotAccessToken: payload.OneBotAccessToken,
 	})
 	if err != nil {
@@ -276,10 +291,33 @@ func (s *Server) restartBot(writer http.ResponseWriter, request *http.Request) {
 
 func publicBot(item bot.Bot) botView {
 	return botView{
-		ID: item.ID, Name: item.Name, Type: item.Type, Endpoint: item.Endpoint, OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath, GroupTriggerMode: item.GroupTriggerMode,
+		ID: item.ID, Name: item.Name, Type: item.Type, Endpoint: item.Endpoint, OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath, GroupTriggerMode: item.GroupTriggerMode, AdminUserIDs: item.AdminUserIDs,
 		TelegramTokenConfigured: strings.TrimSpace(item.TelegramToken) != "",
 		OneBotTokenConfigured:   strings.TrimSpace(item.OneBotAccessToken) != "",
 		Enabled:                 item.Enabled, Status: item.Status, StatusMessage: item.StatusMessage,
 		LastCheckedAt: item.LastCheckedAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 	}
+}
+
+// normalizeAdminUserIDs keeps the administrator list bounded, deduplicated and
+// sorted so a WebUI round-trip is predictable.
+func normalizeAdminUserIDs(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || len(value) > 64 || strings.ContainsAny(value, " \t\r\n\x00") {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }

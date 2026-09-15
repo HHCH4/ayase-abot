@@ -112,6 +112,8 @@ export interface Bot {
   listen_port?: number
   listen_path?: string
   group_trigger_mode?: 'mention' | 'all' | string
+  /** 聊天指令的全局管理员；只能在 WebUI 配置，聊天中无法授予。 */
+  admin_user_ids?: string[]
   telegram_token_configured?: boolean
   onebot_access_token_configured?: boolean
   enabled: boolean
