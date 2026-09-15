@@ -662,3 +662,33 @@ export interface ChatAttachment {
   artifact_digest?: string
   artifact_size?: number
 }
+
+/** BotCommand 是一条聊天指令在某个机器人上的生效策略。 */
+export interface BotCommand {
+  id: string
+  name: string
+  aliases?: string[]
+  source: string
+  source_name: string
+  category: string
+  description: string
+  default_permission: string
+  scope: string
+  default_enabled: boolean
+  effective_permission: string
+  effective_enabled: boolean
+  overridden: boolean
+}
+
+/** BotCommandAudit 记录一次影响权限或配置的动作。 */
+export interface BotCommandAudit {
+  id: string
+  adapter_id: string
+  chat_id?: string
+  user_id?: string
+  command?: string
+  action: string
+  target?: string
+  result: string
+  created_at: string
+}

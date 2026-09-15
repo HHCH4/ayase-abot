@@ -5,6 +5,7 @@ export const router = createRouter({
     { path: '/', redirect: '/status' },
     { path: '/status', name: 'status', component: () => import('@/views/StatusView.vue'), meta: { title: '总览', eyebrow: 'SYSTEM OVERVIEW' } },
     { path: '/bots', name: 'bots', component: () => import('@/views/BotsView.vue'), meta: { title: '机器人平台', eyebrow: 'PLATFORM ADAPTERS' } },
+    { path: '/bot-commands', name: 'bot-commands', component: () => import('@/views/BotCommandsView.vue'), meta: { title: '指令', eyebrow: 'COMMAND CENTER' } },
     { path: '/providers', name: 'providers', component: () => import('@/views/ProvidersView.vue'), meta: { title: '模型供应商', eyebrow: 'MODEL POOL' } },
     { path: '/config', name: 'config', component: () => import('@/views/ConfigView.vue'), meta: { title: '配置文件', eyebrow: 'CONFIG CENTER' } },
     { path: '/memories', name: 'memories', component: () => import('@/views/MemoriesView.vue'), meta: { title: '长期记忆', eyebrow: 'LONG-TERM MEMORY' } },

@@ -63,15 +63,19 @@ const (
 
 // Bot 是机器人连接配置和运行状态。秘密字段只在进程内部使用，API 层不会直接序列化它。
 type Bot struct {
-	ID                string     `json:"id"`
-	Name              string     `json:"name"`
-	Type              Type       `json:"type"`
-	Endpoint          string     `json:"endpoint,omitempty"` // 正向 WS 客户端模式的目标地址，保留用于兼容旧配置。
-	OneBotMode        string     `json:"onebot_mode,omitempty"`
-	ListenHost        string     `json:"listen_host,omitempty"`
-	ListenPort        int        `json:"listen_port,omitempty"`
-	ListenPath        string     `json:"listen_path,omitempty"`
-	GroupTriggerMode  string     `json:"group_trigger_mode,omitempty"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Type             Type   `json:"type"`
+	Endpoint         string `json:"endpoint,omitempty"` // 正向 WS 客户端模式的目标地址，保留用于兼容旧配置。
+	OneBotMode       string `json:"onebot_mode,omitempty"`
+	ListenHost       string `json:"listen_host,omitempty"`
+	ListenPort       int    `json:"listen_port,omitempty"`
+	ListenPath       string `json:"listen_path,omitempty"`
+	GroupTriggerMode string `json:"group_trigger_mode,omitempty"`
+	// AdminUserIDs are the global administrators of this bot. They are the root
+	// of trust for chat commands and can only be edited from the WebUI, never
+	// from a chat message.
+	AdminUserIDs      []string   `json:"admin_user_ids,omitempty"`
 	TelegramToken     string     `json:"-"`
 	OneBotAccessToken string     `json:"-"`
 	Enabled           bool       `json:"enabled"`
@@ -116,6 +120,12 @@ type Message struct {
 	// Mentioned is set by a platform adapter when a group message explicitly
 	// addresses this bot. Private messages are treated as addressed.
 	Mentioned bool
+	// ReplyToUserID is the author of the message this one replies to, when the
+	// platform reports it. It lets /admin add target the replied-to user.
+	ReplyToUserID string
+	// Mentions lists the user ids this message addressed, when the platform
+	// reports them directly (OneBot "at" segments do).
+	Mentions []string
 	// Control is an adapter-produced approval decision and never enters the
 	// model prompt.
 	Control *MessageControl
@@ -292,6 +302,13 @@ type Manager struct {
 	observedInvocations map[string]struct{}
 	pendingApprovals    map[string][]approvalTicket
 	progressInterval    time.Duration
+	// commands is the chat command catalog. It is replaced only during
+	// construction or plugin registration, never while dispatching.
+	commands *CommandRegistry
+	// commandRuntimeInfo/Admin are optional configuration read/write hooks
+	// installed by the application after construction.
+	commandRuntimeInfo  CommandRuntimeInfo
+	commandRuntimeAdmin CommandRuntimeAdmin
 }
 
 type runtimeEntry struct {
@@ -318,12 +335,17 @@ func NewManager(ctx context.Context, repository Repository, kernel *agent.Kernel
 	if err != nil {
 		return nil, fmt.Errorf("加载机器人配置失败: %w", err)
 	}
+	commands, err := NewBuiltinCommandRegistry()
+	if err != nil {
+		return nil, fmt.Errorf("初始化指令注册表失败: %w", err)
+	}
 	m := &Manager{
 		repository: repository, kernel: kernel, conversations: conversations,
 		bus: eventbus.New(), bots: make(map[string]Bot), runtimes: make(map[string]runtimeEntry),
 		locks: make(map[string]*sync.Mutex), baseCtx: ctx,
 		activeConversations: make(map[string]string), activeInvocations: make(map[string]string), observedInvocations: make(map[string]struct{}), pendingApprovals: make(map[string][]approvalTicket),
 		progressInterval: 30 * time.Second,
+		commands:         commands,
 	}
 	for _, item := range items {
 		if item.Status == "" {

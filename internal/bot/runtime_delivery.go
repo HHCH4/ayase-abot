@@ -187,33 +187,39 @@ func parseBotCommand(text string) (botCommand, bool) {
 	return botCommand{Name: name, Arg: arg}, true
 }
 
+// handleBotCommand authorises and dispatches one chat command. Commands are
+// handled entirely here: they never enter the model prompt, so a /status or
+// /help answer cannot pollute the conversation history.
 func (m *Manager) handleBotCommand(ctx context.Context, message Message, command botCommand) error {
-	switch command.Name {
-	case commandHelp:
-		return m.send(ctx, message, botHelpText())
-	case commandNew:
-		return m.startNewConversation(ctx, message)
-	case commandStatus:
-		return m.send(ctx, message, m.statusText(ctx, message))
-	case commandCancel:
-		return m.cancelChatInvocation(ctx, message)
-	case commandApprove, commandReject:
-		approved := command.Name == commandApprove
-		ticket := strings.TrimSpace(command.Arg)
-		if ticket == "" {
-			return m.send(ctx, message, "请提供审批序号，例如 /approve 1。")
-		}
-		if handled, err := m.resolveApprovalChoice(ctx, message, ticket, approved); handled {
-			return err
-		}
-		return m.send(ctx, message, "找不到属于当前聊天的待审批请求，请发送 /status 查看任务状态。")
-	default:
-		return m.send(ctx, message, "未知命令。\n\n"+botHelpText())
+	registry := m.commandRegistry()
+	if registry == nil {
+		return m.send(ctx, message, "指令系统未初始化。")
 	}
-}
-
-func botHelpText() string {
-	return "可用命令：\n/help 查看帮助\n/new 新建会话\n/status 查看当前任务\n/cancel 取消当前任务\n\n审批：/approve 序号 批准，/reject 序号 拒绝。"
+	bot, err := m.Get(strings.TrimSpace(message.AdapterID))
+	if err != nil {
+		return m.send(ctx, message, "读取机器人配置失败。")
+	}
+	descriptor, arg, ok := registry.Resolve(command.Name, command.Arg)
+	if !ok {
+		return m.send(ctx, message, m.unknownCommandText(ctx, bot, message))
+	}
+	authorization, err := m.authorizeCommand(ctx, bot, message, descriptor, arg)
+	if err != nil {
+		return err
+	}
+	if !authorization.Command.Enabled {
+		// A disabled command is reported as disabled to everyone; the reason it
+		// is disabled is an administrative detail, not chat content.
+		return m.send(ctx, message, "该指令当前已停用。发送 /help 查看可用指令。")
+	}
+	if !authorization.allows() {
+		m.recordAudit(ctx, CommandAudit{
+			AdapterID: bot.ID, ChatID: message.ChatID, UserID: message.UserID,
+			Command: descriptor.ID, Action: AuditCommandDenied, Result: "denied",
+		})
+		return m.send(ctx, message, authorization.denyReason())
+	}
+	return m.dispatchBotCommand(ctx, bot, message, authorization)
 }
 
 func (m *Manager) conversationForMessage(ctx context.Context, message Message) (string, string, error) {

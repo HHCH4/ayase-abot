@@ -202,7 +202,10 @@ func TestBotApprovalCannotCrossChatOrUserBoundary(t *testing.T) {
 func newBotRuntimeTestManager(t *testing.T) (*Manager, *botRuntimeTestCoordinator, *botTestPlatform, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	botRepo := &botTestRepository{items: map[string]Bot{"bot-1": {ID: "bot-1", Name: "测试 Bot", Type: TypeTelegram, TelegramToken: "token"}}}
+	// user-1 is the configured global administrator: chat commands with side
+	// effects require that level in a private chat, so the fixture must grant it
+	// explicitly instead of relying on an implicit default.
+	botRepo := &botTestRepository{items: map[string]Bot{"bot-1": {ID: "bot-1", Name: "测试 Bot", Type: TypeTelegram, TelegramToken: "token", AdminUserIDs: []string{"user-1"}}}}
 	conversationRepo := newBotConversationRepository()
 	conversationService, err := conversation.NewService(conversationRepo, session.InMemoryService(), "abot")
 	if err != nil {

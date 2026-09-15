@@ -520,6 +520,14 @@ func Run(opts bootstrap.Options) error {
 		return time.Duration(settings.RequestTimeoutSeconds) * time.Second, nil
 	})
 	botManager.SetRuntimeCoordinator(runtimeCoordinator)
+	// Chat commands read and (where supported) change configuration through the
+	// same services the WebUI uses.
+	commandBridge := &commandRuntimeBridge{
+		providers: registry, config: configService, personas: personaService,
+		workspaces: workspaceService, conversations: conversationService,
+	}
+	botManager.SetCommandRuntimeInfo(commandBridge)
+	botManager.SetCommandRuntimeAdmin(commandBridge)
 	botManager.SetAttachmentStorer(func(storeCtx context.Context, request bot.AttachmentStoreRequest) (agent.Attachment, error) {
 		input := request.Attachment
 		if input.Ref != nil {

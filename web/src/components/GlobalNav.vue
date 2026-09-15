@@ -6,6 +6,7 @@ const route = useRoute()
 const navItems = [
   { name: 'status', label: '总览' },
   { name: 'bots', label: '机器人' },
+  { name: 'bot-commands', label: '指令' },
   { name: 'providers', label: '模型供应商' },
   { name: 'config', label: '配置中心' },
   { name: 'memories', label: '长期记忆' },
