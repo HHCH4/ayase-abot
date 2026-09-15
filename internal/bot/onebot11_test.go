@@ -36,6 +36,14 @@ func TestOneBotReverseWebSocketReceivesAndSends(t *testing.T) {
 		if err := conn.ReadJSON(&action); err == nil {
 			actionReceived <- action
 		}
+		// 保持连接直到客户端主动断开。服务端在这里提前返回会触发 defer 关闭
+		// 连接，客户端读取循环可能先观察到这次断开、再等到测试调用 cancel()，
+		// 使本测试在 -race 下出现时序抖动。
+		for {
+			if _, _, readErr := conn.ReadMessage(); readErr != nil {
+				return
+			}
+		}
 	}))
 	defer server.Close()
 
