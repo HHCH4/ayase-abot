@@ -31,15 +31,20 @@ const (
 
 // Conversation 保存对话元数据；WorkspaceID 为空表示普通对话。
 type Conversation struct {
-	ID          string     `json:"id"`
-	AppName     string     `json:"app_name"`
-	UserID      string     `json:"user_id"`
-	WorkspaceID string     `json:"workspace_id,omitempty"`
-	Title       string     `json:"title"`
-	Status      Status     `json:"status"`
-	ArchivedAt  *time.Time `json:"archived_at,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	ID          string `json:"id"`
+	AppName     string `json:"app_name"`
+	UserID      string `json:"user_id"`
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	// ProviderID and ModelID are an optional per-conversation model override.
+	// Empty means "inherit whatever the configuration bindings resolve", so a
+	// chat can switch models without touching the bot or the global default.
+	ProviderID string     `json:"provider_id,omitempty"`
+	ModelID    string     `json:"model_id,omitempty"`
+	Title      string     `json:"title"`
+	Status     Status     `json:"status"`
+	ArchivedAt *time.Time `json:"archived_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
 // Message 是聊天历史的公开视图；附件正文仍由 ADK 事件存储，列表只返回数量和元信息。
@@ -87,11 +92,12 @@ type TotalCounter interface {
 // Service 管理对话与 ADK Session 的关系。Conversation ID 与 ADK Session ID 一致，
 // 这样可以保证删除对话时能准确清理底层消息事件。
 type Service struct {
-	repository       Repository
-	sessions         session.Service
-	appName          string
-	artifactDeletion func(context.Context, string) error
-	mu               sync.Mutex
+	repository         Repository
+	sessions           session.Service
+	appName            string
+	artifactDeletion   func(context.Context, string) error
+	workspaceValidator WorkspaceValidator
+	mu                 sync.Mutex
 }
 
 // NewService 创建对话服务。
@@ -271,6 +277,77 @@ func (s *Service) ContextStatus(ctx context.Context, userID, id string) (Context
 		}
 	}
 	return status, nil
+}
+
+// WorkspaceValidator checks that a workspace may be bound to a conversation.
+// It is injected by the application so the conversation service does not depend
+// on the workspace service.
+type WorkspaceValidator func(context.Context, string) error
+
+// SetWorkspaceValidator installs the optional workspace existence check.
+func (s *Service) SetWorkspaceValidator(validator WorkspaceValidator) {
+	s.mu.Lock()
+	s.workspaceValidator = validator
+	s.mu.Unlock()
+}
+
+// SetWorkspace binds or clears the workspace of one conversation. An empty
+// workspace id clears the binding. A bound workspace is validated first so a
+// conversation cannot point at a workspace that no longer exists.
+func (s *Service) SetWorkspace(ctx context.Context, userID, id, workspaceID string) (Conversation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, err := s.Get(ctx, userID, id)
+	if err != nil {
+		return Conversation{}, err
+	}
+	if item.Status != StatusActive {
+		return Conversation{}, fmt.Errorf("%w: 当前状态为 %s", ErrInvalidRequest, item.Status)
+	}
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID != "" && s.workspaceValidator != nil {
+		if err := s.workspaceValidator(ctx, workspaceID); err != nil {
+			return Conversation{}, fmt.Errorf("%w: 工作区不可用", ErrInvalidRequest)
+		}
+	}
+	if item.WorkspaceID == workspaceID {
+		return item, nil
+	}
+	item.WorkspaceID = workspaceID
+	item.UpdatedAt = time.Now().UTC()
+	if err := s.repository.Save(ctx, item); err != nil {
+		return Conversation{}, err
+	}
+	return item, nil
+}
+
+// SetRuntimeOverride stores or clears the per-conversation model override.
+// Empty values clear the override and restore inheritance.
+func (s *Service) SetRuntimeOverride(ctx context.Context, userID, id, providerID, modelID string) (Conversation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, err := s.Get(ctx, userID, id)
+	if err != nil {
+		return Conversation{}, err
+	}
+	if item.Status != StatusActive {
+		return Conversation{}, fmt.Errorf("%w: 当前状态为 %s", ErrInvalidRequest, item.Status)
+	}
+	providerID = strings.TrimSpace(providerID)
+	modelID = strings.TrimSpace(modelID)
+	if len(providerID) > 100 || len(modelID) > 200 {
+		return Conversation{}, fmt.Errorf("%w: 模型标识过长", ErrInvalidRequest)
+	}
+	if item.ProviderID == providerID && item.ModelID == modelID {
+		return item, nil
+	}
+	item.ProviderID = providerID
+	item.ModelID = modelID
+	item.UpdatedAt = time.Now().UTC()
+	if err := s.repository.Save(ctx, item); err != nil {
+		return Conversation{}, err
+	}
+	return item, nil
 }
 
 // Archive 将活跃对话归档；归档保留全部信息，但停止聊天和工作区操作。

@@ -32,7 +32,14 @@ var (
 
 // CurrentModel reports the model that is actually in effect for the chat, which
 // already accounts for conversation and bot level configuration bindings.
-func (b *commandRuntimeBridge) CurrentModel(ctx context.Context, botID, _ string, conversationID string) (string, string, error) {
+func (b *commandRuntimeBridge) CurrentModel(ctx context.Context, botID, userID, conversationID string) (string, string, error) {
+	// A per-conversation override is what the chat is actually running, so it
+	// is reported ahead of the resolved default.
+	if item, err := b.conversations.Get(ctx, userID, conversationID); err == nil {
+		if modelID := strings.TrimSpace(item.ModelID); modelID != "" {
+			return strings.TrimSpace(item.ProviderID), modelID, nil
+		}
+	}
 	runtime, err := b.config.Resolve(ctx, botID, conversationID)
 	if err != nil {
 		return "", "", err
@@ -121,13 +128,36 @@ func (b *commandRuntimeBridge) SetPersona(ctx context.Context, _, _, conversatio
 	return b.personas.Bind(ctx, configsvc.BindingConversation, conversationID, strings.TrimSpace(personaID))
 }
 
-// SetModel and SetWorkspace report that chat-side switching is not available in
-// this build rather than pretending to succeed. Both remain WebUI operations
-// until the conversation layer can persist a per-conversation override.
-func (b *commandRuntimeBridge) SetModel(context.Context, string, string, string, string) error {
-	return fmt.Errorf("当前版本请在 WebUI 的任务配置中切换模型")
+// SetModel stores a per-conversation model override. The provider is resolved
+// from the model catalog so a caller cannot pair a model with a wrong provider.
+func (b *commandRuntimeBridge) SetModel(ctx context.Context, _, userID, conversationID, modelID string) error {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return errors.New("模型不能为空")
+	}
+	providerID, err := b.providerForModel(modelID)
+	if err != nil {
+		return err
+	}
+	_, err = b.conversations.SetRuntimeOverride(ctx, userID, conversationID, providerID, modelID)
+	return err
 }
 
-func (b *commandRuntimeBridge) SetWorkspace(context.Context, string, string, string) error {
-	return fmt.Errorf("当前版本请在 WebUI 中为任务绑定工作区")
+// SetWorkspace binds a workspace to the conversation. Validation happens inside
+// the conversation service so both the chat and the WebUI share one rule.
+func (b *commandRuntimeBridge) SetWorkspace(ctx context.Context, userID, conversationID, workspaceID string) error {
+	_, err := b.conversations.SetWorkspace(ctx, userID, conversationID, strings.TrimSpace(workspaceID))
+	return err
+}
+
+// providerForModel finds the provider that owns a model id.
+func (b *commandRuntimeBridge) providerForModel(modelID string) (string, error) {
+	for _, item := range b.providers.List() {
+		for _, model := range item.Models {
+			if model.Enabled && model.ID == modelID {
+				return item.ID, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("没有供应商提供模型 %s", modelID)
 }

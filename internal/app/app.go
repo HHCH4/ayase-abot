@@ -130,6 +130,19 @@ func Run(opts bootstrap.Options) error {
 		return err
 	}
 	conversationService.SetArtifactDeletionHook(artifactService.DeleteConversation)
+	// Chat commands may bind a workspace to a conversation; the conversation
+	// service validates the target through this narrow hook instead of
+	// depending on the workspace service.
+	conversationService.SetWorkspaceValidator(func(validateCtx context.Context, workspaceID string) error {
+		item, getErr := workspaceService.Get(validateCtx, strings.TrimSpace(workspaceID))
+		if getErr != nil {
+			return getErr
+		}
+		if !item.Enabled {
+			return fmt.Errorf("工作区 %s 已停用", item.Name)
+		}
+		return nil
+	})
 	// 工作区删除和操作审批都服从对话生命周期：归档后不能继续批准操作，
 	// 仍有关联对话时不能删除工作区。
 	workspaceService.SetConversationPolicy(conversationService.CountByWorkspace, conversationService.IsActiveByID)
@@ -368,6 +381,16 @@ func Run(opts bootstrap.Options) error {
 			runtime, err := configService.Resolve(ctx, botID, conversationID)
 			if err != nil {
 				return agent.RuntimeOptions{}, err
+			}
+			// A per-conversation override wins over the resolved default, so a
+			// chat can switch models without changing the bot or global config.
+			if item, getErr := conversationService.Get(ctx, userID, conversationID); getErr == nil {
+				if override := strings.TrimSpace(item.ProviderID); override != "" {
+					runtime.ProviderID = override
+				}
+				if override := strings.TrimSpace(item.ModelID); override != "" {
+					runtime.ModelID = override
+				}
 			}
 			runtime, err = resolvePersonaRuntime(ctx, personaService, botID, conversationID, runtime)
 			if err != nil {

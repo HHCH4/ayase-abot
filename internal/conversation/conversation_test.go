@@ -3,6 +3,7 @@ package conversation
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,4 +196,98 @@ func (r *memoryRepository) Delete(_ context.Context, userID, id string) error {
 	}
 	delete(r.items, id)
 	return nil
+}
+
+func TestSetWorkspaceValidatesAndIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	repository := newMemoryRepository()
+	service, err := NewService(repository, session.InMemoryService(), "abot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := service.Create(ctx, CreateRequest{UserID: "user-1", Title: "会话"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 校验失败时必须拒绝，且不改变已有绑定。
+	service.SetWorkspaceValidator(func(context.Context, string) error { return errors.New("工作区不存在") })
+	if _, err := service.SetWorkspace(ctx, "user-1", item.ID, "missing"); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("无效工作区必须被拒绝, got %v", err)
+	}
+	stored, err := service.Get(ctx, "user-1", item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WorkspaceID != "" {
+		t.Fatalf("被拒绝的绑定不应写入: %q", stored.WorkspaceID)
+	}
+
+	// 校验通过时写入，并保持幂等。
+	service.SetWorkspaceValidator(func(_ context.Context, workspaceID string) error {
+		if workspaceID != "project-a" {
+			return errors.New("未知工作区")
+		}
+		return nil
+	})
+	bound, err := service.SetWorkspace(ctx, "user-1", item.ID, "project-a")
+	if err != nil || bound.WorkspaceID != "project-a" {
+		t.Fatalf("绑定工作区失败: %+v err=%v", bound, err)
+	}
+	again, err := service.SetWorkspace(ctx, "user-1", item.ID, "project-a")
+	if err != nil || again.UpdatedAt != bound.UpdatedAt {
+		t.Fatalf("重复绑定应幂等: %+v err=%v", again, err)
+	}
+
+	// 空值解除绑定。
+	cleared, err := service.SetWorkspace(ctx, "user-1", item.ID, "")
+	if err != nil || cleared.WorkspaceID != "" {
+		t.Fatalf("清空工作区失败: %+v err=%v", cleared, err)
+	}
+}
+
+func TestSetRuntimeOverrideAndArchiveGuard(t *testing.T) {
+	ctx := context.Background()
+	repository := newMemoryRepository()
+	service, err := NewService(repository, session.InMemoryService(), "abot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := service.Create(ctx, CreateRequest{UserID: "user-1", Title: "会话"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := service.SetRuntimeOverride(ctx, "user-1", item.ID, "provider-a", "model-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ProviderID != "provider-a" || updated.ModelID != "model-b" {
+		t.Fatalf("模型覆盖未写入: %+v", updated)
+	}
+	// 幂等：值未变化时不推进时间戳。
+	again, err := service.SetRuntimeOverride(ctx, "user-1", item.ID, "provider-a", "model-b")
+	if err != nil || !again.UpdatedAt.Equal(updated.UpdatedAt) {
+		t.Fatalf("重复设置应幂等: %+v err=%v", again, err)
+	}
+	// 清空覆盖，恢复继承。
+	cleared, err := service.SetRuntimeOverride(ctx, "user-1", item.ID, "", "")
+	if err != nil || cleared.ProviderID != "" || cleared.ModelID != "" {
+		t.Fatalf("清空覆盖失败: %+v err=%v", cleared, err)
+	}
+	// 过长标识被拒绝。
+	if _, err := service.SetRuntimeOverride(ctx, "user-1", item.ID, "p", strings.Repeat("m", 201)); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("过长模型标识必须被拒绝, got %v", err)
+	}
+
+	// 归档后不允许再改绑定。
+	if _, err := service.Archive(ctx, "user-1", item.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetRuntimeOverride(ctx, "user-1", item.ID, "p", "m"); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("归档会话不应接受覆盖, got %v", err)
+	}
+	if _, err := service.SetWorkspace(ctx, "user-1", item.ID, "project-a"); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("归档会话不应接受工作区绑定, got %v", err)
+	}
 }

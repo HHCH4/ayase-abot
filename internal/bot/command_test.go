@@ -500,3 +500,47 @@ func (a *commandTestRuntimeAdmin) SetPersona(context.Context, string, string, st
 func (a *commandTestRuntimeAdmin) SetWorkspace(context.Context, string, string, string) error {
 	return nil
 }
+
+func TestGroupAdminIsScopedToBotAndChat(t *testing.T) {
+	ctx := context.Background()
+	repository := newCommandTestRepository()
+	// 两个机器人拥有相同的聊天标识与用户标识，只有 adapter 不同。
+	repository.items["bot-1"] = Bot{ID: "bot-1", Name: "一号", Type: TypeOneBot11, AdminUserIDs: []string{"global-1"}}
+	repository.items["bot-2"] = Bot{ID: "bot-2", Name: "二号", Type: TypeOneBot11, AdminUserIDs: []string{"global-1"}}
+	conversationService, err := conversation.NewService(newBotConversationRepository(), session.InMemoryService(), "abot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(ctx, repository, &agent.Kernel{}, conversationService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	platform := &botTestPlatform{}
+	manager.mu.Lock()
+	manager.runtimes["bot-1"] = runtimeEntry{platform: platform}
+	manager.runtimes["bot-2"] = runtimeEntry{platform: platform}
+	manager.mu.Unlock()
+
+	// 在 bot-1 的 group-x 授权 555。
+	if err := manager.handleMessage(ctx, Message{ID: "a", AdapterID: "bot-1", Platform: TypeOneBot11, UserID: "global-1", ChatID: "group-x", ChatType: "group", Mentioned: true, Text: "/admin add 555"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(platform.lastSent(), "555") {
+		t.Fatalf("授权失败: %q", platform.lastSent())
+	}
+
+	// 同一个 chat_id 与 user_id，在 bot-2 上不获得权限。
+	if err := manager.handleMessage(ctx, Message{ID: "b", AdapterID: "bot-2", Platform: TypeOneBot11, UserID: "555", ChatID: "group-x", ChatType: "group", Mentioned: true, Text: "/new"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(platform.lastSent(), "群管理员权限") {
+		t.Fatalf("群管理员标识必须绑定 adapter，跨机器人不得生效: %q", platform.lastSent())
+	}
+	// 在 bot-1 上同一身份可用。
+	if err := manager.handleMessage(ctx, Message{ID: "c", AdapterID: "bot-1", Platform: TypeOneBot11, UserID: "555", ChatID: "group-x", ChatType: "group", Mentioned: true, Text: "/status"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(platform.lastSent(), "权限") {
+		t.Fatalf("授权应在来源机器人生效: %q", platform.lastSent())
+	}
+}
