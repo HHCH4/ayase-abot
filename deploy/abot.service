@@ -1,0 +1,17 @@
+[Unit]
+Description=Abot 内置 AI Agent 服务
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/abot
+ExecStart=%h/abot/ayase-abot -http 0.0.0.0:6969 -data %h/abot/data -log-level info
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target
