@@ -1202,13 +1202,19 @@ func (s *Server) streamChat(writer http.ResponseWriter, ctx context.Context, req
 		writeError(writer, errors.New("当前 HTTP 服务不支持 SSE"))
 		return
 	}
+	streamLog := newSSEStreamLog("chat", "conversation_id", request.ConversationID, "session_id", request.SessionID)
+	streamStatus := "closed"
+	defer func() {
+		streamLog.finish(streamStatus)
+	}()
 	writer.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	writer.Header().Set("Cache-Control", "no-cache, no-transform")
 	writer.Header().Set("Connection", "keep-alive")
 	finalText := ""
 	for event, err := range s.kernel.Run(ctx, request) {
 		if err != nil {
-			_ = writeSSE(writer, "error", map[string]any{"error": err.Error()})
+			streamStatus = "failed"
+			_ = writeSSE(writer, "error", map[string]any{"error": err.Error()}, streamLog)
 			flusher.Flush()
 			return
 		}
@@ -1218,7 +1224,10 @@ func (s *Server) streamChat(writer http.ResponseWriter, ctx context.Context, req
 		text := agent.TextFromContent(event.Content)
 		if event.Partial {
 			if text != "" {
-				_ = writeSSE(writer, "message", map[string]any{"type": "message", "delta": text})
+				if err := writeSSE(writer, "message", map[string]any{"type": "message", "delta": text}, streamLog); err != nil {
+					streamStatus = "write_failed"
+					return
+				}
 				flusher.Flush()
 			}
 			continue
@@ -1227,7 +1236,11 @@ func (s *Server) streamChat(writer http.ResponseWriter, ctx context.Context, req
 			finalText = text
 		}
 	}
-	_ = writeSSE(writer, "done", map[string]any{"type": "done", "text": finalText, "conversation_id": request.ConversationID, "session_id": request.SessionID})
+	if err := writeSSE(writer, "done", map[string]any{"type": "done", "text": finalText, "conversation_id": request.ConversationID, "session_id": request.SessionID}, streamLog); err != nil {
+		streamStatus = "write_failed"
+		return
+	}
+	streamStatus = "completed"
 	flusher.Flush()
 }
 
@@ -1494,13 +1507,17 @@ func writeJSONInternal(writer http.ResponseWriter, status int, value any, logBod
 	}
 }
 
-func writeSSE(writer http.ResponseWriter, event string, value any) error {
+func writeSSE(writer http.ResponseWriter, event string, value any, streamLog *sseStreamLog) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	// SSE 每个事件都是一次独立响应，记录原始事件正文以便还原实时交互。
-	slog.Info("HTTP SSE 响应正文", "event", event, "body", string(data))
+	if streamLog != nil {
+		streamLog.record(event, data)
+	} else {
+		// 非流式聚合调用保留兼容日志，避免未来新增调用点完全丢失正文。
+		slog.Info("HTTP SSE 响应正文", "event", event, "body", string(data))
+	}
 	_, err = fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", event, data)
 	return err
 }

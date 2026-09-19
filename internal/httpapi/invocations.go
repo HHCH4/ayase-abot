@@ -918,6 +918,11 @@ func (s *Server) streamRuntimeChat(writer http.ResponseWriter, request *http.Req
 	writer.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	writer.Header().Set("Cache-Control", "no-cache, no-transform")
 	writer.Header().Set("Connection", "keep-alive")
+	streamLog := newSSEStreamLog("runtime_chat", "invocation_id", invocation.ID, "conversation_id", invocation.ConversationID, "session_id", invocation.SessionID)
+	streamStatus := "closed"
+	defer func() {
+		streamLog.finish(streamStatus)
+	}()
 	var finalText strings.Builder
 	var sawDelta bool
 	last := int64(0)
@@ -933,7 +938,8 @@ func (s *Server) streamRuntimeChat(writer http.ResponseWriter, request *http.Req
 			if textValue != "" {
 				sawDelta = true
 				finalText.WriteString(textValue)
-				if err := writeSSE(writer, "message", map[string]any{"type": "message", "delta": textValue}); err != nil {
+				if err := writeSSE(writer, "message", map[string]any{"type": "message", "delta": textValue}, streamLog); err != nil {
+					streamStatus = "write_failed"
 					return false
 				}
 				flusher.Flush()
@@ -946,7 +952,8 @@ func (s *Server) streamRuntimeChat(writer http.ResponseWriter, request *http.Req
 				// fallback text and the non-stream projection could return the
 				// fallback instead of the primary answer.
 				if scope, _ := event.Data["scope"].(string); scope == "modal_fallback" {
-					if err := writeSSE(writer, "message", map[string]any{"type": "message", "delta": textValue}); err != nil {
+					if err := writeSSE(writer, "message", map[string]any{"type": "message", "delta": textValue}, streamLog); err != nil {
+						streamStatus = "write_failed"
 						return false
 					}
 					flusher.Flush()
@@ -955,7 +962,8 @@ func (s *Server) streamRuntimeChat(writer http.ResponseWriter, request *http.Req
 				if !sawDelta {
 					finalText.Reset()
 					finalText.WriteString(textValue)
-					if err := writeSSE(writer, "message", map[string]any{"type": "message", "delta": textValue}); err != nil {
+					if err := writeSSE(writer, "message", map[string]any{"type": "message", "delta": textValue}, streamLog); err != nil {
+						streamStatus = "write_failed"
 						return false
 					}
 					flusher.Flush()
@@ -967,7 +975,8 @@ func (s *Server) streamRuntimeChat(writer http.ResponseWriter, request *http.Req
 			data := cloneRuntimeEventData(event.Data)
 			data["type"] = "approval"
 			data["invocation_id"] = invocation.ID
-			if err := writeSSE(writer, "approval", data); err != nil {
+			if err := writeSSE(writer, "approval", data, streamLog); err != nil {
+				streamStatus = "write_failed"
 				return false
 			}
 			flusher.Flush()
@@ -979,18 +988,20 @@ func (s *Server) streamRuntimeChat(writer http.ResponseWriter, request *http.Req
 			agentruntime.EventModelCompleted, agentruntime.EventModelRetrying, agentruntime.EventModelFailed,
 			agentruntime.EventApprovalExpired, agentruntime.EventInvocationCancelling, agentruntime.EventRuntimeNotice, agentruntime.EventADK:
 			data := map[string]any{"type": "runtime", "event": event.Type, "data": event.Data}
-			if err := writeSSE(writer, "runtime", data); err != nil {
+			if err := writeSSE(writer, "runtime", data, streamLog); err != nil {
+				streamStatus = "write_failed"
 				return false
 			}
 			flusher.Flush()
 		case agentruntime.EventInvocationCompleted:
-			terminal = true
-			if err := writeSSE(writer, "done", map[string]any{"type": "done", "text": finalText.String(), "conversation_id": invocation.ConversationID, "session_id": invocation.SessionID, "invocation_id": invocation.ID}); err != nil {
+			if err := writeSSE(writer, "done", map[string]any{"type": "done", "text": finalText.String(), "conversation_id": invocation.ConversationID, "session_id": invocation.SessionID, "invocation_id": invocation.ID}, streamLog); err != nil {
+				streamStatus = "write_failed"
 				return false
 			}
+			terminal = true
+			streamStatus = "completed"
 			flusher.Flush()
 		case agentruntime.EventInvocationFailed, agentruntime.EventInvocationCancelled, agentruntime.EventInvocationExpired:
-			terminal = true
 			message := "Agent 运行失败"
 			if event.Type == agentruntime.EventInvocationCancelled {
 				message = "Agent 已取消"
@@ -1000,9 +1011,12 @@ func (s *Server) streamRuntimeChat(writer http.ResponseWriter, request *http.Req
 			if value, ok := event.Data["error"].(string); ok && strings.TrimSpace(value) != "" {
 				message = value
 			}
-			if err := writeSSE(writer, "error", map[string]any{"type": "error", "error": message, "invocation_id": invocation.ID}); err != nil {
+			if err := writeSSE(writer, "error", map[string]any{"type": "error", "error": message, "invocation_id": invocation.ID}, streamLog); err != nil {
+				streamStatus = "write_failed"
 				return false
 			}
+			terminal = true
+			streamStatus = "failed"
 			flusher.Flush()
 		}
 		return true

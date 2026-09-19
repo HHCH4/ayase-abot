@@ -579,12 +579,56 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 		}
 		defer unsubscribe()
 		sentResponse := false
+		var streamedText strings.Builder
+		streamedDeltaCount := 0
+		flushStreamLog := func(status, finalText string) {
+			if streamedDeltaCount == 0 {
+				return
+			}
+			text := finalText
+			streamedDeltaText := streamedText.String()
+			if strings.TrimSpace(text) == "" {
+				text = streamedDeltaText
+			}
+			// 把 assistant.delta 合并成一条完整响应，避免思考或回答的每个分片各自刷日志。
+			attributes := []any{"adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "invocation_id", invocationID, "status", status, "delta_count", streamedDeltaCount, "text", text}
+			if streamedDeltaText != "" && streamedDeltaText != text {
+				// 思考增量和最终正文可能不是同一份文本，两者都保留但仍只生成一条日志。
+				attributes = append(attributes, "streamed_text", streamedDeltaText)
+			}
+			slog.Info("机器人 Runtime 流式响应", attributes...)
+			streamedText.Reset()
+			streamedDeltaCount = 0
+		}
+		defer func() {
+			// 订阅被取消或 Runtime 异常关闭时也要落下已经收到的部分正文。
+			flushStreamLog("closed", "")
+		}()
 		process := func(event agentruntime.AgentEvent) bool {
 			if event.InvocationID != invocationID {
 				return false
 			}
-			// Runtime 事件包含工具调用、模型响应和终态信息；保留完整数据便于追踪请求链路。
-			slog.Info("机器人 Runtime 响应事件", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "invocation_id", invocationID, "event_type", event.Type, "data", event.Data)
+			if event.Type == agentruntime.EventAssistantDelta {
+				if text := eventString(event.Data, "text"); text != "" {
+					streamedText.WriteString(text)
+					streamedDeltaCount++
+					return false
+				}
+			}
+			suppressResponseEventLog := false
+			if event.Type == agentruntime.EventAssistantMessage {
+				if text := eventString(event.Data, "text"); text != "" {
+					if scope, _ := event.Data["scope"].(string); scope != "modal_fallback" && streamedDeltaCount > 0 {
+						// 主模型已经发过增量时，用最终正文结束这次聚合日志，避免再次按事件拆开。
+						flushStreamLog("completed", text)
+						suppressResponseEventLog = true
+					}
+				}
+			}
+			// Runtime 事件包含工具调用、模型响应和终态信息；非文本增量继续逐条保留完整数据。
+			if !suppressResponseEventLog {
+				slog.Info("机器人 Runtime 响应事件", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "invocation_id", invocationID, "event_type", event.Type, "data", event.Data)
+			}
 			switch event.Type {
 			case agentruntime.EventAssistantMessage:
 				if text := eventString(event.Data, "text"); text != "" {
@@ -608,12 +652,14 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 				}
 				_ = m.send(baseCtx, message, "正在执行："+safeProgressText(name))
 			case agentruntime.EventInvocationCompleted:
+				flushStreamLog("completed", "")
 				if !sentResponse {
 					_ = m.send(baseCtx, message, "任务已完成，但没有返回文字结果。")
 				}
 				m.clearActiveInvocation(message, invocationID)
 				return true
 			case agentruntime.EventInvocationFailed:
+				flushStreamLog("failed", "")
 				reason := eventString(event.Data, "error")
 				if reason == "" {
 					reason = "运行时返回失败"
@@ -622,10 +668,12 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 				m.clearActiveInvocation(message, invocationID)
 				return true
 			case agentruntime.EventInvocationCancelled:
+				flushStreamLog("cancelled", "")
 				_ = m.send(baseCtx, message, "任务已取消。")
 				m.clearActiveInvocation(message, invocationID)
 				return true
 			case agentruntime.EventInvocationExpired:
+				flushStreamLog("expired", "")
 				_ = m.send(baseCtx, message, "任务已过期。")
 				m.clearActiveInvocation(message, invocationID)
 				return true
