@@ -17,7 +17,7 @@ const profileName = ref('')
 const draft = reactive<Record<string, unknown>>({})
 const systemDraft = reactive<Record<string, unknown>>({
   log_level: 'info', request_timeout_seconds: 300,
-  artifact_quota_bytes: 4 * 1024 * 1024 * 1024, artifact_stale_upload_seconds: 86400,
+  artifact_quota_bytes: 4 * 1024 * 1024 * 1024, artifact_stale_upload_seconds: 86400, artifact_input_retention_seconds: 7 * 86400,
   modal_fallback_enabled: false, modal_fallback_provider_id: '', modal_fallback_vision_model: '', modal_fallback_audio_model: '',
 })
 const revisions = ref<ConfigRevision[]>([])
@@ -245,7 +245,7 @@ function syncSystemDraft() {
   Object.keys(systemDraft).forEach((key) => { delete systemDraft[key] })
   Object.assign(systemDraft, {
     log_level: value.log_level, request_timeout_seconds: value.request_timeout_seconds,
-    artifact_quota_bytes: value.artifact_quota_bytes, artifact_stale_upload_seconds: value.artifact_stale_upload_seconds,
+    artifact_quota_bytes: value.artifact_quota_bytes, artifact_stale_upload_seconds: value.artifact_stale_upload_seconds, artifact_input_retention_seconds: value.artifact_input_retention_seconds,
     modal_fallback_enabled: value.modal_fallback_enabled, modal_fallback_provider_id: value.modal_fallback_provider_id,
     modal_fallback_vision_model: value.modal_fallback_vision_model, modal_fallback_audio_model: value.modal_fallback_audio_model,
   })

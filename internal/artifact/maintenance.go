@@ -25,13 +25,16 @@ const (
 	// DefaultStaleUploadAge is how long an artifact may stay in the uploading
 	// state before its metadata is closed as failed.
 	DefaultStaleUploadAge = 24 * time.Hour
+	// DefaultInputAttachmentRetention 是输入附件进入定时回收前的默认保留时长。
+	DefaultInputAttachmentRetention = 7 * 24 * time.Hour
 	// DefaultObjectGracePeriod protects an object that was just written but
 	// whose metadata row is not committed yet from being collected.
 	DefaultObjectGracePeriod = time.Hour
 
-	minStaleUploadAge = 5 * time.Minute
-	maxStaleUploadAge = 30 * 24 * time.Hour
-	maxObjectGrace    = 24 * time.Hour
+	minStaleUploadAge           = 5 * time.Minute
+	maxStaleUploadAge           = 30 * 24 * time.Hour
+	maxObjectGrace              = 24 * time.Hour
+	maxInputAttachmentRetention = 365 * 24 * time.Hour
 
 	// maxSweepBatch and maxObjectDeletionBatch bound one maintenance pass so a
 	// large store cannot stall startup for an unbounded time.
@@ -52,13 +55,19 @@ var (
 // SetMaintenancePolicy so a configuration mistake cannot silently disable
 // reclamation.
 type MaintenancePolicy struct {
-	QuotaBytes        int64
-	StaleUploadAge    time.Duration
-	ObjectGracePeriod time.Duration
+	QuotaBytes                     int64
+	StaleUploadAge                 time.Duration
+	InputAttachmentRetentionPeriod time.Duration
+	ObjectGracePeriod              time.Duration
 }
 
 func DefaultMaintenancePolicy() MaintenancePolicy {
-	return MaintenancePolicy{QuotaBytes: DefaultQuotaBytes, StaleUploadAge: DefaultStaleUploadAge, ObjectGracePeriod: DefaultObjectGracePeriod}
+	return MaintenancePolicy{
+		QuotaBytes:                     DefaultQuotaBytes,
+		StaleUploadAge:                 DefaultStaleUploadAge,
+		InputAttachmentRetentionPeriod: DefaultInputAttachmentRetention,
+		ObjectGracePeriod:              DefaultObjectGracePeriod,
+	}
 }
 
 // StoredUsage is the physical, de-duplicated footprint of the store. Content
@@ -116,6 +125,12 @@ type StaleArtifactRepository interface {
 	ListStaleDeleting(context.Context, time.Time, int) ([]Artifact, error)
 }
 
+// ExpiredArtifactRepository 列出已过期的可删除附件；第二个时间点用于兼容
+// 旧版本没有写入 expires_at 的 input_attachment 记录。
+type ExpiredArtifactRepository interface {
+	ListExpiredArtifacts(context.Context, time.Time, time.Time, int) ([]Artifact, error)
+}
+
 // ObjectDeletionRepository is the durable delete outbox. It is what makes an
 // object-delete failure recoverable without keeping the metadata row alive.
 type ObjectDeletionRepository interface {
@@ -153,6 +168,9 @@ func (s *Service) SetMaintenancePolicy(policy MaintenancePolicy) error {
 	}
 	if policy.StaleUploadAge < minStaleUploadAge || policy.StaleUploadAge > maxStaleUploadAge {
 		return fmt.Errorf("%w: 上传超时阈值必须在 %s 到 %s 之间", ErrInvalidRequest, minStaleUploadAge, maxStaleUploadAge)
+	}
+	if policy.InputAttachmentRetentionPeriod < 0 || policy.InputAttachmentRetentionPeriod > maxInputAttachmentRetention {
+		return fmt.Errorf("%w: 输入附件保留时长必须在 0 到 %s 之间", ErrInvalidRequest, maxInputAttachmentRetention)
 	}
 	if policy.ObjectGracePeriod < 0 || policy.ObjectGracePeriod > maxObjectGrace {
 		return fmt.Errorf("%w: 对象保护期必须在 0 到 %s 之间", ErrInvalidRequest, maxObjectGrace)
@@ -269,6 +287,13 @@ type ObjectDeletionResult struct {
 	Deferred int `json:"deferred"`
 }
 
+// ExpiredArtifactResult 汇总一轮过期 Artifact 删除结果。
+type ExpiredArtifactResult struct {
+	Scanned  int `json:"scanned"`
+	Deleted  int `json:"deleted"`
+	Deferred int `json:"deferred"`
+}
+
 // GarbageCollectResult summarises one orphan-object pass.
 type GarbageCollectResult struct {
 	Scanned        int   `json:"scanned"`
@@ -280,9 +305,10 @@ type GarbageCollectResult struct {
 
 // MaintenanceResult is the combined outcome of one maintenance pass.
 type MaintenanceResult struct {
-	UploadSweep       UploadSweepResult    `json:"upload_sweep"`
-	ObjectDeletions   ObjectDeletionResult `json:"object_deletions"`
-	GarbageCollection GarbageCollectResult `json:"garbage_collection"`
+	ExpiredArtifacts  ExpiredArtifactResult `json:"expired_artifacts"`
+	UploadSweep       UploadSweepResult     `json:"upload_sweep"`
+	ObjectDeletions   ObjectDeletionResult  `json:"object_deletions"`
+	GarbageCollection GarbageCollectResult  `json:"garbage_collection"`
 }
 
 func resolveMaintenanceNow(now time.Time, fallback func() time.Time) time.Time {
@@ -388,6 +414,44 @@ func (s *Service) SweepStaleArtifacts(ctx context.Context, now time.Time) (Uploa
 			return result, err
 		}
 		result.TemporaryRemoved = removed
+	}
+	return result, nil
+}
+
+// DeleteExpiredArtifacts 删除已经过期的 ready/quarantined 元数据，并复用单条
+// 删除流程回收或登记原始对象。旧版本未写入过期时间的输入附件也按当前策略补偿清理。
+func (s *Service) DeleteExpiredArtifacts(ctx context.Context, now time.Time) (ExpiredArtifactResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	now = resolveMaintenanceNow(now, s.now)
+	result := ExpiredArtifactResult{}
+	repository, ok := s.repository.(ExpiredArtifactRepository)
+	if !ok {
+		return result, nil
+	}
+	policy := s.maintenancePolicy()
+	legacyInputBefore := time.Time{}
+	if policy.InputAttachmentRetentionPeriod > 0 {
+		legacyInputBefore = now.Add(-policy.InputAttachmentRetentionPeriod)
+	}
+	items, err := repository.ListExpiredArtifacts(ctx, now, legacyInputBefore, maxSweepBatch)
+	if err != nil {
+		return result, err
+	}
+	result.Scanned = len(items)
+	for _, item := range items {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		if err := s.Delete(ctx, item.UserID, item.ID); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			result.Deferred++
+			continue
+		}
+		result.Deleted++
 	}
 	return result, nil
 }
@@ -535,15 +599,19 @@ func (s *Service) hasPendingObjectDeletion(ctx context.Context, storageKey strin
 	return repository.HasObjectDeletion(ctx, storageKey)
 }
 
-// RunMaintenance runs the sweep, the delete-outbox drain and the orphan pass in
-// the order that keeps the footprint consistent: close abandoned rows first,
-// then retry known deletions, then collect what is left over.
+// RunMaintenance runs the expiry sweep, stale-row sweep, delete-outbox drain and
+// orphan pass in the order that keeps the footprint consistent.
 func (s *Service) RunMaintenance(ctx context.Context, now time.Time) (MaintenanceResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	now = resolveMaintenanceNow(now, s.now)
 	result := MaintenanceResult{}
+	expired, err := s.DeleteExpiredArtifacts(ctx, now)
+	result.ExpiredArtifacts = expired
+	if err != nil {
+		return result, err
+	}
 	sweep, err := s.SweepStaleArtifacts(ctx, now)
 	result.UploadSweep = sweep
 	if err != nil {

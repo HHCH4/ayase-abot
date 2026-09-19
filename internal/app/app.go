@@ -533,18 +533,22 @@ func Run(opts bootstrap.Options) error {
 	if _, err := workspaceService.PurgeExpiredCommandOutput(ctx, time.Now().UTC()); err != nil {
 		return fmt.Errorf("清理过期命令日志失败: %w", err)
 	}
-	// Artifact 维护同样是启动触发的幂等回收：关闭未完成上传、重试对象删除、
-	// 回收无引用对象。它只影响可回收空间，不影响已有内容的正确性，因此失败
-	// 记录警告而不阻止启动，下一次启动或显式维护请求会重试。
+	// Artifact 维护先在启动时执行一次幂等回收：删除过期附件、关闭未完成上传、
+	// 重试对象删除并回收无引用对象。它只影响可回收空间，不影响已有内容的正确性，
+	// 因此失败记录警告而不阻止启动，后续定时循环或显式维护请求会重试。
 	if result, maintenanceErr := artifactService.RunMaintenance(ctx, time.Now().UTC()); maintenanceErr != nil {
 		slog.Warn("Artifact 维护未完成", "error", maintenanceErr)
 	} else {
 		slog.Info("Artifact 维护完成",
+			"expired_deleted", result.ExpiredArtifacts.Deleted,
 			"uploads_failed", result.UploadSweep.UploadsFailed,
 			"deletions_closed", result.UploadSweep.DeletionsClosed,
 			"objects_deleted", result.GarbageCollection.Deleted,
 			"bytes_reclaimed", result.GarbageCollection.ReclaimedBytes)
 	}
+	// 启动维护只处理历史积压；定时循环负责后续过期附件和对象删除，避免
+	// 进程长期运行时原始文档一直占用磁盘。每轮都有独立超时，不阻塞关停。
+	go runArtifactMaintenanceLoop(ctx, artifactService)
 	if _, ok := runtimeRepo.(agentruntime.InstructionSnapshotRepository); ok {
 		runtimeCoordinator.SetInstructionSnapshotValidator(validateInstructionSnapshot)
 		runtimeCoordinator.SetInstructionSnapshotReconfirmer(reconfirmInstructionSnapshot)
@@ -796,7 +800,39 @@ func applyArtifactMaintenancePolicy(service *artifact.Service, settings configsv
 	if settings.ArtifactStaleUploadSeconds > 0 {
 		policy.StaleUploadAge = time.Duration(settings.ArtifactStaleUploadSeconds) * time.Second
 	}
+	if settings.ArtifactInputRetentionSeconds > 0 {
+		policy.InputAttachmentRetentionPeriod = time.Duration(settings.ArtifactInputRetentionSeconds) * time.Second
+	}
 	return service.SetMaintenancePolicy(policy)
+}
+
+// runArtifactMaintenanceLoop 定期执行有界维护，过期输入附件会先删除元数据，
+// 随后由对象删除 outbox 或孤儿对象回收完成磁盘清理。
+func runArtifactMaintenanceLoop(ctx context.Context, service *artifact.Service) {
+	if service == nil {
+		return
+	}
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			maintenanceCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			result, err := service.RunMaintenance(maintenanceCtx, time.Now().UTC())
+			cancel()
+			if err != nil {
+				slog.Warn("Artifact 定时维护未完成", "error", err)
+				continue
+			}
+			slog.Info("Artifact 定时维护完成",
+				"expired_deleted", result.ExpiredArtifacts.Deleted,
+				"expired_deferred", result.ExpiredArtifacts.Deferred,
+				"objects_deleted", result.GarbageCollection.Deleted,
+				"bytes_reclaimed", result.GarbageCollection.ReclaimedBytes)
+		}
+	}
 }
 
 func parseLevel(value string) slog.Level {

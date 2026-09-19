@@ -33,6 +33,7 @@ var (
 	_ artifact.UsageRepository                 = (*artifactRepository)(nil)
 	_ artifact.ActiveReferenceRepository       = (*artifactRepository)(nil)
 	_ artifact.StaleArtifactRepository         = (*artifactRepository)(nil)
+	_ artifact.ExpiredArtifactRepository       = (*artifactRepository)(nil)
 	_ artifact.ObjectDeletionRepository        = (*artifactRepository)(nil)
 	_ artifact.PendingObjectDeletionRepository = (*artifactRepository)(nil)
 )
@@ -82,6 +83,30 @@ func (r *artifactRepository) ListStaleUploading(ctx context.Context, before time
 
 func (r *artifactRepository) ListStaleDeleting(ctx context.Context, before time.Time, limit int) ([]artifact.Artifact, error) {
 	return r.listStaleArtifacts(ctx, artifact.StatusDeleting, before, limit)
+}
+
+// ListExpiredArtifacts 查询已过期的 ready/quarantined 记录，并兼容旧版本没有
+// 写入 expires_at 的 input_attachment，避免升级后历史文件永远无法进入回收流程。
+func (r *artifactRepository) ListExpiredArtifacts(ctx context.Context, now, legacyInputBefore time.Time, limit int) ([]artifact.Artifact, error) {
+	if limit <= 0 || limit > maxStaleArtifactScan {
+		limit = maxStaleArtifactScan
+	}
+	statuses := []string{string(artifact.StatusReady), string(artifact.StatusQuarantined)}
+	query := r.db.WithContext(nonNilContext(ctx)).Where("status IN ? AND ((expires_at IS NOT NULL AND expires_at <= ?) OR (kind = ? AND expires_at IS NULL AND created_at <= ?))", statuses, now.UTC(), string(artifact.KindInputAttachment), legacyInputBefore.UTC()).
+		Order("COALESCE(expires_at, created_at) ASC, id ASC").Limit(limit)
+	var rows []artifactRow
+	if err := query.Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	result := make([]artifact.Artifact, 0, len(rows))
+	for _, row := range rows {
+		item, err := artifactFromRow(row)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, nil
 }
 
 func (r *artifactRepository) listStaleArtifacts(ctx context.Context, status artifact.Status, before time.Time, limit int) ([]artifact.Artifact, error) {

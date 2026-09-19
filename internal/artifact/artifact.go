@@ -335,7 +335,17 @@ func (s *Service) Put(ctx context.Context, request PutRequest, reader io.Reader)
 		return Artifact{}, err
 	}
 	now := s.now().UTC()
-	item := Artifact{ID: newID(), Version: 1, UserID: strings.TrimSpace(request.UserID), ConversationID: strings.TrimSpace(request.ConversationID), InvocationID: strings.TrimSpace(request.InvocationID), ProducerType: strings.TrimSpace(request.ProducerType), ProducerID: strings.TrimSpace(request.ProducerID), Kind: request.Kind, Name: request.Name, MIMEType: normalizeMIME(request.MIMEType), SecurityClass: strings.TrimSpace(request.SecurityClass), Status: StatusUploading, Metadata: cloneMetadata(request.Metadata), ExpiresAt: cloneTime(request.ExpiresAt), CreatedAt: now, UpdatedAt: now}
+	expiresAt := cloneTime(request.ExpiresAt)
+	// 输入附件默认设置保留期限，让图片、音频和文档都能被统一的定时维护回收。
+	// 调用方显式传入 ExpiresAt 时保留调用方的生命周期决定。
+	if expiresAt == nil && request.Kind == KindInputAttachment {
+		policy := s.maintenancePolicy()
+		if policy.InputAttachmentRetentionPeriod > 0 {
+			value := now.Add(policy.InputAttachmentRetentionPeriod)
+			expiresAt = &value
+		}
+	}
+	item := Artifact{ID: newID(), Version: 1, UserID: strings.TrimSpace(request.UserID), ConversationID: strings.TrimSpace(request.ConversationID), InvocationID: strings.TrimSpace(request.InvocationID), ProducerType: strings.TrimSpace(request.ProducerType), ProducerID: strings.TrimSpace(request.ProducerID), Kind: request.Kind, Name: request.Name, MIMEType: normalizeMIME(request.MIMEType), SecurityClass: strings.TrimSpace(request.SecurityClass), Status: StatusUploading, Metadata: cloneMetadata(request.Metadata), ExpiresAt: expiresAt, CreatedAt: now, UpdatedAt: now}
 	if err := item.Validate(); err != nil {
 		return Artifact{}, err
 	}

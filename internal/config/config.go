@@ -98,10 +98,13 @@ type SystemSettings struct {
 	LogLevel              string `json:"log_level"`
 	RequestTimeoutSeconds int    `json:"request_timeout_seconds"`
 	// ArtifactQuotaBytes 是本地内容寻址存储去重后的占用上限。单独出现的 0
-	// 表示用户显式关闭配额；只有两个 Artifact 字段同时为 0 才视为旧数据或
+	// 表示用户显式关闭配额；配额和未完成上传时长同时为 0 才视为旧数据或
 	// 全新记录，此时由 normalizeSystemSettings 补上保守默认值。
 	ArtifactQuotaBytes         int64 `json:"artifact_quota_bytes"`
 	ArtifactStaleUploadSeconds int   `json:"artifact_stale_upload_seconds"`
+	// ArtifactInputRetentionSeconds 控制图片、音频和文档等输入附件的定时
+	// 清理周期；会话物理删除时仍会立即级联清理，不受该周期影响。
+	ArtifactInputRetentionSeconds int `json:"artifact_input_retention_seconds"`
 	// Modal fallback is a system-wide safety valve. Empty provider means the
 	// primary provider; empty per-modality model means that modality is not
 	// downgraded through another model.
@@ -114,11 +117,14 @@ type SystemSettings struct {
 // Artifact 存储约束的默认值与边界。这些数值同时用于 Schema 校验和运行时维护
 // 策略，避免配置层与存储层各自维护一份默认值。
 const (
-	DefaultArtifactQuotaBytes         int64 = 4 << 30
-	MaxArtifactQuotaBytes             int64 = 1 << 40
-	DefaultArtifactStaleUploadSeconds       = 24 * 60 * 60
-	MinArtifactStaleUploadSeconds           = 300
-	MaxArtifactStaleUploadSeconds           = 30 * 24 * 60 * 60
+	DefaultArtifactQuotaBytes            int64 = 4 << 30
+	MaxArtifactQuotaBytes                int64 = 1 << 40
+	DefaultArtifactStaleUploadSeconds          = 24 * 60 * 60
+	MinArtifactStaleUploadSeconds              = 300
+	MaxArtifactStaleUploadSeconds              = 30 * 24 * 60 * 60
+	DefaultArtifactInputRetentionSeconds       = 7 * 24 * 60 * 60
+	MinArtifactInputRetentionSeconds           = 60 * 60
+	MaxArtifactInputRetentionSeconds           = 365 * 24 * 60 * 60
 )
 
 // SystemSchema 描述系统设置的校验范围和是否需要重启，供 WebUI 与外部管理客户端复用。
@@ -130,6 +136,7 @@ func SystemSchema() Schema {
 		{Key: "request_timeout_seconds", Group: "system", Label: "全局请求超时（秒）", Type: "integer", Default: 300, Min: floatPtr(30), Max: floatPtr(3600), Help: "限制 WebUI、API 和机器人消息请求的最长运行时间。"},
 		{Key: "artifact_quota_bytes", Group: "system", Label: "Artifact 存储配额（字节）", Type: "integer", Default: DefaultArtifactQuotaBytes, Min: floatPtr(0), Max: floatPtr(float64(MaxArtifactQuotaBytes)), Help: "本地内容寻址存储去重后的总占用上限，0 表示不限制。超过上限时新的上传会被拒绝，已有内容不受影响。"},
 		{Key: "artifact_stale_upload_seconds", Group: "system", Label: "未完成上传保留时长（秒）", Type: "integer", Default: DefaultArtifactStaleUploadSeconds, Min: floatPtr(MinArtifactStaleUploadSeconds), Max: floatPtr(MaxArtifactStaleUploadSeconds), Help: "超过该时长仍未完成的 Artifact 上传会被标记为失败，遗留的临时文件一并回收。"},
+		{Key: "artifact_input_retention_seconds", Group: "system", Label: "输入附件保留时长（秒）", Type: "integer", Default: DefaultArtifactInputRetentionSeconds, Min: floatPtr(MinArtifactInputRetentionSeconds), Max: floatPtr(MaxArtifactInputRetentionSeconds), Help: "图片、音频、PDF、Word、Excel 等输入附件超过该时长后由定时维护删除；删除会话时会立即删除其关联附件。"},
 		{Key: "modal_fallback_enabled", Group: "system", Label: "启用多模态降级", Type: "boolean", Default: false, Help: "主模型不支持图片或音频时，使用配置的模型生成文字转述；失败时仍会以说明文字完成本轮。"},
 		{Key: "modal_fallback_provider_id", Group: "system", Label: "多模态降级供应商", Type: "string", Default: "", Help: "WebUI 会从已配置供应商目录提供选择；留空表示沿用主模型供应商。"},
 		{Key: "modal_fallback_vision_model", Group: "system", Label: "图片降级模型", Type: "string", Default: "", Help: "从所选供应商的模型目录选择；留空表示不对图片执行模型转述。"},
@@ -851,6 +858,10 @@ func normalizeSystemSettings(settings SystemSettings) SystemSettings {
 		settings.ArtifactQuotaBytes = DefaultArtifactQuotaBytes
 		settings.ArtifactStaleUploadSeconds = DefaultArtifactStaleUploadSeconds
 	}
+	// 旧配置没有该字段时按默认周期补齐，保证升级后历史附件也能进入定时回收。
+	if settings.ArtifactInputRetentionSeconds == 0 {
+		settings.ArtifactInputRetentionSeconds = DefaultArtifactInputRetentionSeconds
+	}
 	return settings
 }
 
@@ -868,6 +879,9 @@ func validateSystemSettings(settings SystemSettings) error {
 	}
 	if settings.ArtifactStaleUploadSeconds < MinArtifactStaleUploadSeconds || settings.ArtifactStaleUploadSeconds > MaxArtifactStaleUploadSeconds {
 		return fmt.Errorf("%w: 未完成上传保留时长必须在 %d-%d 秒之间", ErrInvalidRequest, MinArtifactStaleUploadSeconds, MaxArtifactStaleUploadSeconds)
+	}
+	if settings.ArtifactInputRetentionSeconds < MinArtifactInputRetentionSeconds || settings.ArtifactInputRetentionSeconds > MaxArtifactInputRetentionSeconds {
+		return fmt.Errorf("%w: 输入附件保留时长必须在 %d-%d 秒之间", ErrInvalidRequest, MinArtifactInputRetentionSeconds, MaxArtifactInputRetentionSeconds)
 	}
 	for key, value := range map[string]string{
 		"modal_fallback_provider_id":  settings.ModalFallbackProviderID,

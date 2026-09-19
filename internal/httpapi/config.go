@@ -299,7 +299,8 @@ func (s *Server) getSystemSettings(writer http.ResponseWriter, request *http.Req
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"log_level": settings.LogLevel, "request_timeout_seconds": settings.RequestTimeoutSeconds,
 		"artifact_quota_bytes": settings.ArtifactQuotaBytes, "artifact_stale_upload_seconds": settings.ArtifactStaleUploadSeconds,
-		"modal_fallback_enabled": settings.ModalFallbackEnabled, "modal_fallback_provider_id": settings.ModalFallbackProviderID,
+		"artifact_input_retention_seconds": settings.ArtifactInputRetentionSeconds,
+		"modal_fallback_enabled":           settings.ModalFallbackEnabled, "modal_fallback_provider_id": settings.ModalFallbackProviderID,
 		"modal_fallback_vision_model": settings.ModalFallbackVisionModel, "modal_fallback_audio_model": settings.ModalFallbackAudioModel,
 		"schema": configsvc.SystemSchema().Fields,
 	})

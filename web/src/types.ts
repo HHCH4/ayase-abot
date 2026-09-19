@@ -591,6 +591,7 @@ export interface SystemSettings {
   request_timeout_seconds: number
   artifact_quota_bytes: number
   artifact_stale_upload_seconds: number
+  artifact_input_retention_seconds: number
   modal_fallback_enabled: boolean
   modal_fallback_provider_id: string
   modal_fallback_vision_model: string

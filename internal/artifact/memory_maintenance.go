@@ -15,6 +15,7 @@ var (
 	_ UsageRepository                 = (*MemoryRepository)(nil)
 	_ ActiveReferenceRepository       = (*MemoryRepository)(nil)
 	_ StaleArtifactRepository         = (*MemoryRepository)(nil)
+	_ ExpiredArtifactRepository       = (*MemoryRepository)(nil)
 	_ ObjectDeletionRepository        = (*MemoryRepository)(nil)
 	_ PendingObjectDeletionRepository = (*MemoryRepository)(nil)
 )
@@ -65,6 +66,48 @@ func (repository *MemoryRepository) ListStaleUploading(_ context.Context, before
 
 func (repository *MemoryRepository) ListStaleDeleting(_ context.Context, before time.Time, limit int) ([]Artifact, error) {
 	return repository.listStale(StatusDeleting, before, limit), nil
+}
+
+// ListExpiredArtifacts 按生产仓储相同的规则筛选已过期记录，并保留稳定排序，
+// 便于测试和分批维护在多次运行之间持续推进。
+func (repository *MemoryRepository) ListExpiredArtifacts(_ context.Context, now, legacyInputBefore time.Time, limit int) ([]Artifact, error) {
+	if limit <= 0 {
+		limit = maxSweepBatch
+	}
+	now = now.UTC()
+	legacyInputBefore = legacyInputBefore.UTC()
+	repository.mu.RLock()
+	defer repository.mu.RUnlock()
+	result := make([]Artifact, 0)
+	for _, item := range repository.items {
+		if item.Status != StatusReady && item.Status != StatusQuarantined {
+			continue
+		}
+		expired := item.ExpiresAt != nil && !item.ExpiresAt.After(now)
+		legacyExpired := item.ExpiresAt == nil && item.Kind == KindInputAttachment && !legacyInputBefore.IsZero() && !item.CreatedAt.After(legacyInputBefore)
+		if !expired && !legacyExpired {
+			continue
+		}
+		result = append(result, cloneArtifact(item))
+	}
+	sort.Slice(result, func(i, j int) bool {
+		left, right := result[i], result[j]
+		leftExpiry, rightExpiry := left.CreatedAt, right.CreatedAt
+		if left.ExpiresAt != nil {
+			leftExpiry = *left.ExpiresAt
+		}
+		if right.ExpiresAt != nil {
+			rightExpiry = *right.ExpiresAt
+		}
+		if leftExpiry.Equal(rightExpiry) {
+			return left.ID < right.ID
+		}
+		return leftExpiry.Before(rightExpiry)
+	})
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
 }
 
 func (repository *MemoryRepository) listStale(status Status, before time.Time, limit int) []Artifact {
