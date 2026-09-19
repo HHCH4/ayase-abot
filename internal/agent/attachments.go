@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"log/slog"
 	"strings"
 	"unicode"
+
+	"Abot/internal/document"
 
 	adkmodel "google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
@@ -171,6 +174,8 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 		return nil, nil
 	}
 	copyContent := &genai.Content{Role: content.Role, Parts: make([]*genai.Part, 0, len(content.Parts))}
+	// 文档过长时用用户当前问题作为筛选提示，优先保留相关页、段落或表格行。
+	query := contentTextForDocument(content)
 	for index, part := range content.Parts {
 		if part == nil {
 			continue
@@ -198,12 +203,48 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 		if text == "" {
 			text = attachmentDescription(ref.Name, ref.MIMEType, ref.Size)
 		}
+		if document.IsDocumentAttachment(ref.Name, ref.MIMEType) {
+			// PDF、Word、Excel 等格式通常不能直接作为通用模型的 file 输入；
+			// 在 provider 边界转换为带来源定位的文本，原始 Artifact 仍保持不变。
+			parsed, parseErr := document.Parse(ctx, ref.Name, ref.MIMEType, data)
+			if parseErr != nil {
+				return nil, fmt.Errorf("附件 %s 解析被取消: %w", safeAttachmentLabel(ref.Name), parseErr)
+			}
+			rendered, truncated := parsed.Render(query, document.DefaultRenderBytes)
+			slog.Info("文档附件已解析",
+				"name", ref.Name,
+				"mime_type", ref.MIMEType,
+				"kind", parsed.Kind,
+				"parsed", parsed.Parsed,
+				"blocks", len(parsed.Blocks),
+				"truncated", truncated,
+				"warnings", parsed.Warnings,
+			)
+			copyContent.Parts = append(copyContent.Parts, genai.NewPartFromText(text+"\n\n"+rendered))
+			continue
+		}
 		copyContent.Parts = append(copyContent.Parts, genai.NewPartFromText(text))
 		copyContent.Parts = append(copyContent.Parts, &genai.Part{InlineData: &genai.Blob{
 			Data: data, MIMEType: strings.TrimSpace(ref.MIMEType), DisplayName: strings.TrimSpace(ref.Name),
 		}})
 	}
 	return copyContent, nil
+}
+
+// contentTextForDocument 提取当前模型请求中的文本，用于文档块的轻量相关性筛选。
+// 它只读取已经存在的文本提示，不读取或持久化附件二进制。
+func contentTextForDocument(content *genai.Content) string {
+	if content == nil {
+		return ""
+	}
+	var parts []string
+	for _, part := range content.Parts {
+		if part == nil || strings.TrimSpace(part.Text) == "" {
+			continue
+		}
+		parts = append(parts, strings.TrimSpace(part.Text))
+	}
+	return strings.Join(parts, "\n")
 }
 
 func attachmentRefFromMetadata(metadata map[string]any) (AttachmentRef, bool, error) {

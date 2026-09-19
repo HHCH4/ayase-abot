@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"Abot/internal/conversation"
+	"Abot/internal/document"
 	"Abot/internal/provider"
 
 	adkagent "google.golang.org/adk/v2/agent"
@@ -295,10 +296,17 @@ func modelRequirements(contract *TaskContractProjection, attachments []Attachmen
 		if mimeType == "" {
 			mimeType = "application/octet-stream"
 		}
+		attachmentName := strings.TrimSpace(attachment.Name)
+		if attachmentName == "" && attachment.Ref != nil {
+			attachmentName = strings.TrimSpace(attachment.Ref.Name)
+		}
 		if strings.HasPrefix(mimeType, "image/") {
 			requirements.RequiresImages = true
 		} else if strings.HasPrefix(mimeType, "audio/") {
 			requirements.RequiresAudio = true
+		} else if attachment.Ref != nil && document.IsDocumentAttachment(attachmentName, mimeType) {
+			// Durable 文档会在 provider 边界由本地解析层转换为文本，
+			// 因此不再要求供应商声明原生 file 输入能力。
 		} else {
 			requirements.RequiresFiles = true
 		}

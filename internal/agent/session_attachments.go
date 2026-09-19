@@ -8,6 +8,8 @@ import (
 	"strings"
 	"unicode"
 
+	"Abot/internal/document"
+
 	adkagent "google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/functiontool"
@@ -23,7 +25,7 @@ const (
 // metadata query. It does not accept an Artifact ID, which prevents a model
 // from turning this convenience tool into an arbitrary object-store reader.
 type sessionAttachmentsArgs struct {
-	Mode  string `json:"mode,omitempty" jsonschema:"summary（默认）只返回元数据；original 尝试返回文本附件原文，二进制附件仍返回摘要"`
+	Mode  string `json:"mode,omitempty" jsonschema:"summary（默认）只返回元数据；original 返回文本附件原文或解析后的 PDF/Word/Excel 正文"`
 	Query string `json:"query,omitempty" jsonschema:"按附件名称、MIME 类型或类型筛选；留空返回全部附件"`
 	Index int    `json:"index,omitempty" jsonschema:"1-based 附件序号；留空或 0 返回所有匹配附件"`
 }
@@ -108,7 +110,15 @@ func readSessionAttachments(ctx context.Context, userID, invocationID string, li
 			MIMEType: mimeType, Size: ref.Size, Digest: shortAttachmentDigest(ref.Digest),
 			Summary: sessionAttachmentSummary(name, kind, mimeType, ref),
 		}
-		if mode == "original" && sessionAttachmentIsText(name, mimeType) {
+		if mode == "original" && document.IsDocumentAttachment(name, mimeType) {
+			content, truncated, readErr := readSessionAttachmentDocument(ctx, strings.TrimSpace(userID), ref, name, mimeType, args.Query, resolver)
+			if readErr != nil {
+				item.Summary += "；文档正文暂不可解析"
+			} else {
+				item.Content, item.ContentTruncated = content, truncated
+				item.Summary += "；已执行本地文档解析"
+			}
+		} else if mode == "original" && sessionAttachmentIsText(name, mimeType) {
 			content, truncated, readErr := readSessionAttachmentText(ctx, strings.TrimSpace(userID), ref, resolver)
 			if readErr != nil {
 				item.Summary += "；原文暂不可读取"
@@ -192,4 +202,21 @@ func readSessionAttachmentText(ctx context.Context, userID string, ref Attachmen
 		return r
 	}, string(data)))
 	return string(data), truncated, nil
+}
+
+// readSessionAttachmentDocument 为模型提供带来源信息的文档正文，同时继续受工具输出上限约束。
+func readSessionAttachmentDocument(ctx context.Context, userID string, ref AttachmentRef, name, mimeType, query string, resolver AttachmentResolver) (string, bool, error) {
+	if resolver == nil {
+		return "", false, errors.New("附件 resolver 未装配")
+	}
+	data, err := readAttachmentRef(ctx, userID, ref, resolver)
+	if err != nil {
+		return "", false, err
+	}
+	parsed, err := document.Parse(ctx, name, mimeType, data)
+	if err != nil {
+		return "", false, err
+	}
+	content, truncated := parsed.Render(query, maxSessionAttachmentReadBytes)
+	return content, truncated, nil
 }
