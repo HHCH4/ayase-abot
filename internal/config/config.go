@@ -139,6 +139,7 @@ type Runtime struct {
 	ProviderID                    string
 	ModelID                       string
 	AITemperature                 float64
+	AIReasoningEffort             string
 	AITopP                        float64
 	AIMaxOutputTokens             int
 	AIRequestRetries              int
@@ -629,6 +630,7 @@ func buildSchema() Schema {
 		{Key: "ai.top_p", Group: "ai", Label: "Top P", Type: "number", Default: 1.0, Min: floatPtr(0.01), Max: floatPtr(1), Help: "限制采样候选范围；通常与温度二选一调整。"},
 		{Key: "ai.max_output_tokens", Group: "ai", Label: "最大输出 token", Type: "integer", Default: 0, Min: floatPtr(0), Max: floatPtr(1000000), Help: "0 表示使用模型目录或上游接口默认值。"},
 		{Key: "ai.request_retries", Group: "ai", Label: "请求失败重试次数", Type: "integer", Default: 2, Min: floatPtr(0), Max: floatPtr(5), Help: "仅在模型尚未返回任何内容时重试，避免流式输出重复。"},
+		{Key: "ai.reasoning_effort", Group: "ai", Label: "思考强度", Type: "select", Default: "", Options: []SchemaOption{{Value: "", Label: "不指定"}, {Value: "minimal", Label: "最少"}, {Value: "low", Label: "低"}, {Value: "medium", Label: "中"}, {Value: "high", Label: "高"}}, Help: "仅在模型能力支持时下发；聊天界面可以按请求临时覆盖。"},
 		{Key: "persona.id", Group: "persona", Label: "人格 ID", Type: "select", Default: "", OptionSource: "personas", Help: "选择人格目录中的稳定 ID；为空时继续使用当前配置中的系统提示词。"},
 		{Key: "persona.system_prompt", Group: "persona", Label: "系统提示词", Type: "textarea", Default: "你是 Abot，一个可靠、简洁、遵守用户意图的中文 AI 助手。", Help: "兼容旧配置；选择人格 ID 后由人格目录中的指令覆盖。"},
 		{Key: "context.compaction.enabled", Group: "context", Label: "启用上下文压缩", Type: "boolean", Default: true, Help: "使用 ADK 原生压缩保留长对话的最近事件。"},
@@ -660,6 +662,7 @@ func runtimeFromValues(values Values) Runtime {
 		ProviderID:                    stringOr(values["ai.default_provider_id"]),
 		ModelID:                       stringOr(values["ai.default_model_id"]),
 		AITemperature:                 numberOr(values["ai.temperature"], 0.7),
+		AIReasoningEffort:             stringOr(values["ai.reasoning_effort"]),
 		AITopP:                        numberOr(values["ai.top_p"], 1.0),
 		AIMaxOutputTokens:             intOr(values["ai.max_output_tokens"], 0),
 		AIRequestRetries:              intOr(values["ai.request_retries"], 2),

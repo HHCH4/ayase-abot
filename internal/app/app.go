@@ -402,7 +402,7 @@ func Run(opts bootstrap.Options) error {
 			}
 			return agent.RuntimeOptions{
 				AIEnabled: runtime.AIEnabled, ProviderID: runtime.ProviderID, ModelID: runtime.ModelID,
-				AITemperature: runtime.AITemperature, AITopP: runtime.AITopP, AIMaxOutputTokens: runtime.AIMaxOutputTokens, AIRequestRetries: runtime.AIRequestRetries,
+				AITemperature: runtime.AITemperature, AIReasoningEffort: runtime.AIReasoningEffort, AITopP: runtime.AITopP, AIMaxOutputTokens: runtime.AIMaxOutputTokens, AIRequestRetries: runtime.AIRequestRetries,
 				PersonaID: runtime.PersonaID, Instruction: runtime.Instruction,
 				CompactionEnabled: runtime.CompactionEnabled, CompactionRatio: runtime.CompactionRatio,
 				CompactionSafetyTokens: runtime.CompactionSafetyTokens, CompactionRetentionEvents: runtime.CompactionRetentionEvents,

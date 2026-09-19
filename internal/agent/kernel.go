@@ -264,8 +264,20 @@ func (e *ModelCapabilityError) Error() string {
 	return fmt.Sprintf("模型能力不兼容: provider=%s model=%s code=%s", e.ProviderID, e.ModelID, e.Result.FailureCode)
 }
 
-func modelRequirements(contract *TaskContractProjection, attachments []Attachment, toolCount int) provider.ModelRequirements {
+// effectiveReasoningEffort 让请求级设置覆盖配置默认值；两者都为空表示不主动指定思考强度。
+func effectiveReasoningEffort(requestValue, configured string) string {
+	if effort := strings.TrimSpace(requestValue); effort != "" {
+		return effort
+	}
+	return strings.TrimSpace(configured)
+}
+
+func modelRequirements(contract *TaskContractProjection, attachments []Attachment, toolCount int, reasoningEffort string) provider.ModelRequirements {
 	requirements := provider.ModelRequirements{}
+	// 只有调用方明确要求时才下发思考强度；能力不支持时 Negotiate 会省略并记录降级原因。
+	if effort := strings.TrimSpace(reasoningEffort); effort != "" {
+		requirements.RequestedReasoningEffort = effort
+	}
 	if contract != nil {
 		switch strings.ToLower(strings.TrimSpace(contract.TaskType)) {
 		case "change", "build", "operate":
@@ -339,6 +351,7 @@ type RuntimeOptions struct {
 	ProviderID                    string
 	ModelID                       string
 	AITemperature                 float64
+	AIReasoningEffort             string
 	AITopP                        float64
 	AIMaxOutputTokens             int
 	AIRequestRetries              int
@@ -623,6 +636,8 @@ type ChatRequest struct {
 	SessionID  string
 	ProviderID string
 	ModelID    string
+	// ReasoningEffort 是可选的请求级思考强度（minimal/low/medium/high）；为空时沿用配置默认值。
+	ReasoningEffort string
 	// WorkspaceID 仅为旧版兼容字段；正式对话的工作区来自 Conversation.workspace_id。
 	WorkspaceID *string
 	// TargetPath is an optional workspace-relative path used to scope project
@@ -1222,7 +1237,7 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 			yield(nil, fmt.Errorf("处理多模态附件失败: %w", err))
 			return
 		}
-		requirements := modelRequirements(taskContract, request.Attachments, len(tools))
+		requirements := modelRequirements(taskContract, request.Attachments, len(tools), effectiveReasoningEffort(request.ReasoningEffort, runtime.AIReasoningEffort))
 		negotiation, negotiationErr := provider.Negotiate(profile, requirements, request.Stream)
 		if negotiationErr != nil {
 			yield(nil, fmt.Errorf("解析模型能力失败: %w", negotiationErr))

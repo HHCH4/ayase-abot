@@ -206,7 +206,7 @@ func TestModelRequirementsClassifiesAttachmentModalities(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := modelRequirements(nil, []Attachment{test.attachment}, 0)
+			got := modelRequirements(nil, []Attachment{test.attachment}, 0, "")
 			if got.RequiresImages != test.images || got.RequiresAudio != test.audio || got.RequiresFiles != test.inputFiles {
 				t.Fatalf("附件能力归类=%#v", got)
 			}

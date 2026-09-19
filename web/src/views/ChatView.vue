@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { NAlert, NButton, NEmpty, NForm, NFormItem, NInput, NSelect, NSpace, NSpin, NTag, useMessage } from 'naive-ui'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { NAlert, NButton, NEmpty, NForm, NFormItem, NInput, NScrollbar, NSelect, NSpace, NSpin, NTag, useMessage } from 'naive-ui'
 import { readConversationContext, readConversationMessages, readInvocationCapabilities, readInvocationPlan, readInvocationResult, readInvocationRuntimeSnapshot, readInvocationToolSet, readInvocationTrace, readInvocationVerifications, request, streamChat, uploadArtifact } from '@/api'
+import ConversationActions from '@/components/ConversationActions.vue'
+import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
+import ProviderDialog from '@/components/ProviderDialog.vue'
 import { useAppStore } from '@/stores/app'
 import { useRoute, useRouter } from 'vue-router'
-import type { ChatAttachment, CompletionReport, ConversationContextStatus, ConversationMessage, InvocationTrace, ModelCapabilitySnapshot, RuntimeSnapshot, TaskPlan, ToolSetSnapshot, VerificationRun } from '@/types'
+import type { ChatAttachment, CompletionReport, Conversation, ConversationContextStatus, ConversationMessage,
+  Provider, InvocationTrace, ModelCapabilitySnapshot, RuntimeSnapshot, TaskPlan, ToolSetSnapshot, VerificationRun, Workspace } from '@/types'
 
 const store = useAppStore()
 const route = useRoute()
@@ -24,6 +28,36 @@ const sending = ref(false)
 const loadingMessages = ref(false)
 const statusText = ref('')
 const showSettings = ref(false)
+// 思考强度是请求级覆盖，不写回会话；空值表示沿用配置中心默认。
+const reasoningEffort = ref('')
+// 项目与供应商都在 chat 内就地管理，不跳回管理台。
+const showProjectDialog = ref(false)
+const showProviderDialog = ref(false)
+const editingProvider = ref<Provider | null>(null)
+
+function openProviderDialog(provider: Provider | null) {
+  editingProvider.value = provider
+  showProviderDialog.value = true
+}
+
+async function removeProvider(provider: Provider) {
+  if (!window.confirm(`确认删除供应商“${provider.name}”？使用它的对话需要重新选择模型。`)) return
+  try {
+    await request(`/api/v1/providers/${encodeURIComponent(provider.id)}`, { method: 'DELETE' })
+    await store.reloadProviders()
+    message.success('供应商已删除')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '删除供应商失败')
+  }
+}
+
+const reasoningEffortOptions = [
+  { label: '思考：默认', value: '' },
+  { label: '思考：最少', value: 'minimal' },
+  { label: '思考：低', value: 'low' },
+  { label: '思考：中', value: 'medium' },
+  { label: '思考：高', value: 'high' },
+]
 type RuntimeTimelineItem = { type: string; text: string; timestamp: string; data?: Record<string, unknown> }
 type PendingApproval = { id: string; toolName: string; hint: string; args: Record<string, unknown> }
 type InstructionSnapshotMeta = { path?: string; scope_path?: string; source?: string; priority?: number; content_digest?: string }
@@ -60,6 +94,26 @@ const modelSelectValue = computed({
   set: (value: string) => {
     selectedModel.value = value === '__manual__' ? manualModelID.value : value
   },
+})
+// 顶栏只做模型切换：首项是"跟随默认"，另外把目录外的当前模型也列进来，避免显示成占位文案。
+const defaultModelLabel = computed(() => {
+  const id = store.defaults.model_id
+  if (!id) return '默认模型'
+  const provider = store.providers.find((item) => item.id === store.defaults.provider_id)
+  const model = provider?.models.find((item) => item.id === id)
+  return `默认模型 · ${model?.display_name || id}`
+})
+const topbarModelOptions = computed(() => {
+  const options = modelOptions.value.filter((item) => item.value !== '__manual__')
+  const current = selectedModel.value
+  const followDefault = { label: defaultModelLabel.value, value: '' }
+  if (current && !options.some((item) => item.value === current)) return [followDefault, { label: current, value: current }, ...options]
+  return [followDefault, ...options]
+})
+const topbarModelValue = computed<string | null>({
+  // 空字符串在 naive-ui 里算"已选择"，所以必须有一个 value 为空串的选项来承接它。
+  get: () => (selectedModel.value && selectedModel.value !== '__manual__' ? selectedModel.value : ''),
+  set: (value: string | null) => { selectedModel.value = value || '' },
 })
 const currentModelLabel = computed(() => {
   const provider = store.providers.find((item) => item.id === providerID.value)
@@ -195,6 +249,38 @@ async function selectConversation(id: string, updateRoute = true) {
   }
 }
 
+// 会话侧栏：原先独立的全局项目树收进 chat 内部，改为按项目组织对话。
+const expandedProjects = reactive<Record<string, boolean>>({})
+const projectWorkspaces = computed(() => store.workspaces)
+const looseConversations = computed(() => store.conversations.filter((item) => !item.workspace_id && item.status === 'active'))
+const archivedConversations = computed(() => store.conversations.filter((item) => item.status === 'archived'))
+
+function projectConversations(workspace: Workspace, archived = false) {
+  return store.conversations.filter((item) => item.workspace_id === workspace.id && (archived ? item.status === 'archived' : item.status === 'active'))
+}
+
+function isProjectExpanded(workspace: Workspace) {
+  return expandedProjects[workspace.id] !== false
+}
+
+function toggleProject(workspace: Workspace) {
+  expandedProjects[workspace.id] = !isProjectExpanded(workspace)
+}
+
+function isCurrentConversation(item: { id: string }) {
+  return item.id === conversationID.value
+}
+
+async function createProjectConversation(workspace: Workspace) {
+  try {
+    const conversation = await request<{ id: string }>(`/api/v1/workspaces/${encodeURIComponent(workspace.id)}/conversations`, { method: 'POST', body: JSON.stringify({ user_id: userID.value, title: `${workspace.name} 对话` }) })
+    await store.reloadConversations(userID.value)
+    await selectConversation(conversation.id)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '创建项目对话失败')
+  }
+}
+
 async function ensureConversation() {
   const fromRoute = typeof route.query.conversation === 'string' ? route.query.conversation : ''
   const preferred = fromRoute && store.conversations.some((item) => item.id === fromRoute) ? fromRoute : store.conversations[0]?.id || ''
@@ -221,39 +307,43 @@ async function createConversation() {
   }
 }
 
-async function archiveConversation() {
-  const item = selectedConversation.value
+async function archiveConversation(target?: Conversation) {
+  const item = target || selectedConversation.value
   if (!item || item.status !== 'active') return
   try {
     await request(`/api/v1/conversations/${encodeURIComponent(item.id)}/archive?user_id=${encodeURIComponent(userID.value)}`, { method: 'POST', body: '{}' })
     await store.reloadConversations(userID.value)
-    await selectConversation(item.id, false)
+    if (item.id === conversationID.value) await selectConversation(item.id, false)
     message.success('对话已归档')
   } catch (error) {
     message.error(error instanceof Error ? error.message : '归档失败')
   }
 }
 
-async function unarchiveConversation() {
-  const item = selectedConversation.value
+async function unarchiveConversation(target?: Conversation) {
+  const item = target || selectedConversation.value
   if (!item || item.status !== 'archived') return
   try {
     await request(`/api/v1/conversations/${encodeURIComponent(item.id)}/unarchive?user_id=${encodeURIComponent(userID.value)}`, { method: 'POST', body: '{}' })
     await store.reloadConversations(userID.value)
-    await selectConversation(item.id, false)
+    if (item.id === conversationID.value) await selectConversation(item.id, false)
     message.success('对话已恢复')
   } catch (error) {
     message.error(error instanceof Error ? error.message : '恢复失败')
   }
 }
 
-async function deleteConversation() {
-  const item = selectedConversation.value
+async function deleteConversation(target?: Conversation) {
+  const item = target || selectedConversation.value
   if (!item || item.status !== 'archived') return
   if (!window.confirm(`彻底删除“${item.title}”及全部消息？此操作不可恢复。`)) return
   try {
     await request(`/api/v1/conversations/${encodeURIComponent(item.id)}?user_id=${encodeURIComponent(userID.value)}`, { method: 'DELETE' })
     await store.reloadConversations(userID.value)
+    if (item.id !== conversationID.value) {
+      message.success('对话已彻底删除')
+      return
+    }
     conversationID.value = ''
     conversationMessages.value = []
     contextStatus.value = { compressed: false, compaction_count: 0 }
@@ -405,7 +495,7 @@ async function send() {
   pendingApproval.value = null
   await scrollToBottom()
   try {
-    await streamChat({ user_id: userID.value, conversation_id: item.id, provider_id: providerID.value, model_id: model, message: text, attachments: outgoing, stream: true }, (type, data) => {
+    await streamChat({ user_id: userID.value, conversation_id: item.id, provider_id: providerID.value, model_id: model, message: text, attachments: outgoing, stream: true, reasoning_effort: reasoningEffort.value || undefined }, (type, data) => {
       const last = conversationMessages.value[conversationMessages.value.length - 1]
       if (type === 'message' && last) last.text = `${last.text || ''}${String(data.delta || '')}`
       if (type === 'done' && last && !last.text) last.text = String(data.text || '')
@@ -460,7 +550,9 @@ watch(() => route.query.conversation, (value) => {
   }
 })
 watch(providerID, () => {
-  if (!modelOptions.value.some((item) => item.value === selectedModel.value)) selectedModel.value = modelOptions.value[0]?.value || ''
+  // 只回落到目录里的真实模型；'__manual__' 是设置面板的输入态，不该被写进当前模型。
+  const catalog = modelOptions.value.filter((item) => item.value !== '__manual__')
+  if (!catalog.some((item) => item.value === selectedModel.value)) selectedModel.value = catalog[0]?.value || ''
 })
 watch(userID, async () => {
   await store.reloadConversations(userID.value)
@@ -480,37 +572,91 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="chat-page-view">
-    <header class="chat-header">
-      <div class="chat-header-main">
-        <div class="chat-agent-avatar">A</div>
-        <div class="chat-title-block">
-          <div class="chat-title">{{ selectedConversation?.title || '新对话' }}</div>
-          <div class="chat-subtitle">
-            <span>{{ selectedConversation ? workspaceName(selectedConversation.workspace_id) : '选择一个对话开始' }}</span>
-            <span class="chat-subtitle-dot">·</span>
-            <span>{{ currentModelLabel }}</span>
+  <div class="chat-page-view" :class="{ 'is-empty': !conversationMessages.length }">
+    <!-- 左栏：按项目组织的对话列表，对应参考图的会话侧栏。 -->
+    <aside class="chat-rail">
+      <div class="chat-rail-brand">
+        <span class="chat-rail-brand-mark" aria-hidden="true">A</span>
+        <span class="chat-rail-brand-copy"><strong>Abot</strong><small>Chat</small></span>
+      </div>
+      <button type="button" class="rail-nav-item" @click="createConversation">
+        <span class="rail-nav-icon" aria-hidden="true">＋</span>创建对话
+      </button>
+      <NScrollbar class="chat-rail-scroll">
+        <div class="rail-section-head">
+          <span>项目</span>
+          <button type="button" class="rail-section-add" title="新建项目" aria-label="新建项目" @click="showProjectDialog = true">＋</button>
+        </div>
+        <div v-for="workspace in projectWorkspaces" :key="workspace.id" class="rail-project">
+          <div class="rail-project-head">
+            <button type="button" class="rail-project-toggle" :aria-label="`${isProjectExpanded(workspace) ? '收起' : '展开'}${workspace.name}`" @click="toggleProject(workspace)">
+              <span class="rail-chevron">{{ isProjectExpanded(workspace) ? '⌄' : '›' }}</span>
+            </button>
+            <span class="rail-project-name" :title="workspace.root_path"><span class="rail-folder">▱</span><span class="rail-label">{{ workspace.name }}</span></span>
+            <button type="button" class="rail-project-add" :aria-label="`在${workspace.name}中新建对话`" @click="createProjectConversation(workspace)">＋</button>
+          </div>
+          <div v-if="isProjectExpanded(workspace)" class="rail-children">
+            <div v-for="item in projectConversations(workspace)" :key="item.id" class="rail-conversation-row">
+              <button type="button" class="rail-conversation" :class="{ active: isCurrentConversation(item) }" @click="selectConversation(item.id)">
+                <span class="rail-dot" /><span class="rail-label">{{ item.title || '新对话' }}</span>
+              </button>
+              <span class="rail-item-actions"><ConversationActions :item="item" @archive="archiveConversation" @unarchive="unarchiveConversation" @remove="deleteConversation" /></span>
+            </div>
+            <span v-if="!projectConversations(workspace).length" class="rail-empty">暂无对话</span>
           </div>
         </div>
-      </div>
-      <div class="chat-header-actions">
-        <NTag round :type="statusTagType" :bordered="false">{{ displayStatus }}</NTag>
-        <NButton quaternary circle aria-label="打开对话设置" @click="showSettings = !showSettings">⚙</NButton>
-      </div>
-    </header>
 
-    <main ref="messagePanel" class="chat-thread">
+        <div v-if="looseConversations.length" class="rail-group">
+          <span class="rail-group-label">未归属项目</span>
+          <div v-for="item in looseConversations" :key="item.id" class="rail-conversation-row">
+            <button type="button" class="rail-conversation" :class="{ active: isCurrentConversation(item) }" @click="selectConversation(item.id)">
+              <span class="rail-dot" /><span class="rail-label">{{ item.title || '新对话' }}</span>
+            </button>
+            <span class="rail-item-actions"><ConversationActions :item="item" @archive="archiveConversation" @unarchive="unarchiveConversation" @remove="deleteConversation" /></span>
+          </div>
+        </div>
+
+        <div v-if="archivedConversations.length" class="rail-group">
+          <span class="rail-group-label">已归档</span>
+          <div v-for="item in archivedConversations" :key="item.id" class="rail-conversation-row">
+            <button type="button" class="rail-conversation archived" :class="{ active: isCurrentConversation(item) }" @click="selectConversation(item.id)">
+              <span class="rail-dot" /><span class="rail-label">{{ item.title || '新对话' }}</span>
+            </button>
+            <span class="rail-item-actions"><ConversationActions :item="item" @archive="archiveConversation" @unarchive="unarchiveConversation" @remove="deleteConversation" /></span>
+          </div>
+        </div>
+
+        <span v-if="!projectWorkspaces.length && !looseConversations.length && !archivedConversations.length" class="rail-empty">还没有对话，先新建一个。</span>
+      </NScrollbar>
+      <div class="chat-rail-footer">
+        <button type="button" class="rail-nav-item" @click="showSettings = true">
+          <span class="rail-nav-icon" aria-hidden="true">⚙</span>设置
+        </button>
+      </div>
+    </aside>
+
+    <section class="chat-main">
+      <header class="chat-topbar">
+        <div class="chat-topbar-main">
+          <strong class="chat-topbar-title">{{ selectedConversation?.title || '新对话' }}</strong>
+          <span class="chat-topbar-sub">{{ selectedConversation ? workspaceName(selectedConversation.workspace_id) : '尚未选择对话' }}</span>
+        </div>
+        <div class="chat-topbar-actions">
+          <span class="chat-topbar-status">{{ displayStatus }}</span>
+          <button type="button" class="chat-switch-button" title="返回 Bot 管理台" @click="router.push({ name: 'status' })">
+            <span aria-hidden="true">🤖</span>Bot
+          </button>
+        </div>
+      </header>
+
+      <main ref="messagePanel" class="chat-thread">
       <NSpin v-if="loadingMessages" size="small" />
       <div v-else-if="!selectedConversation" class="chat-empty-state">
-        <div class="chat-empty-avatar">A</div>
-        <h1>准备好开始了吗？</h1>
-        <p>创建或选择一个对话，把问题交给 Abot。</p>
-        <NButton type="primary" size="large" @click="createConversation">＋ 新建对话</NButton>
+        <h1>今天想聊点什么？</h1>
+        <p>从左侧新建或选择一个对话，把问题交给 Abot。</p>
       </div>
-      <div v-else-if="!conversationMessages.length" class="chat-empty-state chat-empty-state-compact">
-        <div class="chat-empty-avatar">✦</div>
-        <h1>从这里开始</h1>
-        <p>你可以直接提问，也可以让 Abot 读取和处理当前项目。</p>
+      <div v-else-if="!conversationMessages.length" class="chat-empty-state">
+        <h1>今天想聊点什么？</h1>
         <div class="quick-prompts">
           <button v-for="prompt in quickPrompts" :key="prompt" type="button" @click="inputText = prompt">{{ prompt }}</button>
         </div>
@@ -653,7 +799,8 @@ onMounted(async () => {
           <div class="chat-composer-tools">
             <input ref="fileInput" type="file" multiple class="visually-hidden" accept="image/*,application/pdf,text/*,.json,.md,.csv,.doc,.docx,.xls,.xlsx" @change="chooseFiles" />
             <NButton quaternary circle aria-label="添加文件" :disabled="!selectedConversation || selectedConversation.status !== 'active' || sending" @click="fileInput?.click()">＋</NButton>
-            <span>支持图片和文件</span>
+            <NSelect v-model:value="topbarModelValue" :options="topbarModelOptions" size="tiny" class="composer-select composer-model-select" placeholder="选择模型" />
+            <NSelect v-model:value="reasoningEffort" :options="reasoningEffortOptions" size="tiny" class="composer-select composer-effort-select" />
           </div>
           <div class="chat-send-hint">⌘↵ 发送</div>
           <NButton class="chat-send-button" type="primary" circle :loading="sending" :disabled="!selectedConversation || selectedConversation.status !== 'active' || (!inputText.trim() && !attachments.length)" aria-label="发送消息" @click="send">↑</NButton>
@@ -661,16 +808,30 @@ onMounted(async () => {
       </div>
       <p class="chat-disclaimer">Abot 可能会出错，请检查重要信息。</p>
     </footer>
+    </section>
+
+    <ProjectCreateDialog v-model:show="showProjectDialog" />
+    <ProviderDialog v-model:show="showProviderDialog" :provider="editingProvider" />
 
     <transition name="chat-settings">
       <aside v-if="showSettings" class="chat-settings-panel">
         <div class="chat-settings-header"><div><span class="eyebrow">CONVERSATION</span><strong>对话设置</strong></div><NButton quaternary circle aria-label="关闭设置" @click="showSettings = false">×</NButton></div>
         <NForm label-placement="top" :show-feedback="false">
           <NFormItem label="对话"><NSelect :value="conversationID" :options="activeConversations.map((item) => ({ label: conversationLabel(item), value: item.id }))" placeholder="选择一个对话" @update:value="selectConversation" /></NFormItem>
-          <NSpace wrap><NButton type="primary" @click="createConversation">＋ 新建对话</NButton><NButton secondary :disabled="selectedConversation?.status !== 'active'" @click="archiveConversation">归档</NButton><NButton secondary :disabled="selectedConversation?.status !== 'archived'" @click="unarchiveConversation">恢复</NButton><NButton tertiary type="error" :disabled="selectedConversation?.status !== 'archived'" @click="deleteConversation">删除</NButton></NSpace>
+          <NSpace wrap><NButton type="primary" @click="createConversation">＋ 新建对话</NButton><NButton secondary :disabled="selectedConversation?.status !== 'active'" @click="archiveConversation()">归档</NButton><NButton secondary :disabled="selectedConversation?.status !== 'archived'" @click="unarchiveConversation()">恢复</NButton><NButton tertiary type="error" :disabled="selectedConversation?.status !== 'archived'" @click="deleteConversation()">删除</NButton></NSpace>
           <div class="chat-settings-divider" />
           <NFormItem label="配置文件"><NSelect v-model:value="profileID" :options="profileOptions" @update:value="bindProfile" /><small>系统默认 → 机器人 → 当前对话。</small></NFormItem>
           <NFormItem label="供应商"><NSelect v-model:value="providerID" :options="providerOptions" placeholder="选择供应商" /></NFormItem>
+          <div class="settings-provider-list">
+            <div v-for="item in store.providers" :key="item.id" class="settings-provider-row">
+              <span class="settings-provider-name">{{ item.name }}</span>
+              <span class="rail-item-actions always">
+                <button type="button" class="rail-item-action" title="编辑" aria-label="编辑供应商" @click="openProviderDialog(item)">✎</button>
+                <button type="button" class="rail-item-action danger" title="删除" aria-label="删除供应商" @click="removeProvider(item)">✕</button>
+              </span>
+            </div>
+            <button type="button" class="settings-provider-add" @click="openProviderDialog(null)">＋ 添加供应商</button>
+          </div>
           <NFormItem label="模型"><NSelect v-model:value="modelSelectValue" :options="modelOptions" placeholder="选择或手动输入模型" /><NInput v-if="modelSelectValue === '__manual__'" v-model:value="manualModelID" class="manual-model-input" placeholder="目录外模型 ID" /></NFormItem>
           <NFormItem label="用户 ID"><NInput v-model:value="userID" /></NFormItem>
         </NForm>

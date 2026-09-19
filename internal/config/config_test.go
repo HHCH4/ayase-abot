@@ -9,7 +9,7 @@ func TestSchemaRuntimeSettingsAreWired(t *testing.T) {
 		keys[field.Key] = field
 	}
 	for _, key := range []string{
-		"ai.temperature", "ai.top_p", "ai.max_output_tokens", "ai.request_retries",
+		"ai.temperature", "ai.top_p", "ai.max_output_tokens", "ai.request_retries", "ai.reasoning_effort",
 		"persona.id", "persona.system_prompt",
 		"context.compaction.unknown_window_tokens", "context.compaction.sliding_interval", "context.compaction.sliding_overlap", "agent.max_tool_calls", "agent.tool_schema_budget_tokens",
 		"workspace.git_enabled", "message.streaming_enabled", "message.prompt_prefix",
@@ -25,6 +25,7 @@ func TestSchemaRuntimeSettingsAreWired(t *testing.T) {
 		"ai.top_p":             0.9,
 		"ai.max_output_tokens": 2048,
 		"ai.request_retries":   3,
+		"ai.reasoning_effort":  "high",
 		"persona.id":           "persona-reviewer",
 		"context.compaction.unknown_window_tokens": 16384,
 		"context.compaction.sliding_interval":      4,
@@ -40,6 +41,9 @@ func TestSchemaRuntimeSettingsAreWired(t *testing.T) {
 	})
 	if runtime.AITemperature != 0.25 || runtime.AITopP != 0.9 || runtime.AIMaxOutputTokens != 2048 || runtime.AIRequestRetries != 3 {
 		t.Fatalf("AI 生成参数没有从配置解析: %#v", runtime)
+	}
+	if runtime.AIReasoningEffort != "high" {
+		t.Fatalf("思考强度没有从配置解析: %#v", runtime)
 	}
 	if runtime.PersonaID != "persona-reviewer" {
 		t.Fatalf("人格 ID 没有从配置解析: %#v", runtime)

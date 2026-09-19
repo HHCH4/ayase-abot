@@ -1004,6 +1004,23 @@ type chatPayload struct {
 	Message     string                  `json:"message"`
 	Attachments []chatAttachmentPayload `json:"attachments"`
 	Stream      bool                    `json:"stream"`
+	// ReasoningEffort 是可选的请求级思考强度覆盖；为空时用配置中心的默认值。
+	ReasoningEffort string `json:"reasoning_effort"`
+}
+
+// reasoningEffortValues 是允许下发的思考强度；空值表示不指定，交给配置中心或模型默认。
+var reasoningEffortValues = map[string]struct{}{"minimal": {}, "low": {}, "medium": {}, "high": {}}
+
+// normalizeReasoningEffort 校验并规范化请求级思考强度，避免把任意字符串透传给上游模型。
+func normalizeReasoningEffort(value string) (string, error) {
+	effort := strings.ToLower(strings.TrimSpace(value))
+	if effort == "" {
+		return "", nil
+	}
+	if _, ok := reasoningEffortValues[effort]; !ok {
+		return "", fmt.Errorf("思考强度 %q 不受支持", value)
+	}
+	return effort, nil
 }
 
 // chatAttachmentPayload 是聊天 API 的上传格式；data 由 encoding/json 按 Base64 字符串解码。
@@ -1029,6 +1046,11 @@ func (s *Server) chat(writer http.ResponseWriter, request *http.Request) {
 	var payload chatPayload
 	if err := decodeJSONWithLimit(writer, request, &payload, maxChatRequestBytes); err != nil {
 		writeError(writer, fmt.Errorf("请求体无效: %w", err))
+		return
+	}
+	reasoningEffort, err := normalizeReasoningEffort(payload.ReasoningEffort)
+	if err != nil {
+		writeError(writer, err)
 		return
 	}
 	conversationID := strings.TrimSpace(payload.ConversationID)
@@ -1070,7 +1092,7 @@ func (s *Server) chat(writer http.ResponseWriter, request *http.Request) {
 	}
 	chatRequest := agent.ChatRequest{
 		UserID: payload.UserID, IdempotencyKey: invocationIdempotencyKey(request, payload.IdempotencyKey), BotID: payload.BotID, ConversationID: conversationID, SessionID: conversationID, ProviderID: payload.ProviderID,
-		ModelID: payload.ModelID, Message: payload.Message, Attachments: attachments, Stream: payload.Stream,
+		ModelID: payload.ModelID, Message: payload.Message, Attachments: attachments, Stream: payload.Stream, ReasoningEffort: reasoningEffort,
 	}
 	// The legacy endpoint remains a compatibility projection, but production
 	// requests must run through the durable Coordinator so a browser disconnect

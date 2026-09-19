@@ -22,7 +22,6 @@ type BotForm = {
   listen_port: number | null
   listen_path: string
   group_trigger_mode: string
-  admin_user_ids: string
   telegram_token: string
   onebot_access_token: string
   enabled: boolean
@@ -47,7 +46,7 @@ const statusMap: Record<string, { label: string; type: 'success' | 'warning' | '
 function emptyForm(): BotForm {
   return {
     id: '', name: '', type: 'onebot11', endpoint: '', onebot_mode: 'reverse-server', listen_host: '0.0.0.0', listen_port: 6199,
-    listen_path: '/ws', group_trigger_mode: 'mention', admin_user_ids: '', telegram_token: '', onebot_access_token: '', enabled: true, config_profile_id: '',
+    listen_path: '/ws', group_trigger_mode: 'mention', telegram_token: '', onebot_access_token: '', enabled: true, config_profile_id: '',
   }
 }
 
@@ -60,7 +59,6 @@ function fillForm(bot?: Bot) {
     id: bot.id, name: bot.name, type: bot.type, endpoint: bot.endpoint || '', onebot_mode: bot.onebot_mode || (bot.endpoint ? 'client' : 'reverse-server'),
     listen_host: bot.listen_host || '0.0.0.0', listen_port: bot.listen_port || 6199, listen_path: bot.listen_path || '/ws',
     group_trigger_mode: bot.group_trigger_mode || 'mention',
-    admin_user_ids: (bot.admin_user_ids || []).join(', '),
     telegram_token: '', onebot_access_token: '', enabled: bot.enabled !== false, config_profile_id: '',
   } : emptyForm())
 }
@@ -88,8 +86,6 @@ function payload() {
     id: form.id.trim(), name: form.name.trim(), type: form.type, endpoint: form.endpoint.trim(), onebot_mode: form.onebot_mode,
     listen_host: form.listen_host.trim(), listen_port: form.listen_port || 0, listen_path: form.listen_path.trim(), group_trigger_mode: form.group_trigger_mode, enabled: form.enabled,
   }
-  // 全局管理员是聊天指令的根信任，只能在 WebUI 配置。
-  value.admin_user_ids = form.admin_user_ids.split(/[,\s]+/).map((item) => item.trim()).filter(Boolean)
   if (form.telegram_token.trim()) value.telegram_token = form.telegram_token.trim()
   if (form.onebot_access_token.trim()) value.onebot_access_token = form.onebot_access_token.trim()
   return value
@@ -236,10 +232,6 @@ onMounted(async () => {
             <NFormItem label="OneBot Access Token"><NInput v-model:value="form.onebot_access_token" type="password" show-password-on="click" :placeholder="editing ? '留空表示保留旧 Token' : '可选'" /></NFormItem>
           </template>
           <NFormItem v-else label="Telegram Bot Token"><NInput v-model:value="form.telegram_token" type="password" show-password-on="click" :placeholder="editing ? '留空表示保留旧 Token' : '请输入 Bot Token'" /></NFormItem>
-          <NFormItem label="全局管理员（用户 ID，逗号分隔）">
-            <NInput v-model:value="form.admin_user_ids" placeholder="例如 10001, 10002；留空表示没有管理员，管理指令将不可用" />
-            <small class="form-help">管理员可以新建会话、切换模型与人格、绑定工作区，并在群里授权群管理员。</small>
-          </NFormItem>
           <NFormItem label="群聊触发方式"><NSelect v-model:value="form.group_trigger_mode" :options="[{ label: '仅 @ 机器人时触发（推荐）', value: 'mention' }, { label: '群内所有消息都触发', value: 'all' }]" /></NFormItem>
 
           <div class="setting-section">

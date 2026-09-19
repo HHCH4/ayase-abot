@@ -63,6 +63,7 @@ type RuntimeConfigSnapshot struct {
 type RuntimeOptionsSnapshot struct {
 	AIEnabled                     bool    `json:"ai_enabled"`
 	AITemperature                 float64 `json:"ai_temperature"`
+	AIReasoningEffort             string  `json:"ai_reasoning_effort,omitempty"`
 	AITopP                        float64 `json:"ai_top_p"`
 	AIMaxOutputTokens             int     `json:"ai_max_output_tokens"`
 	AIRequestRetries              int     `json:"ai_request_retries"`
@@ -132,6 +133,7 @@ func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
 	return RuntimeOptionsSnapshot{
 		AIEnabled:                     runtime.AIEnabled,
 		AITemperature:                 runtime.AITemperature,
+		AIReasoningEffort:             runtime.AIReasoningEffort,
 		AITopP:                        runtime.AITopP,
 		AIMaxOutputTokens:             runtime.AIMaxOutputTokens,
 		AIRequestRetries:              runtime.AIRequestRetries,
@@ -263,6 +265,7 @@ func validateRuntimeOptionsSnapshot(options RuntimeOptionsSnapshot) error {
 		return fmt.Errorf("%w: compaction overlap 不能大于 interval", ErrInvalidRuntimeConfigSnapshot)
 	}
 	for name, value := range map[string]string{
+		"ai_reasoning_effort":         options.AIReasoningEffort,
 		"modal_fallback_provider_id":  options.ModalFallbackProviderID,
 		"modal_fallback_vision_model": options.ModalFallbackVisionModel,
 		"modal_fallback_audio_model":  options.ModalFallbackAudioModel,

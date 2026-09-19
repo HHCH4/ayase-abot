@@ -212,6 +212,8 @@ export async function streamChat(payload: {
   message: string
   attachments: ChatAttachment[]
   stream: boolean
+  /** 请求级思考强度覆盖；为空时由后端使用配置中心默认值。 */
+  reasoning_effort?: string
 }, onEvent: (type: string, data: Record<string, unknown>) => void): Promise<void> {
   const response = await fetch('/api/v1/chat', {
     method: 'POST',

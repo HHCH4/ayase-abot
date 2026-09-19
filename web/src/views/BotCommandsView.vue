@@ -217,10 +217,10 @@ onMounted(async () => {
 .command-list { display: grid; gap: 6px; margin-top: 16px; }
 .command-list.is-loading { opacity: .6; }
 .command-head, .command-row { display: grid; grid-template-columns: 150px 120px 80px minmax(0, 1fr) 160px 80px; align-items: center; gap: 10px; }
-.command-head { padding: 0 10px 6px; color: #98a1ad; font-size: 11px; letter-spacing: .04em; }
-.command-row { padding: 9px 10px; border: 1px solid #eef1f5; border-radius: 10px; }
+.command-head { padding: 0 10px 6px; color: #98a0aa; font-size: 11px; letter-spacing: .04em; }
+.command-row { padding: 9px 10px; border: 1px solid #eef0f2; border-radius: 10px; }
 .command-row code { color: var(--brand); font-size: 12px; }
-.command-desc { color: #55606e; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.command-desc { color: #5b6472; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .audit-list { display: grid; gap: 6px; }
-.audit-row { display: grid; grid-template-columns: 170px 130px 130px 110px minmax(0, 1fr) 90px; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid #eef1f5; border-radius: 10px; font-size: 12px; }
+.audit-row { display: grid; grid-template-columns: 170px 130px 130px 110px minmax(0, 1fr) 90px; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid #eef0f2; border-radius: 10px; font-size: 12px; }
 </style>
