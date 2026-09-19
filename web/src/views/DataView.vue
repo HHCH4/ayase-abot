@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { NButton, NCard, NEmpty, NInput, NSelect, NSpace, NTabPane, NTag, NTabs, useMessage } from 'naive-ui'
 import { openDataLogStream, readDataConversations, readDataTraces, readDashboardStats, readInvocationTrace } from '@/api'
 import type { Conversation, DashboardStats, DataLogEntry, InvocationTrace } from '@/types'
@@ -15,12 +15,17 @@ const logs = ref<DataLogEntry[]>([])
 const conversationQuery = ref('')
 const conversationStatus = ref('')
 const traceQuery = ref('')
-const logLevel = ref('')
 const selectedTrace = ref<InvocationTrace | null>(null)
 const traceLoading = ref(false)
 const logConnected = ref(false)
+const autoScrollLogs = ref(true)
+const logTerminal = ref<HTMLElement | null>(null)
 let closeLogStream: (() => void) | undefined
 let logStreamGeneration = 0
+const logLevels = ['DEBUG', 'INFO', 'WARN', 'ERROR', 'CRITICAL']
+const selectedLogLevels = ref([...logLevels])
+
+const visibleLogs = computed(() => logs.value.filter((item) => selectedLogLevels.value.includes(item.level.toUpperCase())))
 
 const trendMax = computed(() => Math.max(1, ...(stats.value?.message_trend || []).map((item) => item.messages)))
 const statusOptions = [
@@ -28,13 +33,6 @@ const statusOptions = [
   { label: '进行中', value: 'active' },
   { label: '已归档', value: 'archived' },
 ]
-const logLevelOptions = [
-  { label: '全部日志', value: '' },
-  { label: 'INFO', value: 'INFO' },
-  { label: 'WARN', value: 'WARN' },
-  { label: 'ERROR', value: 'ERROR' },
-]
-
 // 仪表盘分成独立请求，单个数据源异常时仍保留其他可用区域。
 async function loadStats() {
   try {
@@ -77,19 +75,55 @@ function stopLogStream() {
   logs.value = []
 }
 
+function scrollLogsToBottom() {
+  if (!autoScrollLogs.value || !logTerminal.value) return
+  logTerminal.value.scrollTop = logTerminal.value.scrollHeight
+}
+
+function appendLogEntries(entries: DataLogEntry[]) {
+  logs.value = [...entries].reverse().slice(-500)
+  void nextTick(scrollLogsToBottom)
+}
+
+function appendLogEntry(entry: DataLogEntry) {
+  logs.value = [...logs.value, entry].slice(-500)
+  void nextTick(scrollLogsToBottom)
+}
+
+function toggleLogLevel(level: string) {
+  if (selectedLogLevels.value.includes(level)) {
+    selectedLogLevels.value = selectedLogLevels.value.filter((item) => item !== level)
+  } else {
+    selectedLogLevels.value = [...selectedLogLevels.value, level]
+  }
+  void nextTick(scrollLogsToBottom)
+}
+
+function formatLogTimestamp(value?: string) {
+  if (!value) return '未知时间'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toISOString().replace('T', ' ').replace('Z', '')
+}
+
+function formatLogLine(item: DataLogEntry) {
+  const attributes = item.attributes && Object.keys(item.attributes).length ? ` ${JSON.stringify(item.attributes)}` : ''
+  return `[${formatLogTimestamp(item.time)}] [${item.level}] ${item.message}${attributes}`
+}
+
 function startLogStream() {
   if (activeTab.value !== 'logs' || closeLogStream) return
   const generation = ++logStreamGeneration
   closeLogStream = openDataLogStream(
-    logLevel.value,
+    '',
     (entries) => {
       if (generation !== logStreamGeneration) return
-      logs.value = entries
+      appendLogEntries(entries)
       logConnected.value = true
     },
     (entry) => {
       if (generation !== logStreamGeneration) return
-      logs.value = [entry, ...logs.value].slice(0, 500)
+      appendLogEntry(entry)
       logConnected.value = true
     },
     () => {
@@ -134,11 +168,6 @@ function traceStatus(value: unknown) {
 watch(range, loadStats)
 watch([conversationQuery, conversationStatus], loadConversations)
 watch(traceQuery, loadTraces)
-watch(logLevel, () => {
-  if (activeTab.value !== 'logs') return
-  stopLogStream()
-  startLogStream()
-})
 watch(activeTab, (tab, previous) => {
   if (previous === 'logs') stopLogStream()
   if (tab === 'logs') startLogStream()
@@ -150,6 +179,10 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopLogStream()
+})
+
+watch(autoScrollLogs, () => {
+  void nextTick(scrollLogsToBottom)
 })
 </script>
 
@@ -216,9 +249,25 @@ onUnmounted(() => {
       </NTabPane>
 
       <NTabPane name="logs" tab="实时日志">
-        <div class="data-toolbar"><NSelect v-model:value="logLevel" :options="logLevelOptions" style="width: 140px" /><span class="muted">{{ logConnected ? '实时流已连接 · 离开此页后自动断开' : '正在连接实时日志流…' }}</span></div>
-        <div v-if="logs.length" class="log-list"><div v-for="(item, index) in logs" :key="`${item.time}-${index}`" class="log-row"><time>{{ formatTime(item.time) }}</time><NTag size="small" :bordered="false" :type="item.level === 'ERROR' ? 'error' : item.level === 'WARN' ? 'warning' : 'info'">{{ item.level }}</NTag><span>{{ item.message }}</span><code v-if="item.attributes">{{ JSON.stringify(item.attributes) }}</code></div></div>
-        <NEmpty v-else :description="logConnected ? '暂无日志' : '正在等待日志流…'" />
+        <div class="log-terminal-shell">
+          <div class="log-terminal-toolbar">
+            <div class="log-level-filters">
+              <button v-for="level in logLevels" :key="level" type="button" class="log-filter-chip" :class="{ active: selectedLogLevels.includes(level) }" @click="toggleLogLevel(level)">
+                <span>✓</span>{{ level }}
+              </button>
+            </div>
+            <div class="log-terminal-actions">
+              <button type="button" class="log-toggle" :class="{ active: autoScrollLogs }" @click="autoScrollLogs = !autoScrollLogs">自动滚动</button>
+              <span class="log-stream-state" :class="{ connected: logConnected }">{{ logConnected ? 'LIVE' : 'CONNECTING' }}</span>
+            </div>
+          </div>
+          <div ref="logTerminal" class="log-terminal">
+            <div v-if="visibleLogs.length" class="log-terminal-lines">
+              <div v-for="(item, index) in visibleLogs" :key="`${item.time}-${index}`" class="log-terminal-line" :class="`level-${item.level.toUpperCase()}`">{{ formatLogLine(item) }}</div>
+            </div>
+            <div v-else class="log-terminal-empty">{{ logConnected ? '暂无匹配日志' : '正在连接实时日志流…' }}</div>
+          </div>
+        </div>
       </NTabPane>
     </NTabs>
   </div>
