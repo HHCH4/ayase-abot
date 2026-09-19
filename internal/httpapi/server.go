@@ -445,6 +445,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/data/conversations", s.dataConversations)
 	mux.HandleFunc("GET /api/v1/data/traces", s.dataTraces)
 	mux.HandleFunc("GET /api/v1/data/logs", s.dataLogs)
+	mux.HandleFunc("GET /api/v1/data/logs/stream", s.dataLogsStream)
 	mux.HandleFunc("GET /api/v1/local/directories", s.listLocalDirectories)
 	mux.HandleFunc("GET /api/v1/remote-targets", s.listRemoteTargets)
 	mux.HandleFunc("POST /api/v1/remote-targets", s.createRemoteTarget)
@@ -1464,7 +1465,16 @@ func decodeSingleJSONWithLimit(writer http.ResponseWriter, request *http.Request
 }
 
 func writeJSON(writer http.ResponseWriter, status int, value any) {
-	// 先编码并记录完整 JSON，再写回客户端，保证管理台和终端都能看到原始响应正文。
+	writeJSONInternal(writer, status, value, true)
+}
+
+// writeJSONWithoutBodyLog 返回结构化 JSON 但不把响应正文再次写入日志，适用于日志查询等自包含接口。
+func writeJSONWithoutBodyLog(writer http.ResponseWriter, status int, value any) {
+	writeJSONInternal(writer, status, value, false)
+}
+
+// writeJSONInternal 统一编码和写回逻辑；日志正文开关用于阻断日志查询接口的自引用。
+func writeJSONInternal(writer http.ResponseWriter, status int, value any, logBody bool) {
 	data, err := json.Marshal(value)
 	if err != nil {
 		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1475,7 +1485,10 @@ func writeJSON(writer http.ResponseWriter, status int, value any) {
 	data = append(data, '\n')
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(status)
-	slog.Info("HTTP JSON 响应正文", "status", status, "body", string(data))
+	if logBody {
+		// 保留普通 API 的完整响应日志，方便查看机器人和模型请求链路；自包含日志接口会显式关闭此项。
+		slog.Info("HTTP JSON 响应正文", "status", status, "body", string(data))
+	}
 	if _, err := writer.Write(data); err != nil {
 		slog.Debug("写入 JSON 响应失败", "error", err)
 	}

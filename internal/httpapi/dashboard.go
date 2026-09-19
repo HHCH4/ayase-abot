@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -199,11 +201,71 @@ func (s *Server) dataTraces(writer http.ResponseWriter, request *http.Request) {
 
 func (s *Server) dataLogs(writer http.ResponseWriter, request *http.Request) {
 	if s.logs == nil {
-		writeJSON(writer, http.StatusOK, map[string]any{"logs": []logging.Entry{}})
+		writeJSONWithoutBodyLog(writer, http.StatusOK, map[string]any{"logs": []logging.Entry{}})
 		return
 	}
 	level := request.URL.Query().Get("level")
-	writeJSON(writer, http.StatusOK, map[string]any{"logs": s.logs.List(level, 500), "realtime": true})
+	// 旧版快照接口仍保留兼容性，但不能把包含历史日志的响应正文再次写入日志。
+	writeJSONWithoutBodyLog(writer, http.StatusOK, map[string]any{"logs": s.logs.List(level, 500), "realtime": true})
+}
+
+// dataLogsStream 只在日志页打开时建立连接，先发送一次快照，再持续推送新增日志。
+func (s *Server) dataLogsStream(writer http.ResponseWriter, request *http.Request) {
+	flusher, ok := writer.(http.Flusher)
+	if !ok {
+		http.Error(writer, "当前响应不支持日志流", http.StatusInternalServerError)
+		return
+	}
+	writer.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Connection", "keep-alive")
+	writer.Header().Set("X-Accel-Buffering", "no")
+
+	level := request.URL.Query().Get("level")
+	var initial []logging.Entry
+	var events <-chan logging.Entry
+	unsubscribe := func() {}
+	if s.logs != nil {
+		initial, events, unsubscribe = s.logs.Subscribe(level, 500)
+	}
+	defer unsubscribe()
+
+	if err := writeLogStreamEvent(writer, "snapshot", map[string]any{"logs": initial, "realtime": true}); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	keepalive := time.NewTicker(15 * time.Second)
+	defer keepalive.Stop()
+	for {
+		select {
+		case <-request.Context().Done():
+			return
+		case entry, open := <-events:
+			if !open {
+				return
+			}
+			if err := writeLogStreamEvent(writer, "log", entry); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-keepalive.C:
+			if _, err := fmt.Fprint(writer, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// writeLogStreamEvent 写入日志专用 SSE 事件；不能复用 writeSSE，避免日志流把自身正文再次记入日志。
+func writeLogStreamEvent(writer http.ResponseWriter, event string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", event, data)
+	return err
 }
 
 func pageValues(request *http.Request) (int, int) {

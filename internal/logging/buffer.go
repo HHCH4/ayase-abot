@@ -1,4 +1,4 @@
-// Package logging 提供内存中的有界日志快照，供管理台实时轮询查看。
+// Package logging 提供内存中的有界日志快照和实时订阅，供管理台按需查看。
 package logging
 
 import (
@@ -21,9 +21,17 @@ type Entry struct {
 
 // Store 保存最近的有限条数日志，进程重启后自动清空，不承担审计存储职责。
 type Store struct {
-	mu      sync.RWMutex
-	max     int
-	entries []Entry
+	mu             sync.RWMutex
+	max            int
+	entries        []Entry
+	nextSubscriber uint64
+	subscribers    map[uint64]*subscriber
+}
+
+// subscriber 是日志流的单个订阅者；有界 channel 防止浏览器断开或网络变慢时反过来阻塞日志写入。
+type subscriber struct {
+	level  string
+	events chan Entry
 }
 
 // NewStore 创建日志环形缓冲区。
@@ -31,7 +39,7 @@ func NewStore(max int) *Store {
 	if max < 100 {
 		max = 1000
 	}
-	return &Store{max: max, entries: make([]Entry, 0, max)}
+	return &Store{max: max, entries: make([]Entry, 0, max), subscribers: make(map[uint64]*subscriber)}
 }
 
 // Add 记录一条完整日志；结构化属性统一转成文本，确保请求和响应正文不会被丢弃。
@@ -60,6 +68,24 @@ func (s *Store) add(record slog.Record, bound ...slog.Attr) {
 	if excess := len(s.entries) - s.max; excess > 0 {
 		s.entries = append([]Entry(nil), s.entries[excess:]...)
 	}
+	// 日志流只投递最新事件且不阻塞生产者；慢客户端会丢弃最旧的待发送事件，重新打开页面时会重新获取快照。
+	for _, item := range s.subscribers {
+		if item.level != "" && item.level != "ALL" && strings.ToUpper(entry.Level) != item.level {
+			continue
+		}
+		select {
+		case item.events <- entry:
+		default:
+			select {
+			case <-item.events:
+			default:
+			}
+			select {
+			case item.events <- entry:
+			default:
+			}
+		}
+	}
 	s.mu.Unlock()
 }
 
@@ -74,6 +100,46 @@ func (s *Store) List(level string, limit int) []Entry {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.listLocked(level, limit)
+}
+
+// Subscribe 返回打开日志页时的快照和之后的实时事件；快照与订阅注册在同一把锁内完成，避免漏掉临界日志。
+func (s *Store) Subscribe(level string, limit int) ([]Entry, <-chan Entry, func()) {
+	if s == nil {
+		events := make(chan Entry)
+		close(events)
+		return []Entry{}, events, func() {}
+	}
+	level = strings.ToUpper(strings.TrimSpace(level))
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	item := &subscriber{level: level, events: make(chan Entry, 128)}
+	s.mu.Lock()
+	s.nextSubscriber++
+	id := s.nextSubscriber
+	initial := s.listLocked(level, limit)
+	if s.subscribers == nil {
+		s.subscribers = make(map[uint64]*subscriber)
+	}
+	s.subscribers[id] = item
+	s.mu.Unlock()
+
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			s.mu.Lock()
+			if current, ok := s.subscribers[id]; ok && current == item {
+				delete(s.subscribers, id)
+				close(item.events)
+			}
+			s.mu.Unlock()
+		})
+	}
+	return initial, item.events, cancel
+}
+
+func (s *Store) listLocked(level string, limit int) []Entry {
 	result := make([]Entry, 0, limit)
 	for index := len(s.entries) - 1; index >= 0 && len(result) < limit; index-- {
 		entry := s.entries[index]

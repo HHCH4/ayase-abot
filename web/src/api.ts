@@ -213,6 +213,34 @@ export async function readDataLogs(level = ''): Promise<DataLogEntry[]> {
   return result.logs || []
 }
 
+// 打开日志页时建立 SSE 连接，关闭页面或切换筛选条件时由调用方关闭连接。
+export function openDataLogStream(
+  level: string,
+  onSnapshot: (entries: DataLogEntry[]) => void,
+  onEntry: (entry: DataLogEntry) => void,
+  onError?: () => void,
+): () => void {
+  const query = level ? `?level=${encodeURIComponent(level)}` : ''
+  const source = new EventSource(`/api/v1/data/logs/stream${query}`)
+  source.addEventListener('snapshot', (event) => {
+    try {
+      const payload = JSON.parse((event as MessageEvent).data) as { logs?: DataLogEntry[] }
+      onSnapshot(payload.logs || [])
+    } catch {
+      onError?.()
+    }
+  })
+  source.addEventListener('log', (event) => {
+    try {
+      onEntry(JSON.parse((event as MessageEvent).data) as DataLogEntry)
+    } catch {
+      onError?.()
+    }
+  })
+  source.onerror = () => onError?.()
+  return () => source.close()
+}
+
 export async function readOperations(workspaceID = '', conversationID = ''): Promise<Operation[]> {
   const params = new URLSearchParams()
   if (workspaceID) params.set('workspace_id', workspaceID)

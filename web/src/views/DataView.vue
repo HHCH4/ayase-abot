@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { NButton, NCard, NEmpty, NInput, NSelect, NSpace, NTabPane, NTag, NTabs, useMessage } from 'naive-ui'
-import { readDataConversations, readDataLogs, readDataTraces, readDashboardStats, readInvocationTrace } from '@/api'
+import { openDataLogStream, readDataConversations, readDataTraces, readDashboardStats, readInvocationTrace } from '@/api'
 import type { Conversation, DashboardStats, DataLogEntry, InvocationTrace } from '@/types'
 
 const message = useMessage()
@@ -18,7 +18,9 @@ const traceQuery = ref('')
 const logLevel = ref('')
 const selectedTrace = ref<InvocationTrace | null>(null)
 const traceLoading = ref(false)
-let logTimer: number | undefined
+const logConnected = ref(false)
+let closeLogStream: (() => void) | undefined
+let logStreamGeneration = 0
 
 const trendMax = computed(() => Math.max(1, ...(stats.value?.message_trend || []).map((item) => item.messages)))
 const statusOptions = [
@@ -60,18 +62,40 @@ async function loadTraces() {
   }
 }
 
-async function loadLogs() {
-  try {
-    logs.value = await readDataLogs(logLevel.value)
-  } catch (error) {
-    message.error(error instanceof Error ? error.message : '读取日志失败')
-  }
-}
-
 async function load() {
   loading.value = true
-  await Promise.all([loadStats(), loadConversations(), loadTraces(), loadLogs()])
+  await Promise.all([loadStats(), loadConversations(), loadTraces()])
   loading.value = false
+}
+
+// 日志只在用户打开日志页时建立流；离开页面立即关闭连接并释放前端快照。
+function stopLogStream() {
+  logStreamGeneration += 1
+  closeLogStream?.()
+  closeLogStream = undefined
+  logConnected.value = false
+  logs.value = []
+}
+
+function startLogStream() {
+  if (activeTab.value !== 'logs' || closeLogStream) return
+  const generation = ++logStreamGeneration
+  closeLogStream = openDataLogStream(
+    logLevel.value,
+    (entries) => {
+      if (generation !== logStreamGeneration) return
+      logs.value = entries
+      logConnected.value = true
+    },
+    (entry) => {
+      if (generation !== logStreamGeneration) return
+      logs.value = [entry, ...logs.value].slice(0, 500)
+      logConnected.value = true
+    },
+    () => {
+      if (generation === logStreamGeneration) logConnected.value = false
+    },
+  )
 }
 
 async function openTrace(item: Record<string, unknown>) {
@@ -110,16 +134,22 @@ function traceStatus(value: unknown) {
 watch(range, loadStats)
 watch([conversationQuery, conversationStatus], loadConversations)
 watch(traceQuery, loadTraces)
-watch(logLevel, loadLogs)
+watch(logLevel, () => {
+  if (activeTab.value !== 'logs') return
+  stopLogStream()
+  startLogStream()
+})
+watch(activeTab, (tab, previous) => {
+  if (previous === 'logs') stopLogStream()
+  if (tab === 'logs') startLogStream()
+})
 
 onMounted(async () => {
   await load()
-  // 日志页需要实时感知新事件，其他统计仍由手动刷新或筛选变化触发。
-  logTimer = window.setInterval(loadLogs, 5000)
 })
 
 onUnmounted(() => {
-  if (logTimer !== undefined) window.clearInterval(logTimer)
+  stopLogStream()
 })
 </script>
 
@@ -186,9 +216,9 @@ onUnmounted(() => {
       </NTabPane>
 
       <NTabPane name="logs" tab="实时日志">
-        <div class="data-toolbar"><NSelect v-model:value="logLevel" :options="logLevelOptions" style="width: 140px" /><span class="muted">每 5 秒刷新一次 · 保留原始请求与响应字段</span></div>
+        <div class="data-toolbar"><NSelect v-model:value="logLevel" :options="logLevelOptions" style="width: 140px" /><span class="muted">{{ logConnected ? '实时流已连接 · 离开此页后自动断开' : '正在连接实时日志流…' }}</span></div>
         <div v-if="logs.length" class="log-list"><div v-for="(item, index) in logs" :key="`${item.time}-${index}`" class="log-row"><time>{{ formatTime(item.time) }}</time><NTag size="small" :bordered="false" :type="item.level === 'ERROR' ? 'error' : item.level === 'WARN' ? 'warning' : 'info'">{{ item.level }}</NTag><span>{{ item.message }}</span><code v-if="item.attributes">{{ JSON.stringify(item.attributes) }}</code></div></div>
-        <NEmpty v-else description="暂无日志" />
+        <NEmpty v-else :description="logConnected ? '暂无日志' : '正在等待日志流…'" />
       </NTabPane>
     </NTabs>
   </div>
