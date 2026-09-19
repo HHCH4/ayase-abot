@@ -26,6 +26,13 @@ import type {
   ToolSetSnapshot,
   ModelCapabilitySnapshot,
   WorktreeBaseline,
+  Persona,
+  PersonaRevision,
+  SessionRule,
+  SessionRuleGroup,
+  ScheduledTask,
+  DashboardStats,
+  DataLogEntry,
 } from './types'
 
 export class ApiError extends Error {
@@ -106,6 +113,104 @@ export async function readInvocationCapabilities(invocationID: string): Promise<
 export async function readConfigRevisions(profileID: string): Promise<ConfigRevision[]> {
   const result = await request<{ revisions: ConfigRevision[] }>(`/api/v1/config-profiles/${encodeURIComponent(profileID)}/revisions`)
   return result.revisions || []
+}
+
+export async function readPersonas(): Promise<{ personas: Persona[]; default_persona_id: string }> {
+  return request<{ personas: Persona[]; default_persona_id: string }>('/api/v1/personas')
+}
+
+export async function readPersonaRevisions(personaID: string): Promise<PersonaRevision[]> {
+  const result = await request<{ revisions: PersonaRevision[] }>(`/api/v1/personas/${encodeURIComponent(personaID)}/revisions`)
+  return result.revisions || []
+}
+
+export async function savePersona(value: Partial<Persona> & { instruction: string; name: string }): Promise<Persona> {
+  const path = value.id ? `/api/v1/personas/${encodeURIComponent(value.id)}` : '/api/v1/personas'
+  return request<Persona>(path, { method: value.id ? 'PUT' : 'POST', body: JSON.stringify(value) })
+}
+
+export async function setDefaultPersona(personaID: string): Promise<void> {
+  await request(`/api/v1/personas/${encodeURIComponent(personaID)}/default`, { method: 'POST', body: '{}' })
+}
+
+export async function deletePersona(personaID: string): Promise<void> {
+  await request<void>(`/api/v1/personas/${encodeURIComponent(personaID)}`, { method: 'DELETE' })
+}
+
+export async function readSessionRules(query = ''): Promise<SessionRule[]> {
+  const result = await request<{ rules: SessionRule[] }>(`/api/v1/session-rules${query.trim() ? `?q=${encodeURIComponent(query.trim())}` : ''}`)
+  return result.rules || []
+}
+
+export async function saveSessionRule(value: Partial<SessionRule> & { source: string }): Promise<SessionRule> {
+	return request<SessionRule>(`/api/v1/session-rules/${encodeURIComponent(value.source)}`, { method: 'PUT', body: JSON.stringify(value) })
+}
+
+// 新建规则单独走 POST，避免来源字段存在时误把新规则当成更新请求。
+export async function createSessionRule(value: Partial<SessionRule> & { source: string }): Promise<SessionRule> {
+	return request<SessionRule>('/api/v1/session-rules', { method: 'POST', body: JSON.stringify(value) })
+}
+
+export async function deleteSessionRule(source: string): Promise<void> {
+  await request<void>(`/api/v1/session-rules/${encodeURIComponent(source)}`, { method: 'DELETE' })
+}
+
+export async function batchSessionRules(value: Record<string, unknown>): Promise<SessionRule[]> {
+  const result = await request<{ rules: SessionRule[] }>('/api/v1/session-rules/batch', { method: 'POST', body: JSON.stringify(value) })
+  return result.rules || []
+}
+
+export async function readSessionRuleGroups(): Promise<SessionRuleGroup[]> {
+  const result = await request<{ groups: SessionRuleGroup[] }>('/api/v1/session-rule-groups')
+  return result.groups || []
+}
+
+export async function saveSessionRuleGroup(value: Partial<SessionRuleGroup> & { name: string; members: string[] }): Promise<SessionRuleGroup> {
+  const path = value.id ? `/api/v1/session-rule-groups/${encodeURIComponent(value.id)}` : '/api/v1/session-rule-groups'
+  return request<SessionRuleGroup>(path, { method: value.id ? 'PUT' : 'POST', body: JSON.stringify(value) })
+}
+
+export async function deleteSessionRuleGroup(id: string): Promise<void> {
+  await request<void>(`/api/v1/session-rule-groups/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+export async function readScheduledTasks(status = ''): Promise<ScheduledTask[]> {
+  const query = status ? `?status=${encodeURIComponent(status)}` : ''
+  const result = await request<{ tasks: ScheduledTask[] }>(`/api/v1/scheduled-tasks${query}`)
+  return result.tasks || []
+}
+
+export async function saveScheduledTask(value: Partial<ScheduledTask> & { name: string; request: string; mode: string }): Promise<ScheduledTask> {
+  const path = value.id ? `/api/v1/scheduled-tasks/${encodeURIComponent(value.id)}` : '/api/v1/scheduled-tasks'
+  return request<ScheduledTask>(path, { method: value.id ? 'PUT' : 'POST', body: JSON.stringify(value) })
+}
+
+export async function setScheduledTaskStatus(id: string, action: 'pause' | 'resume'): Promise<ScheduledTask> {
+  return request<ScheduledTask>(`/api/v1/scheduled-tasks/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: '{}' })
+}
+
+export async function deleteScheduledTask(id: string): Promise<void> {
+  await request<void>(`/api/v1/scheduled-tasks/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+export async function readDashboardStats(range = '1d'): Promise<DashboardStats> {
+  return request<DashboardStats>(`/api/v1/data/stats?range=${encodeURIComponent(range)}`)
+}
+
+export async function readDataConversations(query: Record<string, string> = {}): Promise<{ conversations: Conversation[]; total: number; page: number; page_size: number }> {
+  const params = new URLSearchParams(query)
+  return request<{ conversations: Conversation[]; total: number; page: number; page_size: number }>(`/api/v1/data/conversations?${params}`)
+}
+
+export async function readDataTraces(query: Record<string, string> = {}): Promise<{ traces: Record<string, unknown>[]; total: number; page: number; page_size: number }> {
+  const params = new URLSearchParams(query)
+  return request<{ traces: Record<string, unknown>[]; total: number; page: number; page_size: number }>(`/api/v1/data/traces?${params}`)
+}
+
+export async function readDataLogs(level = ''): Promise<DataLogEntry[]> {
+  const query = level ? `?level=${encodeURIComponent(level)}` : ''
+  const result = await request<{ logs: DataLogEntry[] }>(`/api/v1/data/logs${query}`)
+  return result.logs || []
 }
 
 export async function readOperations(workspaceID = '', conversationID = ''): Promise<Operation[]> {

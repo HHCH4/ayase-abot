@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -43,18 +44,41 @@ func (b Bot) effectiveGroupTrigger() string {
 	return groupTriggerMention
 }
 
-func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message) error {
+func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message) (err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// 先记录平台送入的完整消息，再做规范化和权限判断，确保被忽略的请求也能追踪。
+	rawText := message.Text
+	message.Text = strings.TrimSpace(message.Text)
+	startedAt := time.Now()
+	slog.Info("机器人收到请求", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_type", message.ChatType, "chat_id", message.ChatID, "user_id", message.UserID, "message_id", message.ID, "text", rawText, "normalized_text", message.Text, "mentioned", message.Mentioned, "attachments", message.Attachments, "control", message.Control)
+	defer func() {
+		if err != nil {
+			// 统一记录处理失败及原始请求，避免只看到平台连接层的笼统错误。
+			slog.Error("机器人请求处理失败", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "text", rawText, "duration", time.Since(startedAt), "error", err)
+		}
+	}()
 	if message.Control != nil {
 		return m.handleApprovalControl(ctx, message)
 	}
-	message.Text = strings.TrimSpace(message.Text)
 	if message.Text == "" && len(message.Attachments) == 0 {
+		// 空消息不会进入 Agent，但仍保留忽略原因，方便排查平台事件解析问题。
+		slog.Info("机器人请求已忽略", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "reason", "empty")
 		return nil
 	}
-	if !m.groupMessageAllowed(message) {
+	allowed, admissionErr := m.messageAllowed(ctx, &message)
+	if admissionErr != nil {
+		return fmt.Errorf("读取平台消息配置失败: %w", admissionErr)
+	}
+	if !allowed {
+		// 未满足群聊触发或私聊唤醒条件时忽略，同时打印完整判断上下文。
+		slog.Info("机器人请求已忽略", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "text", rawText, "mentioned", message.Mentioned, "reason", "wakeup_not_met")
+		return nil
+	}
+	if message.Text == "" && len(message.Attachments) == 0 {
+		// 唤醒词本身不是有效问题，去掉前缀后仍为空时不创建空会话。
+		slog.Info("机器人请求已忽略", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "reason", "empty_after_wakeup")
 		return nil
 	}
 	command, isCommand := parseBotCommand(message.Text)
@@ -96,6 +120,8 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	coordinator := m.runtimeCoordinator
 	m.mu.RUnlock()
 	if coordinator == nil {
+		// 兼容没有装配 Durable Runtime 的嵌入方，并记录本次完整输入。
+		slog.Info("机器人请求进入兼容 Agent 执行", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "text", message.Text, "attachments", attachments, "timeout", timeout)
 		return m.handleLegacyMessage(ctx, message, userID, conversationID, attachments, timeout)
 	}
 	if timeout <= 0 {
@@ -108,11 +134,15 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	if workspaceID := strings.TrimSpace(item.WorkspaceID); workspaceID != "" {
 		request.WorkspaceID = &workspaceID
 	}
+	// 记录交给内置 Agent 的完整请求对象，便于把平台消息和 Invocation 对齐。
+	slog.Info("机器人请求启动内置 Agent", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "request", request)
 	invocation, startErr := coordinator.StartInvocation(ctx, request)
 	if startErr != nil {
 		_ = m.send(ctx, message, botRuntimeStartError(startErr))
 		return fmt.Errorf("启动机器人 Runtime invocation 失败: %w", startErr)
 	}
+	// 启动成功后记录 Durable Runtime 返回的任务标识，后续事件和响应都用它关联。
+	slog.Info("机器人请求已启动", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "invocation_id", invocation.ID, "status", invocation.Status)
 	chatKey := chatBindingKey(message)
 	m.mu.Lock()
 	m.activeInvocations[chatKey] = invocation.ID
@@ -143,6 +173,8 @@ func (m *Manager) handleLegacyMessage(ctx context.Context, message Message, user
 	if strings.TrimSpace(response) == "" {
 		return nil
 	}
+	// 兼容执行模式直接得到最终文本，发送动作本身还会由 Manager.Send 记录。
+	slog.Info("机器人兼容 Agent 返回响应", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "text", response)
 	return m.send(requestCtx, message, response)
 }
 
@@ -263,7 +295,7 @@ func (m *Manager) conversationForMessage(ctx context.Context, message Message) (
 		return "", "", fmt.Errorf("恢复机器人会话失败: %w", listErr)
 	}
 	item, err := m.conversations.Create(ctx, conversation.CreateRequest{
-		ID: baseConversationID, UserID: userID, Title: fmt.Sprintf("%s · %s", message.Platform, message.ChatID),
+		ID: baseConversationID, UserID: userID, Source: messageSource(message), Title: fmt.Sprintf("%s · %s", message.Platform, message.ChatID),
 	})
 	if err != nil {
 		return "", "", fmt.Errorf("创建机器人会话失败: %w", err)
@@ -308,7 +340,7 @@ func (m *Manager) startNewConversation(ctx context.Context, message Message) err
 		}
 	}
 	newID := "bot-" + strings.TrimPrefix(agent.NewSessionID(), "session-")
-	created, createErr := m.conversations.Create(ctx, conversation.CreateRequest{ID: newID, UserID: userID, WorkspaceID: workspaceID, Title: botConversationTitle(message)})
+	created, createErr := m.conversations.Create(ctx, conversation.CreateRequest{ID: newID, UserID: userID, Source: messageSource(message), WorkspaceID: workspaceID, Title: botConversationTitle(message)})
 	if createErr != nil {
 		return fmt.Errorf("创建新机器人会话失败: %w", createErr)
 	}
@@ -347,6 +379,16 @@ func (m *Manager) statusText(ctx context.Context, message Message) string {
 }
 
 func (m *Manager) cancelChatInvocation(ctx context.Context, message Message) error {
+	return m.controlChatInvocation(ctx, message, "取消", "可取消")
+}
+
+// stopChatInvocation 是对 AstrBot /stop 语义的直接实现，只停止任务而不改变会话历史。
+func (m *Manager) stopChatInvocation(ctx context.Context, message Message) error {
+	return m.controlChatInvocation(ctx, message, "停止", "可停止")
+}
+
+// controlChatInvocation 统一处理取消和停止，保证两条命令都只作用于当前会话的活动任务。
+func (m *Manager) controlChatInvocation(ctx context.Context, message Message, action, available string) error {
 	_, conversationID, conversationErr := m.conversationForMessage(ctx, message)
 	if conversationErr != nil {
 		return conversationErr
@@ -356,7 +398,7 @@ func (m *Manager) cancelChatInvocation(ctx context.Context, message Message) err
 	id := m.activeInvocations[chatBindingKey(message)]
 	m.mu.RUnlock()
 	if coordinator == nil {
-		return m.send(ctx, message, "当前没有可取消的任务。")
+		return m.send(ctx, message, "当前没有"+available+"的任务。")
 	}
 	if id == "" {
 		item, found, findErr := m.findActiveInvocation(ctx, message, conversationID)
@@ -369,12 +411,12 @@ func (m *Manager) cancelChatInvocation(ctx context.Context, message Message) err
 		}
 	}
 	if id == "" {
-		return m.send(ctx, message, "当前没有可取消的任务。")
+		return m.send(ctx, message, "当前没有"+available+"的任务。")
 	}
 	if _, err := coordinator.CancelInvocation(ctx, id); err != nil {
-		return m.send(ctx, message, "取消任务失败："+trimError(err))
+		return m.send(ctx, message, action+"任务失败："+trimError(err))
 	}
-	return m.send(ctx, message, "已请求取消当前任务。")
+	return m.send(ctx, message, "已请求"+action+"当前任务。")
 }
 
 func (m *Manager) setActiveInvocation(message Message, id string) {
@@ -541,6 +583,8 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 			if event.InvocationID != invocationID {
 				return false
 			}
+			// Runtime 事件包含工具调用、模型响应和终态信息；保留完整数据便于追踪请求链路。
+			slog.Info("机器人 Runtime 响应事件", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "invocation_id", invocationID, "event_type", event.Type, "data", event.Data)
 			switch event.Type {
 			case agentruntime.EventAssistantMessage:
 				if text := eventString(event.Data, "text"); text != "" {
@@ -626,6 +670,8 @@ func (m *Manager) deliverApproval(ctx context.Context, message Message, event ag
 	m.mu.Unlock()
 	prompt := ApprovalPrompt{ApprovalID: approvalID, ToolName: eventString(event.Data, "tool_name"), Hint: eventString(event.Data, "hint")}
 	prompt.ExpiresAt = eventTime(event.Data, "expires_at")
+	// 审批请求可能由平台专用交互组件发送，先在 Manager 层记录完整提示内容。
+	slog.Info("机器人发送审批请求", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "invocation_id", event.InvocationID, "approval_id", approvalID, "prompt", prompt)
 	m.mu.RLock()
 	entry, running := m.runtimes[message.AdapterID]
 	m.mu.RUnlock()
@@ -634,7 +680,10 @@ func (m *Manager) deliverApproval(ctx context.Context, message Message, event ag
 	}
 	if sender, ok := entry.platform.(ApprovalSender); ok {
 		if err := sender.SendApproval(ctx, message, prompt); err == nil {
+			slog.Info("机器人审批请求发送成功", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "approval_id", approvalID)
 			return
+		} else {
+			slog.Error("机器人审批请求发送失败", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "approval_id", approvalID, "prompt", prompt, "error", err)
 		}
 	}
 	position := len(tickets)
@@ -793,6 +842,39 @@ func chatBindingKey(message Message) string {
 		chatID = strings.TrimSpace(message.UserID)
 	}
 	return strings.Join([]string{string(message.Platform), strings.TrimSpace(message.AdapterID), strings.TrimSpace(message.ChatType), chatID}, "\x00")
+}
+
+// messageSessionID 返回平台侧会话 ID；群聊使用群/频道 ID，私聊使用聊天 ID，缺失时回退到用户 ID。
+// 该值是 UMO 的第三段，不是 Abot 内部的 Conversation ID 或 Runtime Session ID。
+func messageSessionID(message Message) string {
+	chatID := strings.TrimSpace(message.ChatID)
+	if chatID == "" {
+		chatID = strings.TrimSpace(message.UserID)
+	}
+	return chatID
+}
+
+// messageUMOMessageType 将平台适配器的聊天类型映射为 AstrBot 兼容的 MessageType。
+// UMO 只允许 FriendMessage、GroupMessage、OtherMessage 三类，避免把 Telegram/OneBot 的原始枚举直接写进规则键。
+func messageUMOMessageType(message Message) string {
+	switch strings.ToLower(strings.TrimSpace(message.ChatType)) {
+	case "private", "friend", "direct", "dm", "user":
+		return "FriendMessage"
+	case "group", "supergroup", "channel":
+		return "GroupMessage"
+	default:
+		return "OtherMessage"
+	}
+}
+
+// messageSource 生成 AstrBot 兼容的稳定 UMO：platform_id:message_type:session_id。
+// AdapterID 对应 AstrBot 的 platform_id；适配器尚未注入 ID 时才回退到平台类型，避免产生空的来源键。
+func messageSource(message Message) string {
+	platformID := strings.TrimSpace(message.AdapterID)
+	if platformID == "" {
+		platformID = strings.TrimSpace(string(message.Platform))
+	}
+	return strings.Join([]string{platformID, messageUMOMessageType(message), messageSessionID(message)}, ":")
 }
 
 func bindingUserID(message Message) string {

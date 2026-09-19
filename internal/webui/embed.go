@@ -2,6 +2,7 @@ package webui
 
 import (
 	"embed"
+	"fmt"
 	"io/fs"
 	"net/http"
 	"strings"
@@ -11,6 +12,14 @@ import (
 //
 //go:embed dist/*
 var dist embed.FS
+
+// CheckEmbeddedDashboard 校验管理台入口仍在内嵌资源中，供 /dashboard_update 给出真实状态。
+func CheckEmbeddedDashboard() error {
+	if _, err := fs.Stat(dist, "dist/index.html"); err != nil {
+		return fmt.Errorf("内嵌管理台入口不存在: %w", err)
+	}
+	return nil
+}
 
 // Handler 提供静态资源和 history 路由回退，/api 路径由 httpapi 单独处理。
 func Handler() http.Handler {

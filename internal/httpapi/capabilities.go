@@ -13,6 +13,8 @@ import (
 // the HTTP boundary explicit. A pointer distinguishes “leave unchanged” from
 // a requested conservative state.
 type capabilityOverridePayload struct {
+	// Manual 只允许管理界面明确声明模型能力时使用；普通调用仍保持保守收紧策略。
+	Manual                 bool                   `json:"manual,omitempty"`
 	ToolCalling            *provider.SupportState `json:"tool_calling,omitempty"`
 	ParallelToolCalls      *provider.SupportState `json:"parallel_tool_calls,omitempty"`
 	StructuredOutput       *provider.SupportState `json:"structured_output,omitempty"`
@@ -97,7 +99,16 @@ func (s *Server) updateProviderModelCapabilityOverrides(writer http.ResponseWrit
 		writeError(writer, err)
 		return
 	}
-	model, err := s.providers.ApplyCapabilityOverrides(request.Context(), request.PathValue("id"), strings.TrimSpace(request.PathValue("model")), payload.domain())
+	var model provider.Model
+	var err error
+	providerID := request.PathValue("id")
+	modelID := strings.TrimSpace(request.PathValue("model"))
+	if payload.Manual {
+		// 管理员明确选择的 supported 也要保留 user_override provenance，避免后续探测把配置误判成探测事实。
+		model, err = s.providers.ApplyManualCapabilityOverrides(request.Context(), providerID, modelID, payload.domain())
+	} else {
+		model, err = s.providers.ApplyCapabilityOverrides(request.Context(), providerID, modelID, payload.domain())
+	}
 	if err != nil {
 		writeError(writer, err)
 		return

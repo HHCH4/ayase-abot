@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { NButton, NCard, NCheckbox, NEmpty, NInput, NInputNumber, NSelect, NSpace, NTabPane, NTag, NTabs, useMessage } from 'naive-ui'
-import { readConfigRevisions, request } from '@/api'
+import { NButton, NCard, NCheckbox, NDynamicTags, NEmpty, NInput, NInputNumber, NSelect, NSpace, NTabPane, NTag, NTabs, useMessage } from 'naive-ui'
+import { readConfigRevisions, readPersonas, request } from '@/api'
+import { configuredModelOptions, makeModelReference, parseModelReference } from '@/model-catalog'
 import { useAppStore } from '@/stores/app'
 import type { ConfigField, ConfigProfile, ConfigRevision } from '@/types'
 
@@ -25,15 +26,20 @@ const jsonText = ref('{}')
 const saving = ref(false)
 const showHistory = ref(false)
 const importInput = ref<HTMLInputElement | null>(null)
+const personas = ref<{ id: string; name: string; enabled: boolean }[]>([])
 
 const groupItems = [
   { key: 'ai', label: 'AI 与模型' },
+  { key: 'capabilities', label: '能力' },
   { key: 'persona', label: '人格' },
   { key: 'context', label: '上下文管理' },
   { key: 'agent', label: 'Agent 执行' },
   { key: 'workspace', label: '项目能力' },
   { key: 'message', label: '消息输出' },
   { key: 'memory', label: '长期记忆' },
+  { key: 'plugins', label: '插件配置' },
+  { key: 'platform', label: '平台配置' },
+  { key: 'extensions', label: '扩展功能' },
 ]
 
 const currentProfile = computed(() => store.configProfiles.find((item) => item.id === selectedID.value) || store.defaultProfile)
@@ -45,6 +51,9 @@ const currentFields = computed(() => (store.configSchema.fields || []).filter((f
   const text = [field.label, field.key, field.help].filter(Boolean).join(' ').toLocaleLowerCase()
   return text.includes(search.value.trim().toLocaleLowerCase())
 }))
+
+// 这些字段保存的都是供应商模型 ID，统一改用已配置目录选择，避免同一个模型在不同页面重复手写。
+const modelFieldKeys = new Set(['ai.default_model_id', 'image.caption_model', 'voice.stt_model', 'voice.tts_model'])
 
 function clone(value: unknown): unknown {
   return JSON.parse(JSON.stringify(value ?? {}))
@@ -64,6 +73,37 @@ function numberValue(field: ConfigField) {
   return typeof value === 'number' ? value : Number(value || 0)
 }
 
+// listValue 把新旧两种列表形状都转换为标签编辑器需要的字符串数组。
+function listValue(field: ConfigField): string[] {
+  const value = fieldValue(field)
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean)
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value) as unknown
+      return Array.isArray(parsed) ? parsed.map((item) => String(item).trim()).filter(Boolean) : []
+    } catch {
+      return value.trim() ? [value.trim()] : []
+    }
+  }
+  return []
+}
+
+// setListValue 统一去空白和去重，保证标签编辑器不会产生无效重复项。
+function setListValue(field: ConfigField, value: unknown) {
+  const values = Array.isArray(value) ? value.map((item) => String(item).trim()).filter(Boolean) : []
+  draft[field.key] = [...new Set(values)]
+  dirty.value = true
+}
+
+// normalizeListDraft 让旧配置在第一次打开或保存其他字段时自动升级为数组。
+function normalizeListDraft() {
+  for (const field of store.configSchema.fields || []) {
+    if (field.type === 'list' && Object.prototype.hasOwnProperty.call(draft, field.key)) {
+      draft[field.key] = listValue(field)
+    }
+  }
+}
+
 function systemFieldValue(field: ConfigField) {
   return Object.prototype.hasOwnProperty.call(systemDraft, field.key) ? systemDraft[field.key] : field.default
 }
@@ -80,6 +120,124 @@ function systemNumberValue(field: ConfigField) {
 
 function setSystemValue(field: ConfigField, value: unknown) {
   systemDraft[field.key] = value
+  // 打开降级开关时优先选择目录中已经确认支持图片的模型，避免用户还要重复输入已配置的模型 ID。
+  if (field.key === 'modal_fallback_enabled' && value === true && !String(systemDraft.modal_fallback_vision_model || '').trim()) {
+    const providerID = fallbackPrimaryProviderID()
+    const provider = store.providers.find((item) => item.id === providerID)
+    const candidate = (provider?.models || []).find((item) => {
+      if (item.enabled === false) return false
+      const state = item.capabilities?.images?.state
+      return state === 'supported' || state === 'degraded'
+    })
+    if (candidate) {
+      systemDraft.modal_fallback_provider_id = providerID
+      systemDraft.modal_fallback_vision_model = candidate.id
+    }
+  }
+}
+
+function isModelField(field: ConfigField) {
+  return modelFieldKeys.has(field.key)
+}
+
+function profileModelOptions(field: ConfigField) {
+  const current = textValue(field).trim()
+  const preferredProvider = field.key === 'ai.default_model_id' ? String(draft['ai.default_provider_id'] || '').trim() : ''
+  const options = configuredModelOptions(store.providers).filter((item) => !preferredProvider || item.providerID === preferredProvider)
+  const result = [
+    { label: field.key === 'ai.default_model_id' ? '沿用供应商默认模型' : '不指定模型', value: '' },
+    ...options.map((item) => ({ label: item.label, value: item.value })),
+  ]
+  if (current && !options.some((item) => item.modelID === current)) {
+    // 旧配置可能来自目录外模型；保留它的显示和运行能力，但不再要求用户重新输入。
+    result.push({ label: `当前值：${current}（目录外）`, value: makeModelReference('current', current) })
+  }
+  return result
+}
+
+function profileModelControlValue(field: ConfigField) {
+  const current = textValue(field).trim()
+  if (!current) return ''
+  const options = profileModelOptions(field)
+  return options.find((item) => parseModelReference(item.value)?.modelID === current)?.value || makeModelReference('current', current)
+}
+
+function setProfileModelValue(field: ConfigField, value: unknown) {
+  const raw = String(value || '')
+  const reference = parseModelReference(raw)
+  if (!reference || reference.providerID === 'current') {
+    setValue(field, reference?.modelID || '')
+    return
+  }
+  setValue(field, reference.modelID)
+  // 默认模型同时绑定供应商，防止选择了 A 供应商的模型却继续沿用 B 供应商。
+  if (field.key === 'ai.default_model_id') {
+    draft['ai.default_provider_id'] = reference.providerID
+  }
+}
+
+const fallbackProviderOptions = computed(() => {
+  const current = String(systemDraft.modal_fallback_provider_id || '').trim()
+  const result = [{ label: '跟随主模型供应商', value: '' }, ...store.providers.map((item) => ({ label: item.name, value: item.id }))]
+  if (current && !result.some((item) => item.value === current)) result.push({ label: `当前值：${current}（供应商不存在）`, value: current })
+  return result
+})
+
+function fallbackPrimaryProviderID() {
+  const configured = String(systemDraft.modal_fallback_provider_id || '').trim()
+  if (configured) return configured
+  const profileProvider = String(currentProfile.value?.values?.['ai.default_provider_id'] || '').trim()
+  return store.defaults.provider_id || profileProvider || store.providers[0]?.id || ''
+}
+
+function isFallbackModelField(field: ConfigField) {
+  return field.key === 'modal_fallback_vision_model' || field.key === 'modal_fallback_audio_model'
+}
+
+function fallbackModelOptions(field: ConfigField) {
+  const current = systemTextValue(field).trim()
+  const selectedProvider = String(systemDraft.modal_fallback_provider_id || '').trim()
+  const primaryProvider = fallbackPrimaryProviderID()
+  const providerIDs = selectedProvider ? [selectedProvider] : primaryProvider ? [primaryProvider] : store.providers.map((item) => item.id)
+  const options = configuredModelOptions(store.providers).filter((item) => providerIDs.includes(item.providerID))
+  const result = [{ label: '未指定（收到附件时只提示，不调用降级模型）', value: '' }, ...options.map((item) => ({ label: item.label, value: item.value }))]
+  if (current && !options.some((item) => item.modelID === current)) {
+    result.push({ label: `当前值：${current}（目录外）`, value: makeModelReference('current', current) })
+  }
+  return result
+}
+
+function fallbackModelControlValue(field: ConfigField) {
+  const current = systemTextValue(field).trim()
+  if (!current) return ''
+  const options = fallbackModelOptions(field)
+  return options.find((item) => parseModelReference(item.value)?.modelID === current)?.value || makeModelReference('current', current)
+}
+
+function setFallbackProvider(value: unknown) {
+  const providerID = String(value || '')
+  systemDraft.modal_fallback_provider_id = providerID
+  // 切换供应商后清理不属于新目录的模型，避免保存一个看似有效但运行时找不到的组合。
+  const targetProviderID = providerID || fallbackPrimaryProviderID()
+  if (targetProviderID) {
+    const provider = store.providers.find((item) => item.id === targetProviderID)
+    const modelIDs = new Set((provider?.models || []).filter((item) => item.enabled !== false).map((item) => item.id))
+    for (const key of ['modal_fallback_vision_model', 'modal_fallback_audio_model']) {
+      const current = String(systemDraft[key] || '').trim()
+      if (current && !modelIDs.has(current)) systemDraft[key] = ''
+    }
+  }
+}
+
+function setFallbackModel(field: ConfigField, value: unknown) {
+  const reference = parseModelReference(String(value || ''))
+  if (!reference || reference.providerID === 'current') {
+    systemDraft[field.key] = reference?.modelID || ''
+    return
+  }
+  systemDraft[field.key] = reference.modelID
+  // 未指定供应商时，选择目录模型会自动锁定它所属的供应商，确保运行时路由一致。
+  if (!String(systemDraft.modal_fallback_provider_id || '').trim()) systemDraft.modal_fallback_provider_id = reference.providerID
 }
 
 function syncSystemDraft() {
@@ -103,6 +261,7 @@ function displayMatches(field: ConfigField) {
 
 function fieldOptions(field: ConfigField) {
   if (field.option_source === 'providers') return [{ label: '沿用供应商注册表默认', value: '' }, ...store.providers.map((item) => ({ label: item.name, value: item.id }))]
+  if (field.option_source === 'personas') return [{ label: '沿用默认人格', value: '' }, ...personas.value.filter((item) => item.enabled).map((item) => ({ label: item.name, value: item.id }))]
   return (field.options || []).map((item) => ({ label: item.label, value: item.value }))
 }
 
@@ -114,6 +273,7 @@ function setValue(field: ConfigField, value: unknown) {
 function resetDraft(profile?: ConfigProfile) {
   Object.keys(draft).forEach((key) => delete draft[key])
   Object.assign(draft, clone(profile?.values || {}) as Record<string, unknown>)
+  normalizeListDraft()
   profileName.value = profile?.name || ''
   jsonText.value = JSON.stringify(draft, null, 2)
   dirty.value = false
@@ -151,6 +311,7 @@ async function saveProfile() {
       const parsed = JSON.parse(jsonText.value) as Record<string, unknown>
       Object.keys(draft).forEach((key) => delete draft[key])
       Object.assign(draft, parsed)
+      normalizeListDraft()
     } catch (error) {
       message.error(`JSON 格式无效：${error instanceof Error ? error.message : '无法解析'}`)
       return
@@ -269,6 +430,12 @@ async function saveSystem() {
 
 onMounted(async () => {
   await store.loadAll()
+  // 人格选择器复用独立目录，配置文件本身只保存稳定 ID。
+  try {
+    personas.value = (await readPersonas()).personas || []
+  } catch {
+    personas.value = []
+  }
   selectedID.value = store.defaultProfileID || store.configProfiles[0]?.id || ''
   resetDraft(currentProfile.value)
   syncSystemDraft()
@@ -296,14 +463,16 @@ onMounted(async () => {
           <div class="config-editor-layout">
             <aside class="config-groups"><button v-for="item in groupItems" :key="item.key" type="button" :class="{ active: group === item.key }" @click="group = item.key">{{ item.label }}</button></aside>
             <section class="config-editor">
-              <div class="editor-view-tabs"><NButton size="small" :type="view === 'visual' ? 'primary' : 'default'" @click="view = 'visual'">可视化</NButton><NButton size="small" :type="view === 'json' ? 'primary' : 'default'" @click="jsonText = JSON.stringify(draft, null, 2); view = 'json'">JSON</NButton></div>
+              <div class="editor-view-tabs"><NButton size="small" :type="view === 'visual' ? 'primary' : 'default'" @click="view = 'visual'">可视化</NButton><NButton size="small" :type="view === 'json' ? 'primary' : 'default'" @click="jsonText = JSON.stringify(draft, null, 2); view = 'json'">JSON（高级）</NButton></div>
               <div v-if="view === 'visual'" class="field-list">
                 <div v-for="field in currentFields" :key="field.key" class="config-field-row">
                   <div class="field-copy"><strong>{{ field.label }}</strong><code>{{ field.key }}</code><span v-if="field.help">{{ field.help }}</span><NTag v-if="field.restart_required" size="small" type="warning">需重启</NTag></div>
                   <div class="field-control">
                     <NCheckbox v-if="field.type === 'boolean'" :checked="fieldValue(field) === true" @update:checked="setValue(field, $event)" />
+                    <NSelect v-else-if="isModelField(field)" :value="profileModelControlValue(field)" :options="profileModelOptions(field)" filterable clearable @update:value="setProfileModelValue(field, $event)" />
                     <NSelect v-else-if="field.type === 'select'" :value="String(fieldValue(field) ?? '')" :options="fieldOptions(field)" @update:value="setValue(field, $event)" />
                     <NInputNumber v-else-if="field.type === 'integer' || field.type === 'number'" :value="numberValue(field)" :min="field.min" :max="field.max" :step="field.type === 'number' ? 0.01 : 1" :show-button="false" @update:value="setValue(field, $event)" />
+                    <NDynamicTags v-else-if="field.type === 'list'" :value="listValue(field)" :closable="true" :input-props="{ placeholder: '输入后按 Enter 添加' }" @update:value="setListValue(field, $event)" />
                     <NInput v-else-if="field.type === 'textarea'" type="textarea" :value="textValue(field)" :autosize="{ minRows: 3, maxRows: 8 }" @update:value="setValue(field, $event)" />
                     <NInput v-else :value="textValue(field)" :type="field.secret ? 'password' : 'text'" @update:value="setValue(field, $event)" />
                   </div>
@@ -322,6 +491,8 @@ onMounted(async () => {
               <div class="field-copy"><strong>{{ field.label }}</strong><code>system.{{ field.key }}</code><span>{{ field.help }}</span><NTag v-if="field.restart_required" size="small" type="warning">需重启</NTag></div>
               <div class="field-control">
                 <NCheckbox v-if="field.type === 'boolean'" :checked="systemFieldValue(field) === true" @update:checked="setSystemValue(field, $event)" />
+                <NSelect v-else-if="field.key === 'modal_fallback_provider_id'" :value="String(systemFieldValue(field) ?? '')" :options="fallbackProviderOptions" @update:value="setFallbackProvider" />
+                <NSelect v-else-if="isFallbackModelField(field)" :value="fallbackModelControlValue(field)" :options="fallbackModelOptions(field)" filterable clearable @update:value="setFallbackModel(field, $event)" />
                 <NSelect v-else-if="field.type === 'select'" :value="String(systemFieldValue(field) ?? '')" :options="field.options || []" @update:value="setSystemValue(field, $event)" />
                 <NInputNumber v-else-if="field.type === 'integer' || field.type === 'number'" :value="systemNumberValue(field)" :min="field.min" :max="field.max" :step="field.type === 'number' ? 0.01 : 1" :show-button="false" @update:value="setSystemValue(field, $event)" />
                 <NInput v-else :value="systemTextValue(field)" :type="field.secret ? 'password' : 'text'" @update:value="setSystemValue(field, $event)" />

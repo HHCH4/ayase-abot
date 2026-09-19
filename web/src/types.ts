@@ -187,6 +187,8 @@ export interface StatusSummary {
 export interface Conversation {
   id: string
   user_id: string
+  source?: string
+  source_name?: string
   workspace_id?: string
   title: string
   status: 'active' | 'archived' | string
@@ -448,7 +450,7 @@ export interface ConfigField {
   key: string
   group: string
   label: string
-  type: 'boolean' | 'integer' | 'number' | 'string' | 'textarea' | 'select' | string
+  type: 'boolean' | 'integer' | 'number' | 'string' | 'textarea' | 'list' | 'select' | string
   default?: unknown
   required?: boolean
   min?: number
@@ -481,6 +483,107 @@ export interface ConfigRevision {
   revision: number
   values: ConfigValues
   created_at?: string
+}
+
+export interface Persona {
+  id: string
+  name: string
+  description?: string
+  instruction: string
+  revision: number
+  is_default: boolean
+  enabled: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+export interface PersonaRevision {
+  persona_id: string
+  revision: number
+  name: string
+  description?: string
+  instruction: string
+  enabled: boolean
+  created_at?: string
+}
+
+export interface SessionRule {
+  source: string
+  process_enabled: boolean
+  llm_enabled: boolean
+  tts_enabled: boolean
+  note?: string
+  chat_model?: string
+  stt_model?: string
+  tts_model?: string
+  follow_profile: boolean
+  profile_id?: string
+  persona_id?: string
+  disabled_plugins?: string[]
+  knowledge_bases?: string[]
+  knowledge_top_k: number
+  knowledge_rerank: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+export interface SessionRuleGroup {
+  id: string
+  name: string
+  description?: string
+  members: string[]
+  created_at?: string
+  updated_at?: string
+}
+
+export type ScheduledTaskMode = 'once' | 'interval' | 'daily' | 'weekly' | 'monthly' | 'custom' | string
+
+export interface ScheduledTask {
+  id: string
+  name: string
+  request: string
+  mode: ScheduledTaskMode
+  start_at?: string
+  interval_seconds?: number
+  weekday?: number
+  month_day?: number
+  time_of_day?: string
+  cron?: string
+  user_id: string
+  conversation_id?: string
+  adapter_id?: string
+  chat_id?: string
+  status: 'active' | 'paused' | 'completed' | string
+  next_run_at?: string
+  last_run_at?: string
+  last_invocation_id?: string
+  last_error?: string
+  running: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+export interface DashboardStats {
+  range_days: number
+  overview: {
+    invocation_count: number
+    message_count: number
+    model_calls: number
+    total_tokens: number
+    success_count: number
+    failed_count: number
+    avg_response_ms: number
+  }
+  message_trend: { date: string; messages: number }[]
+  model_ranking: { model: string; calls: number; tokens: number; success_rate: number }[]
+  platform_instances: number
+}
+
+export interface DataLogEntry {
+  time: string
+  level: string
+  message: string
+  attributes?: Record<string, string>
 }
 
 export interface SystemSettings {

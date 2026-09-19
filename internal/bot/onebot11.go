@@ -230,12 +230,19 @@ func (p *oneBotPlatform) authorizeReverseRequest(request *http.Request) bool {
 // consumeConnection 读取一个 OneBot 连接；心跳、生命周期事件和动作响应不会进入 Agent。
 func (p *oneBotPlatform) consumeConnection(ctx context.Context, conn *websocket.Conn, handler Handler) error {
 	for {
-		var event oneBotEvent
-		if err := conn.ReadJSON(&event); err != nil {
+		// 先读取原始 WebSocket 帧并打印，再解析事件，确保消息和动作响应不会因结构体字段不足而丢失。
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			return err
+		}
+		slog.Info("OneBot WebSocket 响应", "adapter_id", p.bot.ID, "payload", string(payload))
+		var event oneBotEvent
+		if err := json.Unmarshal(payload, &event); err != nil {
+			slog.Error("OneBot WebSocket 响应解析失败", "adapter_id", p.bot.ID, "payload", string(payload), "error", err)
+			continue
 		}
 		if event.PostType != "message" {
 			continue
@@ -305,9 +312,12 @@ func (p *oneBotPlatform) Send(ctx context.Context, message Message, text string)
 			params["user_id"] = oneBotIDValue(message.ChatID)
 		}
 		action := map[string]any{"action": "send_msg", "params": params, "echo": fmt.Sprintf("abot-%d", time.Now().UnixNano())}
+		// 记录发给 OneBot 的完整动作；对应的异步响应由 consumeConnection 原文记录。
+		slog.Info("OneBot WebSocket 请求", "adapter_id", p.bot.ID, "action", action)
 		p.mu.Lock()
 		if p.conn == nil {
 			p.mu.Unlock()
+			slog.Error("OneBot WebSocket 请求失败", "adapter_id", p.bot.ID, "action", action, "error", ErrNotRunning)
 			return ErrNotRunning
 		}
 		conn = p.conn
@@ -315,6 +325,7 @@ func (p *oneBotPlatform) Send(ctx context.Context, message Message, text string)
 		err := conn.WriteJSON(action)
 		p.mu.Unlock()
 		if err != nil {
+			slog.Error("OneBot WebSocket 请求失败", "adapter_id", p.bot.ID, "action", action, "error", err)
 			return fmt.Errorf("OneBot 发送消息失败: %w", err)
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"net/url"
@@ -458,6 +459,8 @@ func (p *telegramPlatform) call(ctx context.Context, method string, payload map[
 	if err != nil {
 		return fmt.Errorf("Telegram 请求编码失败: %w", err)
 	}
+	// Telegram 请求和响应都保留原文，便于排查平台协议、参数和返回值问题。
+	slog.Info("Telegram 请求", "adapter_id", p.bot.ID, "method", method, "endpoint", endpoint, "payload", string(body))
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
 	if err != nil {
 		return fmt.Errorf("Telegram 请求创建失败: %w", err)
@@ -465,13 +468,28 @@ func (p *telegramPlatform) call(ctx context.Context, method string, payload map[
 	request.Header.Set("Content-Type", "application/json")
 	response, err := p.client.Do(request)
 	if err != nil {
+		slog.Error("Telegram 请求失败", "adapter_id", p.bot.ID, "method", method, "endpoint", endpoint, "payload", string(body), "error", err)
 		return fmt.Errorf("Telegram API 请求失败: %w", err)
 	}
 	defer response.Body.Close()
+	const responseLimit = 8 << 20
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, responseLimit+1))
+	truncated := len(responseBody) > responseLimit
+	if truncated {
+		responseBody = responseBody[:responseLimit]
+	}
+	// 先记录完整可读响应，再按原有协议规则处理状态码和 JSON。
+	slog.Info("Telegram 响应", "adapter_id", p.bot.ID, "method", method, "endpoint", endpoint, "status", response.StatusCode, "body", string(responseBody), "body_truncated", truncated)
+	if readErr != nil {
+		return fmt.Errorf("读取 Telegram API 响应失败: %w", readErr)
+	}
+	if truncated {
+		return fmt.Errorf("Telegram API 响应超过 %d MB", responseLimit>>20)
+	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("Telegram API 返回 HTTP %d", response.StatusCode)
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(target); err != nil {
+	if err := json.Unmarshal(responseBody, target); err != nil {
 		return fmt.Errorf("Telegram API 响应无效: %w", err)
 	}
 	return nil

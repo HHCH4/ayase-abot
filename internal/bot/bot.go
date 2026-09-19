@@ -307,8 +307,14 @@ type Manager struct {
 	commands *CommandRegistry
 	// commandRuntimeInfo/Admin are optional configuration read/write hooks
 	// installed by the application after construction.
-	commandRuntimeInfo  CommandRuntimeInfo
-	commandRuntimeAdmin CommandRuntimeAdmin
+	commandRuntimeInfo      CommandRuntimeInfo
+	commandRuntimeAdmin     CommandRuntimeAdmin
+	commandRuntimeStats     CommandRuntimeStats
+	commandDashboardUpdater CommandDashboardUpdater
+	// messageConfigResolver 读取平台级管理员和唤醒配置；未装配时保持嵌入式旧行为。
+	messageConfigResolver MessageConfigResolver
+	// sourceNames 是没有持久化扩展的嵌入方的安全兜底；生产 SQLite 会优先使用数据库。
+	sourceNames map[string]string
 }
 
 type runtimeEntry struct {
@@ -346,6 +352,7 @@ func NewManager(ctx context.Context, repository Repository, kernel *agent.Kernel
 		activeConversations: make(map[string]string), activeInvocations: make(map[string]string), observedInvocations: make(map[string]struct{}), pendingApprovals: make(map[string][]approvalTicket),
 		progressInterval: 30 * time.Second,
 		commands:         commands,
+		sourceNames:      make(map[string]string),
 	}
 	for _, item := range items {
 		if item.Status == "" {
@@ -799,9 +806,20 @@ func (m *Manager) Send(ctx context.Context, message Message, text string) error 
 	entry, ok := m.runtimes[message.AdapterID]
 	m.mu.RUnlock()
 	if !ok {
+		// 连接不存在时也记录完整响应正文，便于定位“生成成功但没有发出”的问题。
+		slog.Error("机器人发送响应失败", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "text", text, "error", ErrNotRunning)
 		return ErrNotRunning
 	}
-	return entry.platform.Send(ctx, message, text)
+	// 发送前记录完整响应正文，确保普通回复、指令回复和主动投递走同一条日志链路。
+	slog.Info("机器人发送响应", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_type", message.ChatType, "chat_id", message.ChatID, "user_id", message.UserID, "message_id", message.ID, "text", text, "text_length", len([]rune(text)))
+	if err := entry.platform.Send(ctx, message, text); err != nil {
+		// 发送失败仍带上原始正文，便于区分平台拒绝、连接断开和内容生成问题。
+		slog.Error("机器人发送响应失败", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "text", text, "error", err)
+		return err
+	}
+	// 成功日志单独记录结果，便于检索一条响应是否真正交给平台。
+	slog.Info("机器人发送响应成功", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "text_length", len([]rune(text)))
+	return nil
 }
 
 func (m *Manager) bindingLock(id string) *sync.Mutex {

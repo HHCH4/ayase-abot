@@ -31,9 +31,13 @@ const (
 
 // Conversation 保存对话元数据；WorkspaceID 为空表示普通对话。
 type Conversation struct {
-	ID          string `json:"id"`
-	AppName     string `json:"app_name"`
-	UserID      string `json:"user_id"`
+	ID      string `json:"id"`
+	AppName string `json:"app_name"`
+	UserID  string `json:"user_id"`
+	// Source 保存平台消息的稳定来源标识，供会话规则按 UMO 命中；普通 WebUI 对话为空。
+	Source string `json:"source,omitempty"`
+	// SourceName 是 /name 为平台来源设置的可读别名；它不改变稳定来源键。
+	SourceName  string `json:"source_name,omitempty"`
 	WorkspaceID string `json:"workspace_id,omitempty"`
 	// ProviderID and ModelID are an optional per-conversation model override.
 	// Empty means "inherit whatever the configuration bindings resolve", so a
@@ -69,6 +73,7 @@ type CreateRequest struct {
 	ID          string
 	AppName     string
 	UserID      string
+	Source      string
 	WorkspaceID string
 	Title       string
 }
@@ -89,6 +94,11 @@ type TotalCounter interface {
 	CountAll(context.Context, bool) (int, error)
 }
 
+// SourceNameResolver 是会话列表读取来源别名的可选边界，避免会话包依赖 Bot 实现。
+type SourceNameResolver interface {
+	GetSourceName(context.Context, string) (string, error)
+}
+
 // Service 管理对话与 ADK Session 的关系。Conversation ID 与 ADK Session ID 一致，
 // 这样可以保证删除对话时能准确清理底层消息事件。
 type Service struct {
@@ -97,7 +107,9 @@ type Service struct {
 	appName            string
 	artifactDeletion   func(context.Context, string) error
 	workspaceValidator WorkspaceValidator
+	sourceNameResolver SourceNameResolver
 	mu                 sync.Mutex
+	sourceNameMu       sync.RWMutex
 }
 
 // NewService 创建对话服务。
@@ -119,13 +131,29 @@ func (s *Service) SetArtifactDeletionHook(hook func(context.Context, string) err
 	s.artifactDeletion = hook
 }
 
+// SetSourceNameResolver 让管理台读取 /name 的来源别名；未安装时保持原有会话结构不变。
+func (s *Service) SetSourceNameResolver(resolver SourceNameResolver) {
+	s.sourceNameMu.Lock()
+	s.sourceNameResolver = resolver
+	s.sourceNameMu.Unlock()
+}
+
 // List 列出用户的对话；workspaceID 为空时列出普通对话，传入 "*" 时列出所有对话。
 func (s *Service) List(ctx context.Context, userID, workspaceID string, includeArchived bool) ([]Conversation, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
 		return nil, fmt.Errorf("%w: user_id 不能为空", ErrInvalidRequest)
 	}
-	return s.repository.List(ctx, userID, strings.TrimSpace(workspaceID), includeArchived)
+	items, err := s.repository.List(ctx, userID, strings.TrimSpace(workspaceID), includeArchived)
+	if err != nil {
+		return nil, err
+	}
+	for index := range items {
+		if err := s.enrichSourceName(ctx, &items[index]); err != nil {
+			return nil, err
+		}
+	}
+	return items, nil
 }
 
 // CountByWorkspace 返回工作区中仍保留的对话数，活跃和已归档都计算在内。
@@ -160,6 +188,9 @@ func (s *Service) Get(ctx context.Context, userID, id string) (Conversation, err
 	if item.AppName == "" {
 		item.AppName = s.appName
 	}
+	if err := s.enrichSourceName(ctx, &item); err != nil {
+		return Conversation{}, err
+	}
 	return item, nil
 }
 
@@ -171,6 +202,7 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (Conversati
 	}
 	request.UserID = strings.TrimSpace(request.UserID)
 	request.ID = strings.TrimSpace(request.ID)
+	request.Source = strings.TrimSpace(request.Source)
 	request.WorkspaceID = strings.TrimSpace(request.WorkspaceID)
 	request.Title = strings.TrimSpace(request.Title)
 	if request.UserID == "" {
@@ -185,7 +217,7 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (Conversati
 	now := time.Now().UTC()
 	item := Conversation{
 		ID: request.ID, AppName: request.AppName, UserID: request.UserID,
-		WorkspaceID: request.WorkspaceID, Title: request.Title,
+		Source: request.Source, WorkspaceID: request.WorkspaceID, Title: request.Title,
 		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
 	}
 	if s.sessions != nil {
@@ -199,7 +231,29 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (Conversati
 		}
 		return Conversation{}, err
 	}
+	if err := s.enrichSourceName(ctx, &item); err != nil {
+		return Conversation{}, err
+	}
 	return item, nil
+}
+
+// enrichSourceName 只补充展示字段，任何持久化写入仍以 Source 稳定键为准。
+func (s *Service) enrichSourceName(ctx context.Context, item *Conversation) error {
+	if s == nil || item == nil || strings.TrimSpace(item.Source) == "" {
+		return nil
+	}
+	s.sourceNameMu.RLock()
+	resolver := s.sourceNameResolver
+	s.sourceNameMu.RUnlock()
+	if resolver == nil {
+		return nil
+	}
+	name, err := resolver.GetSourceName(ctx, item.Source)
+	if err != nil {
+		return fmt.Errorf("读取来源显示名称失败: %w", err)
+	}
+	item.SourceName = strings.TrimSpace(name)
+	return nil
 }
 
 // Messages 读取对话历史，归档对话仍然允许查看，但已删除对话无法读取。

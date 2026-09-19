@@ -53,6 +53,8 @@ const (
 	AuditModelSwitch      = "model_switch"
 	AuditPersonaSwitch    = "persona_switch"
 	AuditWorkspaceBinding = "workspace_binding"
+	AuditSourceName       = "source_name_update"
+	AuditDashboardUpdate  = "dashboard_update"
 	AuditCommandPolicy    = "command_policy"
 	AuditCommandDenied    = "command_denied"
 )
@@ -293,7 +295,7 @@ func (m *Manager) authorizeCommand(ctx context.Context, bot Bot, message Message
 	authorization := commandAuthorization{
 		Command:     command,
 		IsGroup:     isGroup,
-		GlobalAdmin: isGlobalAdmin(bot, message.UserID),
+		GlobalAdmin: m.globalAdminForMessage(ctx, bot, message),
 		Arg:         arg,
 	}
 	authorization.Permission = requiredPermissionInChat(command.Permission, isGroup)
@@ -317,6 +319,8 @@ func (m *Manager) authorizeCommand(ctx context.Context, bot Bot, message Message
 func helpTextFor(commands []EffectiveCommand, isGroup, globalAdmin, groupAdmin bool) string {
 	var builder strings.Builder
 	builder.WriteString("可用命令：")
+	hiddenCount := 0
+	approvalUsage := make([]string, 0, 2)
 	for _, command := range commands {
 		if !command.Enabled {
 			continue
@@ -326,14 +330,30 @@ func helpTextFor(commands []EffectiveCommand, isGroup, globalAdmin, groupAdmin b
 			(required == PermissionGroupAdmin && (groupAdmin || globalAdmin)) ||
 			(required == PermissionGlobalAdmin && globalAdmin)
 		if !granted {
+			hiddenCount++
 			continue
 		}
 		builder.WriteString("\n/")
 		builder.WriteString(command.Name)
 		builder.WriteString("  ")
 		builder.WriteString(command.Description)
+		switch command.ID {
+		case "approve":
+			approvalUsage = append(approvalUsage, "/approve 序号 批准")
+		case "reject":
+			approvalUsage = append(approvalUsage, "/reject 序号 拒绝")
+		}
 	}
-	builder.WriteString("\n\n审批：/approve 序号 批准，/reject 序号 拒绝。")
+	if hiddenCount > 0 {
+		// 不向普通用户泄露受限命令名称，但明确说明帮助不是完整目录，避免误以为指令不存在。
+		builder.WriteString(fmt.Sprintf("\n\n另有 %d 条管理员指令未显示；请在 WebUI 配置全局管理员 UID。", hiddenCount))
+	}
+	if len(approvalUsage) > 0 {
+		// 只有当前调用者确实能执行且指令仍启用时才展示审批用法，避免帮助文本泄露或引用停用指令。
+		builder.WriteString("\n\n审批：")
+		builder.WriteString(strings.Join(approvalUsage, "，"))
+		builder.WriteString("。")
+	}
 	return builder.String()
 }
 

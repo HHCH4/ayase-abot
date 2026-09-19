@@ -3,7 +3,7 @@ import { computed, reactive, ref } from 'vue'
 import { NAlert, NButton, NCard, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, NSpace, NTag, useMessage } from 'naive-ui'
 import { request } from '@/api'
 import { useAppStore } from '@/stores/app'
-import type { CapabilityObservationRecord, CapabilityProbeResult, Provider, ProviderModel } from '@/types'
+import type { CapabilityObservationRecord, CapabilityProbeResult, ModelCapabilityProfile, Provider, ProviderModel } from '@/types'
 
 const store = useAppStore()
 const message = useMessage()
@@ -14,7 +14,12 @@ const discovering = ref(false)
 // 模型详情按行独立展开，默认不展示上下文和输出上限，避免目录列表过于拥挤。
 const expandedModels = reactive<Record<number, boolean>>({})
 const probingModels = reactive<Record<string, boolean>>({})
+const overridingCapabilities = reactive<Record<string, boolean>>({})
 const capabilityObservationHistory = reactive<Record<string, CapabilityObservationRecord[]>>({})
+const showDefaultModelEditor = ref(false)
+const defaultProviderID = ref('')
+const defaultModelID = ref('')
+const savingDefaultModel = ref(false)
 
 type ProviderForm = {
   id: string
@@ -52,6 +57,23 @@ const statusMap: Record<string, { label: string; type: 'success' | 'warning' | '
   configured: { label: '待测试', type: 'warning' },
 }
 const sortedProviders = computed(() => [...store.providers].sort((a, b) => a.name.localeCompare(b.name)))
+const defaultProvider = computed(() => store.providers.find((item) => item.id === defaultProviderID.value))
+const defaultModelOptions = computed(() => (defaultProvider.value?.models || [])
+  .filter((item) => item.enabled !== false)
+  .map((item) => ({ label: item.display_name || item.id, value: item.id })))
+const supportOverrideOptions = [
+  { label: '支持（手动）', value: 'supported' },
+  { label: '部分支持（手动）', value: 'degraded' },
+  { label: '不支持（手动）', value: 'unsupported' },
+  { label: '未知（手动）', value: 'unknown' },
+]
+
+type CapabilityFeature = 'images' | 'audio' | 'input_files'
+const capabilityFeatures: { key: CapabilityFeature; label: string }[] = [
+  { key: 'images', label: '图片' },
+  { key: 'audio', label: '音频' },
+  { key: 'input_files', label: '文件' },
+]
 
 function statusOf(provider: Provider) {
   return statusMap[provider.status] || { label: provider.status || '未知', type: 'default' as const }
@@ -116,6 +138,35 @@ function supportType(value?: { state?: string }): 'success' | 'warning' | 'error
   if (value?.state === 'unsupported') return 'error'
   if (value?.state === 'degraded') return 'warning'
   return 'default'
+}
+
+function capabilityState(model: ProviderModel, feature: CapabilityFeature) {
+  return model.capabilities?.[feature]?.state || 'unknown'
+}
+
+function capabilityOverrideKey(model: ProviderModel, feature: CapabilityFeature) {
+  return `${editingID.value}:${model.id}:${feature}`
+}
+
+async function setManualCapability(model: ProviderModel, feature: CapabilityFeature, state: string) {
+  const providerID = editingID.value.trim()
+  const modelID = model.id.trim()
+  if (!providerID || !modelID) return
+  const key = capabilityOverrideKey(model, feature)
+  overridingCapabilities[key] = true
+  try {
+    const profile = await request<ModelCapabilityProfile>(`/api/v1/providers/${encodeURIComponent(providerID)}/models/${encodeURIComponent(modelID)}/capability-overrides`, {
+      method: 'PUT',
+      body: JSON.stringify({ [feature]: state, manual: true }),
+    })
+    model.capabilities = profile
+    await store.reloadProviders()
+    message.success(`${feature === 'images' ? '图片' : feature === 'audio' ? '音频' : '文件'}能力已按手动选择保存`)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '保存模型能力选择失败')
+  } finally {
+    delete overridingCapabilities[key]
+  }
 }
 
 function observationHistoryFor(modelID: string) {
@@ -240,16 +291,32 @@ async function test(provider: Provider) {
   }
 }
 
-async function setDefault(provider: Provider) {
-  const suggested = provider.models?.find((item) => item.enabled)?.id || ''
-  const modelID = window.prompt('请输入该供应商的默认模型 ID', suggested)
-  if (!modelID?.trim()) return
+function setDefault(provider: Provider) {
+  const firstModel = provider.models?.find((item) => item.enabled !== false)
+  if (!firstModel) {
+    message.warning('该供应商还没有启用模型，请先在模型目录中添加或获取模型')
+    return
+  }
+  defaultProviderID.value = provider.id
+  const current = provider.models?.find((item) => item.enabled !== false && item.id === store.defaults.model_id)
+  defaultModelID.value = store.defaults.provider_id === provider.id && current ? current.id : firstModel.id
+  showDefaultModelEditor.value = true
+}
+
+async function saveDefaultModel() {
+  const providerID = defaultProviderID.value.trim()
+  const modelID = defaultModelID.value.trim()
+  if (!providerID || !modelID) return
+  savingDefaultModel.value = true
   try {
-    await request('/api/v1/settings/default-model', { method: 'PUT', body: JSON.stringify({ provider_id: provider.id, model_id: modelID.trim() }) })
+    await request('/api/v1/settings/default-model', { method: 'PUT', body: JSON.stringify({ provider_id: providerID, model_id: modelID }) })
     await store.reloadProviders()
+    showDefaultModelEditor.value = false
     message.success('默认模型已更新')
   } catch (error) {
     message.error(error instanceof Error ? error.message : '设置默认模型失败')
+  } finally {
+    savingDefaultModel.value = false
   }
 }
 
@@ -316,6 +383,16 @@ async function remove(provider: Provider) {
       </NCard>
     </div>
 
+    <NModal v-model:show="showDefaultModelEditor" preset="card" style="width: min(520px, calc(100vw - 32px))" title="选择默认模型" :mask-closable="false">
+      <NForm label-placement="top" :show-feedback="false">
+        <NFormItem label="供应商"><NInput :value="defaultProvider?.name || defaultProviderID" disabled /></NFormItem>
+        <NFormItem label="默认模型" required>
+          <NSelect v-model:value="defaultModelID" :options="defaultModelOptions" filterable placeholder="选择已配置模型" />
+        </NFormItem>
+      </NForm>
+      <template #footer><div class="modal-footer"><NButton @click="showDefaultModelEditor = false">取消</NButton><NButton type="primary" :loading="savingDefaultModel" @click="saveDefaultModel">保存</NButton></div></template>
+    </NModal>
+
     <NModal v-model:show="showEditor" preset="card" style="width: min(900px, calc(100vw - 32px))" :title="editingID ? '编辑供应商' : '添加供应商'" :mask-closable="false">
       <NForm label-placement="top" :show-feedback="false">
         <div class="form-grid-2">
@@ -349,11 +426,11 @@ async function remove(provider: Provider) {
           <div class="section-heading-row">
             <div>
               <h3>模型目录</h3>
-              <p>可以在线获取，也可以手动维护目录外模型的 ID。</p>
+              <p>可以在线获取或维护目录；保存后，配置中心、会话规则和多模态降级都会直接复用这里的模型。</p>
             </div>
             <NButton secondary :loading="discovering" @click="discoverModels">获取可用模型</NButton>
           </div>
-          <div v-if="!form.models.length" class="inline-empty">还没有模型目录，保存后仍可在 chat 中手动输入模型 ID。</div>
+          <div v-if="!form.models.length" class="inline-empty">还没有模型目录，请先获取或添加模型；其他页面会自动提供选择。</div>
           <div v-for="(model, index) in form.models" :key="`${model.id}-${index}`" class="model-row">
             <div class="model-row-main">
               <NInput v-model:value="model.id" placeholder="模型 ID" />
@@ -385,6 +462,14 @@ async function remove(provider: Provider) {
                   <span class="model-capability-source">{{ model.capabilities.route || model.capabilities.protocol }} · {{ model.capabilities.tool_calling.source || 'unknown source' }}</span>
                 </div>
                 <span v-else class="model-capability-empty">尚无探测结果，运行一次只读能力探测即可建立证据。</span>
+                <div class="model-capability-overrides">
+                  <span class="model-capability-overrides-title">手动选择（覆盖探测结果）</span>
+                  <label v-for="item in capabilityFeatures" :key="item.key" class="model-capability-override">
+                    <span>{{ item.label }}</span>
+                    <NSelect size="small" :value="capabilityState(model, item.key)" :options="supportOverrideOptions" :loading="overridingCapabilities[capabilityOverrideKey(model, item.key)] === true" @update:value="setManualCapability(model, item.key, $event)" />
+                  </label>
+                  <small>探测为未知时也可以直接选“支持”；选择会记录为管理员配置，不会被后续探测覆盖。</small>
+                </div>
                 <div v-if="observationHistoryFor(model.id).length" class="model-capability-history">
                   <span class="model-capability-history-title">最近证据</span>
                   <span v-for="observation in observationHistoryFor(model.id).slice(0, 3)" :key="observation.id" class="model-capability-history-item">{{ observation.feature }} · {{ supportLabel(observation) }}</span>

@@ -20,7 +20,6 @@ const conversationMessages = ref<ConversationMessage[]>([])
 const contextStatus = ref<ConversationContextStatus>({ compressed: false, compaction_count: 0 })
 const inputText = ref('')
 const attachments = ref<ChatAttachment[]>([])
-const manualModelID = ref('')
 const selectedModel = ref('')
 const providerID = ref('')
 const profileID = ref('')
@@ -87,13 +86,16 @@ const profileOptions = computed(() => [{ label: '使用系统默认配置', valu
 const providerOptions = computed(() => store.providers.map((item) => ({ label: item.name, value: item.id })))
 const modelOptions = computed(() => {
   const provider = store.providers.find((item) => item.id === providerID.value)
-  return [...(provider?.models || []).filter((item) => item.enabled).map((item) => ({ label: item.display_name || item.id, value: item.id })), { label: '手动输入目录外模型…', value: '__manual__' }]
+  const options = (provider?.models || []).filter((item) => item.enabled).map((item) => ({ label: item.display_name || item.id, value: item.id }))
+  if (selectedModel.value && !options.some((item) => item.value === selectedModel.value)) {
+    // 兼容旧配置中的目录外模型，但不再把用户引导到另一个手动输入框。
+    options.unshift({ label: `当前配置模型 · ${selectedModel.value}`, value: selectedModel.value })
+  }
+  return options
 })
 const modelSelectValue = computed({
-  get: () => modelOptions.value.some((item) => item.value === selectedModel.value) ? selectedModel.value : '__manual__',
-  set: (value: string) => {
-    selectedModel.value = value === '__manual__' ? manualModelID.value : value
-  },
+  get: () => selectedModel.value,
+  set: (value: string) => { selectedModel.value = value || '' },
 })
 // 顶栏只做模型切换：首项是"跟随默认"，另外把目录外的当前模型也列进来，避免显示成占位文案。
 const defaultModelLabel = computed(() => {
@@ -104,7 +106,7 @@ const defaultModelLabel = computed(() => {
   return `默认模型 · ${model?.display_name || id}`
 })
 const topbarModelOptions = computed(() => {
-  const options = modelOptions.value.filter((item) => item.value !== '__manual__')
+  const options = modelOptions.value
   const current = selectedModel.value
   const followDefault = { label: defaultModelLabel.value, value: '' }
   if (current && !options.some((item) => item.value === current)) return [followDefault, { label: current, value: current }, ...options]
@@ -112,7 +114,7 @@ const topbarModelOptions = computed(() => {
 })
 const topbarModelValue = computed<string | null>({
   // 空字符串在 naive-ui 里算"已选择"，所以必须有一个 value 为空串的选项来承接它。
-  get: () => (selectedModel.value && selectedModel.value !== '__manual__' ? selectedModel.value : ''),
+  get: () => selectedModel.value || '',
   set: (value: string | null) => { selectedModel.value = value || '' },
 })
 const currentModelLabel = computed(() => {
@@ -202,11 +204,9 @@ function applyProfile(id = profileID.value) {
   const nextModel = typeof values['ai.default_model_id'] === 'string' ? values['ai.default_model_id'] : store.defaults.model_id || ''
   if (nextModel) {
     selectedModel.value = nextModel
-    manualModelID.value = nextModel
   } else {
     // 切换到没有默认模型的配置时清掉旧值，避免把上一份配置的模型带入当前对话。
     selectedModel.value = ''
-    manualModelID.value = ''
   }
 }
 
@@ -481,7 +481,7 @@ async function scrollToBottom() {
 
 async function send() {
   const text = inputText.value.trim()
-  const model = selectedModel.value === '__manual__' ? manualModelID.value.trim() : selectedModel.value.trim()
+  const model = selectedModel.value.trim()
   const item = selectedConversation.value
   if ((!text && !attachments.value.length) || !item || item.status !== 'active' || !model || sending.value) return
   const outgoing = attachments.value.map((item) => ({ ...item }))
@@ -550,9 +550,9 @@ watch(() => route.query.conversation, (value) => {
   }
 })
 watch(providerID, () => {
-  // 只回落到目录里的真实模型；'__manual__' 是设置面板的输入态，不该被写进当前模型。
-  const catalog = modelOptions.value.filter((item) => item.value !== '__manual__')
-  if (!catalog.some((item) => item.value === selectedModel.value)) selectedModel.value = catalog[0]?.value || ''
+  // 切换供应商后只回落到该供应商已启用的模型目录，避免把旧供应商的 ID 带到新路由。
+  const catalog = (store.providers.find((item) => item.id === providerID.value)?.models || []).filter((item) => item.enabled)
+  if (!catalog.some((item) => item.id === selectedModel.value)) selectedModel.value = catalog[0]?.id || ''
 })
 watch(userID, async () => {
   await store.reloadConversations(userID.value)
@@ -564,7 +564,6 @@ onMounted(async () => {
   if (!store.conversations.length) await store.reloadConversations(userID.value)
   providerID.value = store.defaults.provider_id || store.providers[0]?.id || ''
   selectedModel.value = store.defaults.model_id || ''
-  manualModelID.value = selectedModel.value
   profileID.value = ''
   applyProfile('')
   await ensureConversation()
@@ -832,7 +831,7 @@ onMounted(async () => {
             </div>
             <button type="button" class="settings-provider-add" @click="openProviderDialog(null)">＋ 添加供应商</button>
           </div>
-          <NFormItem label="模型"><NSelect v-model:value="modelSelectValue" :options="modelOptions" placeholder="选择或手动输入模型" /><NInput v-if="modelSelectValue === '__manual__'" v-model:value="manualModelID" class="manual-model-input" placeholder="目录外模型 ID" /></NFormItem>
+          <NFormItem label="模型"><NSelect v-model:value="modelSelectValue" :options="modelOptions" placeholder="选择已配置模型" /></NFormItem>
           <NFormItem label="用户 ID"><NInput v-model:value="userID" /></NFormItem>
         </NForm>
         <NAlert v-if="statusText" :type="statusTagType" :show-icon="false">{{ statusText }}</NAlert>

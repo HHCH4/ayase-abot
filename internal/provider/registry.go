@@ -64,6 +64,23 @@ func (r *Registry) Refresh(ctx context.Context) error {
 		item.Protocol = normalizeProtocol(item.Protocol)
 		items[item.ID] = cloneProvider(item)
 	}
+	// 兼容旧版本把默认模型只保存到 settings、没有写入模型目录的配置。
+	// 先把这个稳定引用补回目录，后续 WebUI 才能为它展示能力选择，运行时也不会
+	// 因为缺少目录元数据而把图片能力误判成未知。这里只补默认引用，不猜测任何能力。
+	if defaults.ProviderID != "" && defaults.ModelID != "" {
+		if item, ok := items[defaults.ProviderID]; ok && modelByID(item.Models, defaults.ModelID).ID == "" {
+			item.Models = append(item.Models, Model{
+				ID: defaults.ModelID, DisplayName: defaults.ModelID, Enabled: true, Source: "manual",
+			})
+			if err := item.Validate(); err != nil {
+				return fmt.Errorf("迁移旧默认模型 %q 失败: %w", defaults.ModelID, err)
+			}
+			if err := r.repo.Save(ctx, item); err != nil {
+				return fmt.Errorf("保存迁移后的默认模型目录失败: %w", err)
+			}
+			items[item.ID] = cloneProvider(item)
+		}
+	}
 	r.mu.Lock()
 	r.providers = items
 	r.defaults = defaults
@@ -196,15 +213,21 @@ func (r *Registry) Delete(ctx context.Context, id string) error {
 	return r.Refresh(ctx)
 }
 
-// SetDefault 设置全局默认供应商和模型。目录为空时也允许直接使用手动模型 ID。
+// SetDefault 设置全局默认供应商和模型。默认模型必须来自已启用的供应商目录，
+// 这样配置页、能力覆盖和运行时解析使用的是同一个模型引用。
 func (r *Registry) SetDefault(ctx context.Context, ref DefaultRef) error {
 	ref.ProviderID = strings.TrimSpace(ref.ProviderID)
 	ref.ModelID = strings.TrimSpace(ref.ModelID)
 	if ref.ProviderID == "" || ref.ModelID == "" {
 		return fmt.Errorf("%w: 默认供应商和模型不能为空", ErrInvalidRequest)
 	}
-	if _, err := r.Get(ref.ProviderID); err != nil {
+	item, err := r.Get(ref.ProviderID)
+	if err != nil {
 		return err
+	}
+	model := modelByID(item.Models, ref.ModelID)
+	if model.ID == "" || !model.Enabled {
+		return fmt.Errorf("%w: 默认模型必须来自已启用的供应商模型目录", ErrNoModel)
 	}
 	if err := r.repo.SetDefault(ctx, ref); err != nil {
 		return fmt.Errorf("保存默认模型失败: %w", err)
@@ -343,10 +366,18 @@ func (r *Registry) DiscoverModelsForProvider(ctx context.Context, p Provider) ([
 	return adapter.DiscoverModels(ctx, candidate)
 }
 
-// ApplyCapabilityOverrides persists a conservative, model-scoped capability
-// override. The registry is the only writer so the in-memory model cache is
-// refreshed together with the durable provider catalog.
+// ApplyCapabilityOverrides 保存保守的模型级能力覆盖；注册表统一写入，保证内存缓存和持久化目录同时刷新。
 func (r *Registry) ApplyCapabilityOverrides(ctx context.Context, providerID, modelID string, overrides CapabilityOverrides) (Model, error) {
+	return r.applyCapabilityOverrides(ctx, providerID, modelID, overrides, false)
+}
+
+// ApplyManualCapabilityOverrides 保存管理员明确选择的模型能力；它与运行时保守接口分开，避免普通路径伪造探测证据。
+func (r *Registry) ApplyManualCapabilityOverrides(ctx context.Context, providerID, modelID string, overrides CapabilityOverrides) (Model, error) {
+	return r.applyCapabilityOverrides(ctx, providerID, modelID, overrides, true)
+}
+
+// applyCapabilityOverrides 统一完成模型查找、profile 更新和目录持久化，避免两个入口出现不同的保存行为。
+func (r *Registry) applyCapabilityOverrides(ctx context.Context, providerID, modelID string, overrides CapabilityOverrides, manual bool) (Model, error) {
 	providerID = strings.TrimSpace(providerID)
 	modelID = strings.TrimSpace(modelID)
 	item, err := r.Get(providerID)
@@ -363,7 +394,13 @@ func (r *Registry) ApplyCapabilityOverrides(ctx context.Context, providerID, mod
 			value := DefaultCapabilities(item, current)
 			profile = &value
 		}
-		effective, applyErr := ApplyCapabilityOverrides(*profile, overrides)
+		var effective ModelCapabilityProfile
+		var applyErr error
+		if manual {
+			effective, applyErr = ApplyManualCapabilityOverrides(*profile, overrides)
+		} else {
+			effective, applyErr = ApplyCapabilityOverrides(*profile, overrides)
+		}
 		if applyErr != nil {
 			return Model{}, applyErr
 		}

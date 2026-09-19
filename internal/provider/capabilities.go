@@ -447,7 +447,8 @@ func (p ModelCapabilityProfile) Validate() error {
 	return nil
 }
 
-func (o CapabilityOverrides) Validate() error {
+// validate 按调用场景校验能力选择；普通 override 保持收紧策略，管理界面的手动选择允许管理员明确声明能力。
+func (o CapabilityOverrides) validate(allowSupported bool) error {
 	for name, value := range map[string]*SupportState{
 		"tool_calling": o.ToolCalling, "parallel_tool_calls": o.ParallelToolCalls,
 		"structured_output": o.StructuredOutput, "structured_output_schema": o.StructuredOutputSchema, "streaming": o.Streaming,
@@ -460,15 +461,26 @@ func (o CapabilityOverrides) Validate() error {
 		}
 		switch *value {
 		case SupportUnsupported, SupportUnknown, SupportDegraded:
-			// These are all conservative directions. Supported is deliberately
-			// rejected below so a hand-edited profile cannot fake evidence.
+			// 这些状态不会产生超出模型能力的请求，普通 override 和手动选择都允许。
 		case SupportSupported:
-			return fmt.Errorf("%w: %s 不能通过 override 声明 supported", ErrInvalidCapabilityOverride, name)
+			if !allowSupported {
+				return fmt.Errorf("%w: %s 不能通过保守 override 声明 supported", ErrInvalidCapabilityOverride, name)
+			}
 		default:
 			return fmt.Errorf("%w: %s state 无效", ErrInvalidCapabilityOverride, name)
 		}
 	}
 	return nil
+}
+
+// Validate 保留运行时保守 override 的旧契约，避免普通运行路径伪造供应商证据。
+func (o CapabilityOverrides) Validate() error {
+	return o.validate(false)
+}
+
+// validateManual 供已授权的管理界面使用，允许管理员在探测结果 unknown 或错误时明确选择能力。
+func (o CapabilityOverrides) validateManual() error {
+	return o.validate(true)
 }
 
 // ApplyCapabilityOverrides returns a new effective profile and leaves the
@@ -478,11 +490,26 @@ func (o CapabilityOverrides) Validate() error {
 // field records user_override provenance so the UI and Invocation snapshot do
 // not mistake it for an adapter or probe fact.
 func ApplyCapabilityOverrides(profile ModelCapabilityProfile, overrides CapabilityOverrides) (ModelCapabilityProfile, error) {
+	return applyCapabilityOverrides(profile, overrides, false)
+}
+
+// ApplyManualCapabilityOverrides 应用管理界面的显式能力选择。
+// 这里的 user_override 是管理员配置，不冒充探测证据；后续请求会按该选择参与能力协商。
+func ApplyManualCapabilityOverrides(profile ModelCapabilityProfile, overrides CapabilityOverrides) (ModelCapabilityProfile, error) {
+	return applyCapabilityOverrides(profile, overrides, true)
+}
+
+// applyCapabilityOverrides 根据调用方是否为管理界面选择能力，决定是否允许把状态提升为 supported。
+func applyCapabilityOverrides(profile ModelCapabilityProfile, overrides CapabilityOverrides, manual bool) (ModelCapabilityProfile, error) {
 	profile = normalizeCapabilityProfile(profile)
 	if err := profile.Validate(); err != nil {
 		return ModelCapabilityProfile{}, err
 	}
-	if err := overrides.Validate(); err != nil {
+	if manual {
+		if err := overrides.validateManual(); err != nil {
+			return ModelCapabilityProfile{}, err
+		}
+	} else if err := overrides.Validate(); err != nil {
 		return ModelCapabilityProfile{}, err
 	}
 	result := profile
@@ -492,14 +519,18 @@ func ApplyCapabilityOverrides(profile ModelCapabilityProfile, overrides Capabili
 		if requested == nil {
 			return nil
 		}
-		if supportRank(*requested) > supportRank(current.State) {
+		if !manual && supportRank(*requested) > supportRank(current.State) {
 			return fmt.Errorf("%w: %s 只能收紧当前状态 %q", ErrInvalidCapabilityOverride, name, current.State)
 		}
 		current.State = *requested
 		current.Source = "user_override"
 		current.Confidence = 1
 		current.ObservedAt = now
-		current.Reason = "manual conservative override"
+		if manual {
+			current.Reason = "manual capability selection"
+		} else {
+			current.Reason = "manual conservative override"
+		}
 		changed = true
 		return nil
 	}

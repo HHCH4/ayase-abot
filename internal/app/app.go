@@ -24,10 +24,13 @@ import (
 	configsvc "Abot/internal/config"
 	"Abot/internal/conversation"
 	"Abot/internal/httpapi"
+	"Abot/internal/logging"
 	memorysvc "Abot/internal/memory"
 	"Abot/internal/provider"
 	"Abot/internal/provider/gemini"
 	"Abot/internal/provider/openai"
+	"Abot/internal/schedule"
+	"Abot/internal/sessionrule"
 	"Abot/internal/storage/sqlite"
 	"Abot/internal/workspace"
 	adkmemory "google.golang.org/adk/v2/memory"
@@ -48,7 +51,9 @@ func Run(opts bootstrap.Options) error {
 	// LevelVar 让系统设置页可以在不重启进程的情况下切换日志等级。
 	logLevel := new(slog.LevelVar)
 	logLevel.Set(parseLevel(opts.LogLevel))
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	// 管理台日志页读取有界的完整内存快照，终端与管理台展示同一份结构化日志。
+	logStore := logging.NewStore(2000)
+	logger := slog.New(logging.NewHandler(logStore, slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
 	slog.SetDefault(logger)
 
 	store, err := sqlite.Open(opts.DataDir)
@@ -99,6 +104,14 @@ func Run(opts bootstrap.Options) error {
 	if err := personaService.EnsureDefault(context.Background()); err != nil {
 		return err
 	}
+	sessionRuleService, err := sessionrule.NewService(store.SessionRuleRepository())
+	if err != nil {
+		return err
+	}
+	scheduleService, err := schedule.NewService(store.ScheduleRepository())
+	if err != nil {
+		return err
+	}
 	configService.SetSystemSettingsApplier(func(_ context.Context, settings configsvc.SystemSettings) error {
 		logLevel.Set(parseLevel(settings.LogLevel))
 		return applyArtifactMaintenancePolicy(artifactService, settings)
@@ -128,6 +141,10 @@ func Run(opts bootstrap.Options) error {
 	conversationService, err := conversation.NewService(store.ConversationRepository(), store.SessionService(), "abot")
 	if err != nil {
 		return err
+	}
+	// 会话列表复用 /name 的来源名称仓储，让聊天指令设置的别名能在 WebUI 中显示。
+	if sourceNames, ok := store.BotRepository().(conversation.SourceNameResolver); ok {
+		conversationService.SetSourceNameResolver(sourceNames)
 	}
 	conversationService.SetArtifactDeletionHook(artifactService.DeleteConversation)
 	// Chat commands may bind a workspace to a conversation; the conversation
@@ -384,13 +401,47 @@ func Run(opts bootstrap.Options) error {
 			}
 			// A per-conversation override wins over the resolved default, so a
 			// chat can switch models without changing the bot or global config.
+			source := conversationID
 			if item, getErr := conversationService.Get(ctx, userID, conversationID); getErr == nil {
+				if strings.TrimSpace(item.Source) != "" {
+					source = item.Source
+				}
 				if override := strings.TrimSpace(item.ProviderID); override != "" {
 					runtime.ProviderID = override
 				}
 				if override := strings.TrimSpace(item.ModelID); override != "" {
 					runtime.ModelID = override
 				}
+			}
+			// 会话规则优先于全局配置，但只能覆盖内置 Runtime 已支持的模型、人格和启停状态。
+			rule, found, ruleErr := sessionRuleService.Resolve(ctx, source)
+			if ruleErr == nil && !found && source != conversationID {
+				// 兼容旧会话：升级前没有 Source 字段时，仍允许直接用 conversation ID 配规则。
+				rule, found, ruleErr = sessionRuleService.Resolve(ctx, conversationID)
+			}
+			if ruleErr != nil {
+				return agent.RuntimeOptions{}, ruleErr
+			} else if found {
+				if rule.ProfileID != "" && rule.FollowProfile {
+					profileRuntime, profileErr := configService.RuntimeForProfile(ctx, rule.ProfileID)
+					if profileErr != nil {
+						return agent.RuntimeOptions{}, profileErr
+					}
+					runtime = profileRuntime
+				}
+				if !rule.ProcessEnabled || !rule.LLMEnabled {
+					runtime.AIEnabled = false
+				}
+				// 模型覆盖放在配置文件切换之后，确保会话规则具有最终优先级。
+				if rule.ChatModel != "" {
+					runtime.ModelID = rule.ChatModel
+				}
+				if rule.PersonaID != "" {
+					runtime.PersonaID = rule.PersonaID
+				}
+			}
+			if runtime.AIExecutionMode != configsvc.BuiltinAIExecutionMode {
+				return agent.RuntimeOptions{}, fmt.Errorf("仅支持内置 AI 执行方式")
 			}
 			runtime, err = resolvePersonaRuntime(ctx, personaService, botID, conversationID, runtime)
 			if err != nil {
@@ -543,14 +594,28 @@ func Run(opts bootstrap.Options) error {
 		return time.Duration(settings.RequestTimeoutSeconds) * time.Second, nil
 	})
 	botManager.SetRuntimeCoordinator(runtimeCoordinator)
+	// 平台级管理员和唤醒词与 Agent 配置共用同一份配置文件解析结果，避免 WebUI 保存后消息入口仍使用旧逻辑。
+	botManager.SetMessageConfigResolver(func(resolveCtx context.Context, botID, conversationID string) (bot.MessageConfig, error) {
+		runtime, resolveErr := configService.Resolve(resolveCtx, botID, conversationID)
+		if resolveErr != nil {
+			return bot.MessageConfig{}, resolveErr
+		}
+		return bot.MessageConfig{
+			AdminUserIDs:          append([]string(nil), runtime.PlatformAdminIDs...),
+			WakeupWords:           append([]string(nil), runtime.WakeupWords...),
+			PrivateRequiresWakeup: runtime.PrivateRequiresWakeup,
+		}, nil
+	})
 	// Chat commands read and (where supported) change configuration through the
 	// same services the WebUI uses.
 	commandBridge := &commandRuntimeBridge{
 		providers: registry, config: configService, personas: personaService,
-		workspaces: workspaceService, conversations: conversationService,
+		workspaces: workspaceService, conversations: conversationService, runtime: runtimeCoordinator,
 	}
 	botManager.SetCommandRuntimeInfo(commandBridge)
 	botManager.SetCommandRuntimeAdmin(commandBridge)
+	botManager.SetCommandRuntimeStats(commandBridge)
+	botManager.SetCommandDashboardUpdater(commandBridge)
 	botManager.SetAttachmentStorer(func(storeCtx context.Context, request bot.AttachmentStoreRequest) (agent.Attachment, error) {
 		input := request.Attachment
 		if input.Ref != nil {
@@ -578,6 +643,32 @@ func Run(opts bootstrap.Options) error {
 	if err := botManager.Start(ctx); err != nil {
 		return err
 	}
+	// 未来任务始终通过同一个内置 Coordinator 执行；可选平台投递仍复用已连接的机器人适配器。
+	scheduleService.Start(ctx, func(taskCtx context.Context, task schedule.Task) (string, error) {
+		userID := task.UserID
+		if strings.TrimSpace(userID) == "" {
+			userID = "scheduler"
+		}
+		conversationID := strings.TrimSpace(task.ConversationID)
+		if conversationID == "" {
+			created, createErr := conversationService.Create(taskCtx, conversation.CreateRequest{UserID: userID, Title: task.Name})
+			if createErr != nil {
+				return "", createErr
+			}
+			conversationID = created.ID
+		}
+		invocation, startErr := runtimeCoordinator.StartInvocation(taskCtx, agent.ChatRequest{
+			UserID: userID, BotID: task.AdapterID, ConversationID: conversationID, SessionID: conversationID,
+			Message: task.Request, Stream: true,
+		})
+		if startErr != nil {
+			return "", startErr
+		}
+		if task.AdapterID != "" && task.ChatID != "" {
+			go deliverScheduledResult(taskCtx, runtimeCoordinator, conversationService, botManager, task, invocation.ID, userID, conversationID)
+		}
+		return invocation.ID, nil
+	})
 
 	server := httpapi.NewServerWithServices(registry, kernel, workspaceService, conversationService, botManager)
 	server.SetToolRegistry(toolRegistry)
@@ -587,6 +678,9 @@ func Run(opts bootstrap.Options) error {
 	server.SetRemoteTargetService(remoteTargetService)
 	server.SetMemoryService(longMemory)
 	server.SetArtifactService(artifactService)
+	server.SetSessionRuleService(sessionRuleService)
+	server.SetScheduleService(scheduleService)
+	server.SetLogStore(logStore)
 	httpServer := &http.Server{
 		Addr:              opts.HTTPAddr,
 		Handler:           server.Handler(),
@@ -630,6 +724,39 @@ func resolvePersonaRuntime(ctx context.Context, service *configsvc.PersonaServic
 		runtime.Instruction = persona.Instruction
 	}
 	return runtime, nil
+}
+
+// deliverScheduledResult 等待未来任务的终态，再把最后一条内置 Agent 回复投递回目标平台。
+// 轮询只读取持久化状态，不重新执行 invocation，也不会绕过平台发送边界。
+func deliverScheduledResult(ctx context.Context, coordinator *agentruntime.Coordinator, conversations *conversation.Service, bots *bot.Manager, task schedule.Task, invocationID, userID, conversationID string) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		invocation, err := coordinator.GetInvocation(ctx, invocationID)
+		if err == nil && invocation.Status.Terminal() {
+			text := invocation.Error
+			if invocation.Status == agentruntime.InvocationCompleted {
+				if messages, messageErr := conversations.Messages(ctx, userID, conversationID); messageErr == nil {
+					for index := len(messages) - 1; index >= 0; index-- {
+						if messages[index].Role == "assistant" && strings.TrimSpace(messages[index].Text) != "" {
+							text = messages[index].Text
+							break
+						}
+					}
+				}
+			}
+			if strings.TrimSpace(text) == "" {
+				text = "未来任务已完成，但没有可投递的文本结果。"
+			}
+			_ = bots.Send(ctx, bot.Message{AdapterID: task.AdapterID, ChatID: task.ChatID, UserID: userID}, text)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func instructionSnapshotsMatch(stored []agentruntime.InstructionSnapshot, current []workspace.InstructionSnapshot) bool {

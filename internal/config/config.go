@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -15,6 +16,9 @@ import (
 )
 
 const SchemaVersion = 1
+
+// BuiltinAIExecutionMode 是当前唯一允许的 AI 执行方式；外部编排服务不进入本项目配置模型。
+const BuiltinAIExecutionMode = "builtin"
 
 var (
 	ErrNotFound       = errors.New("配置文件不存在")
@@ -127,15 +131,16 @@ func SystemSchema() Schema {
 		{Key: "artifact_quota_bytes", Group: "system", Label: "Artifact 存储配额（字节）", Type: "integer", Default: DefaultArtifactQuotaBytes, Min: floatPtr(0), Max: floatPtr(float64(MaxArtifactQuotaBytes)), Help: "本地内容寻址存储去重后的总占用上限，0 表示不限制。超过上限时新的上传会被拒绝，已有内容不受影响。"},
 		{Key: "artifact_stale_upload_seconds", Group: "system", Label: "未完成上传保留时长（秒）", Type: "integer", Default: DefaultArtifactStaleUploadSeconds, Min: floatPtr(MinArtifactStaleUploadSeconds), Max: floatPtr(MaxArtifactStaleUploadSeconds), Help: "超过该时长仍未完成的 Artifact 上传会被标记为失败，遗留的临时文件一并回收。"},
 		{Key: "modal_fallback_enabled", Group: "system", Label: "启用多模态降级", Type: "boolean", Default: false, Help: "主模型不支持图片或音频时，使用配置的模型生成文字转述；失败时仍会以说明文字完成本轮。"},
-		{Key: "modal_fallback_provider_id", Group: "system", Label: "多模态降级供应商", Type: "string", Default: "", Help: "留空表示沿用主模型供应商；供应商不可用时自动降级为说明文字。"},
-		{Key: "modal_fallback_vision_model", Group: "system", Label: "图片降级模型", Type: "string", Default: "", Help: "留空表示不对图片执行模型转述；模型必须实际支持图片输入。"},
-		{Key: "modal_fallback_audio_model", Group: "system", Label: "音频降级模型", Type: "string", Default: "", Help: "留空表示不对音频执行模型转述；模型必须实际支持音频输入。"},
+		{Key: "modal_fallback_provider_id", Group: "system", Label: "多模态降级供应商", Type: "string", Default: "", Help: "WebUI 会从已配置供应商目录提供选择；留空表示沿用主模型供应商。"},
+		{Key: "modal_fallback_vision_model", Group: "system", Label: "图片降级模型", Type: "string", Default: "", Help: "从所选供应商的模型目录选择；留空表示不对图片执行模型转述。"},
+		{Key: "modal_fallback_audio_model", Group: "system", Label: "音频降级模型", Type: "string", Default: "", Help: "从所选供应商的模型目录选择；留空表示不对音频执行模型转述。"},
 	}}
 }
 
 // Runtime 是配置解析后的 Agent 运行参数，不向 HTTP 层暴露内部实现细节。
 type Runtime struct {
 	AIEnabled                     bool
+	AIExecutionMode               string
 	ProviderID                    string
 	ModelID                       string
 	AITemperature                 float64
@@ -162,9 +167,13 @@ type Runtime struct {
 	WorkspaceCommandTimeoutSecs   int
 	MessageStreamingEnabled       bool
 	MessagePromptPrefix           string
-	MemoryEnabled                 bool
-	MemoryAutoRetrieve            bool
-	MemoryMaxResults              int
+	// PlatformAdminIDs 和 WakeupWords 由 Bot 消息入口使用，保持配置中心与平台鉴权共用一份解析结果。
+	PlatformAdminIDs      []string
+	WakeupWords           []string
+	PrivateRequiresWakeup bool
+	MemoryEnabled         bool
+	MemoryAutoRetrieve    bool
+	MemoryMaxResults      int
 }
 
 // Repository 是配置中心需要的持久化能力，SQLite 实现位于 storage/sqlite，便于单元测试替换。
@@ -260,7 +269,7 @@ func (s *Service) ListProfiles(ctx context.Context) ([]Profile, error) {
 		return nil, err
 	}
 	for i := range items {
-		items[i] = normalizeProfile(items[i])
+		items[i] = s.normalizeProfile(items[i])
 	}
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].IsDefault != items[j].IsDefault {
@@ -280,7 +289,7 @@ func (s *Service) GetProfile(ctx context.Context, id string) (Profile, error) {
 	if err != nil {
 		return Profile{}, err
 	}
-	return normalizeProfile(item), nil
+	return s.normalizeProfile(item), nil
 }
 
 // ListRevisions 返回指定配置文件的历史快照，最新修订排在最前面。
@@ -323,6 +332,9 @@ func (s *Service) SaveProfile(ctx context.Context, id, name string, values Value
 	if name == "" {
 		return Profile{}, fmt.Errorf("%w: 配置名称不能为空", ErrInvalidRequest)
 	}
+	// 保存前把旧版本的 JSON 字符串列表转换为真正的字符串数组，避免用户只修改
+	// 其他配置时被历史格式卡住，同时保证后续 WebUI 读取到统一的数据形状。
+	values = s.normalizeListValues(values)
 	if err := s.ValidateValues(ctx, values); err != nil {
 		return Profile{}, err
 	}
@@ -393,6 +405,11 @@ func (s *Service) ValidateValues(ctx context.Context, values Values) error {
 			if field.Min != nil && number < *field.Min || field.Max != nil && number > *field.Max {
 				return fmt.Errorf("%w: %s 超出允许范围", ErrInvalidRequest, field.Label)
 			}
+		case "list":
+			// 列表字段只接受字符串元素；同时兼容早期保存的 JSON 字符串。
+			if _, ok := stringListValue(value); !ok {
+				return fmt.Errorf("%w: %s 必须是字符串列表", ErrInvalidRequest, field.Label)
+			}
 		case "string", "textarea", "select":
 			text, ok := value.(string)
 			if !ok {
@@ -400,6 +417,19 @@ func (s *Service) ValidateValues(ctx context.Context, values Values) error {
 			}
 			if field.Required && strings.TrimSpace(text) == "" {
 				return fmt.Errorf("%w: %s 不能为空", ErrInvalidRequest, field.Label)
+			}
+			// 带有固定选项的下拉框只接受 Schema 声明的值，尤其是执行方式不能绕过内置 AI 边界。
+			if field.Type == "select" && len(field.Options) > 0 {
+				matched := false
+				for _, option := range field.Options {
+					if option.Value == text {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					return fmt.Errorf("%w: %s 的选项无效", ErrInvalidRequest, field.Label)
+				}
 			}
 		}
 	}
@@ -486,7 +516,16 @@ func (s *Service) EffectiveValues(ctx context.Context, id string) (Values, error
 	for key, value := range item.Values {
 		values[key] = cloneValue(value)
 	}
-	return values, nil
+	return s.normalizeListValues(values), nil
+}
+
+// RuntimeForProfile 将指定配置文件解析为运行参数，供会话规则和调度任务复用。
+func (s *Service) RuntimeForProfile(ctx context.Context, id string) (Runtime, error) {
+	values, err := s.EffectiveValues(ctx, strings.TrimSpace(id))
+	if err != nil {
+		return Runtime{}, err
+	}
+	return runtimeFromValues(values), nil
 }
 
 // Resolve 按系统默认 → 机器人 → 对话的优先级解析配置；会话显式 State 由 Agent 层继续覆盖。
@@ -624,16 +663,30 @@ func (s *Service) SaveSystemSettings(ctx context.Context, settings SystemSetting
 func buildSchema() Schema {
 	return Schema{Version: SchemaVersion, Fields: []Field{
 		{Key: "ai.enabled", Group: "ai", Label: "启用 AI", Type: "boolean", Default: true, Help: "关闭后 Agent 会拒绝新的 AI 请求，但历史对话仍可查看。"},
+		{Key: "ai.execution_mode", Group: "ai", Label: "执行方式", Type: "select", Default: BuiltinAIExecutionMode, Options: []SchemaOption{{Value: BuiltinAIExecutionMode, Label: "内置 AI"}}, Help: "Abot 只使用进程内置 Agent Runtime；Dify、Coze、百炼和 DeerFlow 不在本版本中启用。"},
 		{Key: "ai.default_provider_id", Group: "ai", Label: "默认供应商", Type: "select", Default: "", OptionSource: "providers", Help: "为空时沿用供应商注册表的兼容默认值。"},
-		{Key: "ai.default_model_id", Group: "ai", Label: "默认模型", Type: "string", Default: "", Help: "支持模型目录外的手动模型 ID。"},
+		{Key: "ai.default_model_id", Group: "ai", Label: "默认模型", Type: "string", Default: "", Help: "WebUI 会优先提供已配置模型目录；留空表示沿用供应商默认模型。"},
+		{Key: "ai.fallback_models", Group: "ai", Label: "回退对话模型", Type: "list", Default: []string{}, Help: "按顺序添加主模型失败后的回退模型；当前内置 Runtime 只使用已选主模型。"},
 		{Key: "ai.temperature", Group: "ai", Label: "温度", Type: "number", Default: 0.7, Min: floatPtr(0), Max: floatPtr(2), Help: "控制输出随机性；较低值更稳定，较高值更有创造性。"},
 		{Key: "ai.top_p", Group: "ai", Label: "Top P", Type: "number", Default: 1.0, Min: floatPtr(0.01), Max: floatPtr(1), Help: "限制采样候选范围；通常与温度二选一调整。"},
 		{Key: "ai.max_output_tokens", Group: "ai", Label: "最大输出 token", Type: "integer", Default: 0, Min: floatPtr(0), Max: floatPtr(1000000), Help: "0 表示使用模型目录或上游接口默认值。"},
 		{Key: "ai.request_retries", Group: "ai", Label: "请求失败重试次数", Type: "integer", Default: 2, Min: floatPtr(0), Max: floatPtr(5), Help: "仅在模型尚未返回任何内容时重试，避免流式输出重复。"},
 		{Key: "ai.reasoning_effort", Group: "ai", Label: "思考强度", Type: "select", Default: "", Options: []SchemaOption{{Value: "", Label: "不指定"}, {Value: "minimal", Label: "最少"}, {Value: "low", Label: "低"}, {Value: "medium", Label: "中"}, {Value: "high", Label: "高"}}, Help: "仅在模型能力支持时下发；聊天界面可以按请求临时覆盖。"},
+		{Key: "ai.health_mode", Group: "ai", Label: "健康模式", Type: "boolean", Default: false, Help: "向内置 Agent 注入安全和健康内容边界，避免将该设置误认为外部审核服务。"},
+		{Key: "ai.knowledge_bases", Group: "capabilities", Label: "知识库", Type: "list", Default: []string{}, Help: "逐项添加知识库 ID；当前版本保留配置入口，未接入外部知识库服务。"},
+		{Key: "ai.knowledge_top_k", Group: "capabilities", Label: "知识库返回数量", Type: "integer", Default: 5, Min: floatPtr(1), Max: floatPtr(100), Help: "知识库检索的最大返回条数。"},
+		{Key: "ai.agentic_retrieval", Group: "capabilities", Label: "Agentic 知识库检索", Type: "boolean", Default: false, Help: "允许知识库作为 Agent 工具；未配置知识库时不会添加工具。"},
+		{Key: "ai.web_search.enabled", Group: "capabilities", Label: "网页搜索", Type: "boolean", Default: false, Help: "内置 Agent 的网页搜索开关；当前发行版不代管第三方搜索密钥。"},
+		{Key: "ai.computer_use.environment", Group: "capabilities", Label: "电脑使用环境", Type: "select", Default: "none", Options: []SchemaOption{{Value: "none", Label: "不启用"}, {Value: "local", Label: "本机"}, {Value: "sandbox", Label: "沙箱"}}, Help: "电脑使用能力仍受工作区工具和人工审批约束。"},
+		{Key: "ai.proactive_enabled", Group: "capabilities", Label: "主动型能力", Type: "boolean", Default: true, Help: "允许未来任务唤醒内置 Agent；任务仍由本地调度器执行。"},
 		{Key: "persona.id", Group: "persona", Label: "人格 ID", Type: "select", Default: "", OptionSource: "personas", Help: "选择人格目录中的稳定 ID；为空时继续使用当前配置中的系统提示词。"},
 		{Key: "persona.system_prompt", Group: "persona", Label: "系统提示词", Type: "textarea", Default: "你是 Abot，一个可靠、简洁、遵守用户意图的中文 AI 助手。", Help: "兼容旧配置；选择人格 ID 后由人格目录中的指令覆盖。"},
+		{Key: "persona.failure_reply", Group: "persona", Label: "LLM 失败回复", Type: "textarea", Default: "", Help: "模型失败时的可选固定回复。"},
 		{Key: "context.compaction.enabled", Group: "context", Label: "启用上下文压缩", Type: "boolean", Default: true, Help: "使用 ADK 原生压缩保留长对话的最近事件。"},
+		{Key: "context.compaction.max_turns", Group: "context", Label: "压缩前最多对话轮数", Type: "integer", Default: -1, Min: floatPtr(-1), Max: floatPtr(10000), Help: "-1 表示不按轮数限制，仍受模型上下文窗口约束。"},
+		{Key: "context.compaction.drop_turns", Group: "context", Label: "超限一次丢弃轮数", Type: "integer", Default: 1, Min: floatPtr(1), Max: floatPtr(1000), Help: "按轮数截断模式每次移除的最旧轮数。"},
+		{Key: "context.compaction.mode", Group: "context", Label: "超限处理方式", Type: "select", Default: "llm", Options: []SchemaOption{{Value: "turns", Label: "按对话轮数截断"}, {Value: "llm", Label: "由 LLM 压缩上下文"}}, Help: "内置 ADK 当前使用 LLM 压缩；轮数配置用于兼容导入。"},
+		{Key: "context.compaction.prompt", Group: "context", Label: "压缩提示词", Type: "textarea", Default: "请保留与当前任务相关的事实、决定和未完成事项。", Help: "仅影响内置 AI 的上下文压缩提示。"},
 		{Key: "context.compaction.trigger_ratio", Group: "context", Label: "压缩触发比例", Type: "number", Default: 0.8, Min: floatPtr(0.1), Max: floatPtr(0.99), Help: "上下文窗口达到该比例时触发压缩。"},
 		{Key: "context.compaction.safety_tokens", Group: "context", Label: "压缩安全余量", Type: "integer", Default: 512, Min: floatPtr(0), Max: floatPtr(100000), Help: "为模型输出预算保留的 token 余量。"},
 		{Key: "context.compaction.retention_events", Group: "context", Label: "压缩后保留事件数", Type: "integer", Default: 10, Min: floatPtr(1), Max: floatPtr(1000), Help: "压缩后保留的最近会话事件数量。"},
@@ -642,6 +695,8 @@ func buildSchema() Schema {
 		{Key: "context.compaction.unknown_window_tokens", Group: "context", Label: "未知窗口兜底 token", Type: "integer", Default: 8192, Min: floatPtr(1024), Max: floatPtr(1000000), Help: "模型目录没有上下文窗口时使用的保守估计。"},
 		{Key: "agent.max_tool_calls", Group: "agent", Label: "单轮最大工具调用数", Type: "integer", Default: 20, Min: floatPtr(1), Max: floatPtr(100), Help: "达到上限后 Agent 会暂时移除工具声明，要求模型先给出当前结果。"},
 		{Key: "agent.tool_schema_budget_tokens", Group: "agent", Label: "工具 Schema token 预算", Type: "integer", Default: 4096, Min: floatPtr(256), Max: floatPtr(100000), Help: "限制单次模型请求携带的工具 Schema 大小；超出时按确定性评分裁剪可选工具。"},
+		{Key: "agent.tool_call_mode", Group: "agent", Label: "工具调用模式", Type: "select", Default: "full", Options: []SchemaOption{{Value: "full", Label: "full"}, {Value: "skills-like", Label: "skills-like"}}, Help: "控制内置 Agent 暴露工具的组织方式。"},
+		{Key: "agent.tool_call_timeout_seconds", Group: "agent", Label: "工具调用超时（秒）", Type: "integer", Default: 120, Min: floatPtr(1), Max: floatPtr(3600), Help: "单个工具调用的最大等待时间。"},
 		{Key: "workspace.enabled", Group: "workspace", Label: "启用项目能力", Type: "boolean", Default: true, Help: "关闭后 Agent 不会加载当前项目工具。"},
 		{Key: "workspace.read_enabled", Group: "workspace", Label: "允许读取项目", Type: "boolean", Default: true, DisplayIf: map[string]any{"workspace.enabled": true}, Help: "控制列目录、读文件、搜索和 Git 状态工具。"},
 		{Key: "workspace.write_enabled", Group: "workspace", Label: "允许申请写入", Type: "boolean", Default: true, DisplayIf: map[string]any{"workspace.enabled": true}, Help: "写入仍然必须在工作区页面中由用户批准。"},
@@ -650,6 +705,33 @@ func buildSchema() Schema {
 		{Key: "workspace.command_timeout_seconds", Group: "workspace", Label: "命令超时秒数", Type: "integer", Default: 60, Min: floatPtr(1), Max: floatPtr(120), DisplayIf: map[string]any{"workspace.exec_enabled": true}, Help: "限制 Agent 申请的单次项目命令运行时间。"},
 		{Key: "message.streaming_enabled", Group: "message", Label: "启用流式输出", Type: "boolean", Default: true, Help: "关闭后 WebUI 仍会等待同一轮结果，但不会逐片推送；平台消息不受影响。"},
 		{Key: "message.prompt_prefix", Group: "message", Label: "用户提示词前缀", Type: "string", Default: "", Help: "在每条用户消息前加入固定前缀；留空表示不注入。"},
+		{Key: "message.show_thinking", Group: "message", Label: "显示思考内容", Type: "boolean", Default: false, Help: "控制管理台是否显示模型返回的思考摘要，不改变内置 Agent 的安全边界。"},
+		{Key: "message.realtime_segmented_reply", Group: "message", Label: "实时分段回复", Type: "boolean", Default: false, Help: "平台不支持流式时按段投递；WebUI 使用 SSE。"},
+		{Key: "message.user_identification", Group: "message", Label: "用户识别", Type: "boolean", Default: true, Help: "将会话用户标识作为运行时元数据，而不是拼入用户提示词。"},
+		{Key: "message.group_name_awareness", Group: "message", Label: "显示群名称", Type: "boolean", Default: true, Help: "允许平台适配器提供群名称上下文。"},
+		{Key: "message.world_time_awareness", Group: "message", Label: "现实世界时间感知", Type: "boolean", Default: true, Help: "为内置 Agent 提供当前服务端时间。"},
+		{Key: "message.extra_wakeup_prefix", Group: "message", Label: "额外唤醒前缀", Type: "string", Default: "", Help: "平台消息进入内置 Agent 前追加的唤醒前缀。"},
+		{Key: "image.caption_model", Group: "message", Label: "图片转述模型", Type: "string", Default: "", Help: "从已配置模型目录选择；留空表示不强制指定，主模型不支持图片时可使用系统多模态降级。"},
+		{Key: "voice.stt_enabled", Group: "message", Label: "启用语音识别", Type: "boolean", Default: false, Help: "语音识别由平台或后续内置适配器提供。"},
+		{Key: "voice.stt_model", Group: "message", Label: "默认 STT 模型", Type: "string", Default: "", DisplayIf: map[string]any{"voice.stt_enabled": true}, Help: "从已配置模型目录选择，启用语音识别后使用。"},
+		{Key: "voice.tts_enabled", Group: "message", Label: "启用语音回复", Type: "boolean", Default: false, Help: "语音回复由平台适配器决定是否支持。"},
+		{Key: "voice.tts_model", Group: "message", Label: "默认 TTS 模型", Type: "string", Default: "", DisplayIf: map[string]any{"voice.tts_enabled": true}, Help: "从已配置模型目录选择，启用语音回复后使用。"},
+		{Key: "voice.tts_probability", Group: "message", Label: "TTS 触发概率", Type: "number", Default: 1, Min: floatPtr(0), Max: floatPtr(1), DisplayIf: map[string]any{"voice.tts_enabled": true}, Help: "0-1 之间的语音回复概率。"},
+		{Key: "image.compression_enabled", Group: "message", Label: "启用图片压缩", Type: "boolean", Default: true, Help: "上传图片进入内置 Agent 前按边长和质量限制处理。"},
+		{Key: "image.max_edge", Group: "message", Label: "图片最大边长", Type: "integer", Default: 2048, Min: floatPtr(128), Max: floatPtr(12000), DisplayIf: map[string]any{"image.compression_enabled": true}, Help: "图片压缩后的最大边长。"},
+		{Key: "image.jpeg_quality", Group: "message", Label: "JPEG 质量", Type: "integer", Default: 85, Min: floatPtr(1), Max: floatPtr(100), DisplayIf: map[string]any{"image.compression_enabled": true}, Help: "图片压缩后的 JPEG 质量。"},
+		{Key: "message.prompt_template", Group: "message", Label: "用户提示词模板", Type: "textarea", Default: "{{prompt}}", Help: "必须包含 {{prompt}}；模板内容仍经过内置 Agent 的上下文边界。"},
+		{Key: "message.parser_depth", Group: "message", Label: "富文本解析深度", Type: "integer", Default: 3, Min: floatPtr(0), Max: floatPtr(20), Help: "平台转发和富文本解析的最大嵌套深度。"},
+		{Key: "message.parser_recursive_limit", Group: "message", Label: "递归拉取上限", Type: "integer", Default: 20, Min: floatPtr(0), Max: floatPtr(1000), Help: "平台引用消息递归拉取的最大次数。"},
+		{Key: "plugins.enabled", Group: "plugins", Label: "启用插件列表", Type: "list", Default: []string{}, Help: "逐项添加内置工具和插件 ID；未安装插件不会被执行。"},
+		{Key: "platform.admin_ids", Group: "platform", Label: "平台管理员 ID 列表", Type: "list", Default: []string{}, Help: "逐项添加平台 UID；配置文件绑定到机器人后会参与全局管理员判断，机器人页面还可配置该 Bot 专属管理员。"},
+		{Key: "platform.wakeup_words", Group: "platform", Label: "唤醒词列表", Type: "list", Default: []string{}, Help: "逐项添加唤醒前缀；群聊未 @ 机器人时，以这些前缀开头的消息也会被处理，并会去掉前缀后交给内置 AI。"},
+		{Key: "platform.private_requires_wakeup", Group: "platform", Label: "私聊需要唤醒词", Type: "boolean", Default: false, Help: "平台适配器可据此过滤未唤醒消息。"},
+		{Key: "platform.reply_prefix", Group: "platform", Label: "回复文本前缀", Type: "string", Default: "", Help: "平台输出前追加的前缀。"},
+		{Key: "platform.reply_mention", Group: "platform", Label: "回复时 @ 发送人", Type: "boolean", Default: false, Help: "平台适配器支持时引用发送人。"},
+		{Key: "extensions.segmented_reply_enabled", Group: "extensions", Label: "分段回复", Type: "boolean", Default: false, Help: "按平台能力将内置 Agent 的长回复拆分。"},
+		{Key: "extensions.group_context_enabled", Group: "extensions", Label: "群聊上下文感知", Type: "boolean", Default: false, Help: "将群聊历史作为会话上下文，仍受当前会话边界限制。"},
+		{Key: "extensions.proactive_reply_enabled", Group: "extensions", Label: "主动回复", Type: "boolean", Default: false, Help: "平台主动回复需要白名单和本地调度器共同启用。"},
 		{Key: "memory.enabled", Group: "memory", Label: "启用长期记忆", Type: "boolean", Default: false, Help: "开启后 Agent 可以检索并在用户明确要求时保存跨会话记忆。"},
 		{Key: "memory.auto_retrieve", Group: "memory", Label: "每轮自动检索", Type: "boolean", Default: false, DisplayIf: map[string]any{"memory.enabled": true}, Help: "每轮请求自动把相关记忆放入提示词；关闭时仍可由 Agent 按需检索。"},
 		{Key: "memory.max_results", Group: "memory", Label: "最多检索记忆数", Type: "integer", Default: 8, Min: floatPtr(1), Max: floatPtr(50), DisplayIf: map[string]any{"memory.enabled": true}, Help: "限制单轮注入或返回给 Agent 的记忆数量。"},
@@ -659,6 +741,7 @@ func buildSchema() Schema {
 func runtimeFromValues(values Values) Runtime {
 	return Runtime{
 		AIEnabled:                     boolOr(values["ai.enabled"], true),
+		AIExecutionMode:               stringOrDefault(values["ai.execution_mode"], BuiltinAIExecutionMode),
 		ProviderID:                    stringOr(values["ai.default_provider_id"]),
 		ModelID:                       stringOr(values["ai.default_model_id"]),
 		AITemperature:                 numberOr(values["ai.temperature"], 0.7),
@@ -685,20 +768,41 @@ func runtimeFromValues(values Values) Runtime {
 		WorkspaceCommandTimeoutSecs:   intOr(values["workspace.command_timeout_seconds"], 60),
 		MessageStreamingEnabled:       boolOr(values["message.streaming_enabled"], true),
 		MessagePromptPrefix:           stringOr(values["message.prompt_prefix"]),
+		PlatformAdminIDs:              stringListOr(values["platform.admin_ids"]),
+		WakeupWords:                   stringListOr(values["platform.wakeup_words"]),
+		PrivateRequiresWakeup:         boolOr(values["platform.private_requires_wakeup"], false),
 		MemoryEnabled:                 boolOr(values["memory.enabled"], false),
 		MemoryAutoRetrieve:            boolOr(values["memory.auto_retrieve"], false),
 		MemoryMaxResults:              intOr(values["memory.max_results"], 8),
 	}
 }
 
-func normalizeProfile(item Profile) Profile {
+func (s *Service) normalizeProfile(item Profile) Profile {
 	item.ID = strings.TrimSpace(item.ID)
 	item.Name = strings.TrimSpace(item.Name)
 	if item.Values == nil {
 		item.Values = Values{}
 	}
-	item.Values = cloneValues(item.Values)
+	item.Values = s.normalizeListValues(item.Values)
 	return item
+}
+
+// normalizeListValues 统一配置列表的持久化形状，并兼容早期 textarea 保存的 JSON 字符串。
+func (s *Service) normalizeListValues(values Values) Values {
+	result := cloneValues(values)
+	for _, field := range s.schema.Fields {
+		if field.Type != "list" {
+			continue
+		}
+		value, exists := result[field.Key]
+		if !exists {
+			continue
+		}
+		if list, ok := stringListValue(value); ok {
+			result[field.Key] = list
+		}
+	}
+	return result
 }
 
 func validateID(id string) error {
@@ -799,9 +903,69 @@ func cloneValue(value any) any {
 			result[index] = cloneValue(child)
 		}
 		return result
+	case []string:
+		// []string 是列表 Schema 的默认值，需要独立复制避免草稿和默认值共享底层数组。
+		return append([]string(nil), typed...)
 	default:
 		return value
 	}
+}
+
+// stringListValue 将数组或旧版 JSON 数组字符串转换为去空白、去重后的字符串列表。
+func stringListValue(value any) ([]string, bool) {
+	var raw []any
+	switch typed := value.(type) {
+	case []string:
+		for _, item := range typed {
+			raw = append(raw, item)
+		}
+	case []any:
+		raw = typed
+	case string:
+		text := strings.TrimSpace(typed)
+		if text == "" {
+			return []string{}, true
+		}
+		if err := json.Unmarshal([]byte(text), &raw); err != nil {
+			return nil, false
+		}
+	case nil:
+		return []string{}, true
+	default:
+		return nil, false
+	}
+	result := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, item := range raw {
+		text, ok := item.(string)
+		if !ok {
+			return nil, false
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		if len(text) > 256 {
+			return nil, false
+		}
+		if _, exists := seen[text]; exists {
+			continue
+		}
+		seen[text] = struct{}{}
+		result = append(result, text)
+	}
+	if len(result) > 256 {
+		return nil, false
+	}
+	return result, true
+}
+
+func stringListOr(value any) []string {
+	list, ok := stringListValue(value)
+	if !ok {
+		return nil
+	}
+	return list
 }
 
 func cloneSchema(schema Schema) Schema {

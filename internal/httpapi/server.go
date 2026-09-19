@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -21,8 +23,11 @@ import (
 	"Abot/internal/bot"
 	configsvc "Abot/internal/config"
 	"Abot/internal/conversation"
+	"Abot/internal/logging"
 	memorysvc "Abot/internal/memory"
 	"Abot/internal/provider"
+	"Abot/internal/schedule"
+	"Abot/internal/sessionrule"
 	"Abot/internal/webui"
 	"Abot/internal/workspace"
 	"google.golang.org/adk/v2/session"
@@ -40,6 +45,9 @@ type Server struct {
 	personas                   *configsvc.PersonaService
 	memories                   *memorysvc.Service
 	artifacts                  *artifact.Service
+	sessionRules               *sessionrule.Service
+	schedules                  *schedule.Service
+	logs                       *logging.Store
 	runtime                    *agentruntime.Coordinator
 	toolRegistry               *agent.ToolRegistry
 	eventDelivery              http.Handler
@@ -119,6 +127,21 @@ func (s *Server) SetMemoryService(service *memorysvc.Service) {
 // SetArtifactService 装配大内容的内容寻址存储和元数据访问服务。
 func (s *Server) SetArtifactService(service *artifact.Service) {
 	s.artifacts = service
+}
+
+// SetSessionRuleService 装配按消息会话来源覆盖配置的规则服务。
+func (s *Server) SetSessionRuleService(service *sessionrule.Service) {
+	s.sessionRules = service
+}
+
+// SetScheduleService 装配未来任务和本地调度服务。
+func (s *Server) SetScheduleService(service *schedule.Service) {
+	s.schedules = service
+}
+
+// SetLogStore 装配管理台日志的有界内存快照。
+func (s *Server) SetLogStore(store *logging.Store) {
+	s.logs = store
 }
 
 // SetRuntimeCoordinator 装配独立于 HTTP 请求生命周期的 Agent Runtime。
@@ -363,9 +386,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/personas", s.createPersona)
 	mux.HandleFunc("GET /api/v1/personas/{id}", s.getPersona)
 	mux.HandleFunc("GET /api/v1/personas/{id}/revisions", s.listPersonaRevisions)
+	mux.HandleFunc("GET /api/v1/personas/{id}/export", s.exportPersona)
 	mux.HandleFunc("PUT /api/v1/personas/{id}", s.updatePersona)
 	mux.HandleFunc("DELETE /api/v1/personas/{id}", s.deletePersona)
 	mux.HandleFunc("POST /api/v1/personas/{id}/default", s.setDefaultPersona)
+	mux.HandleFunc("POST /api/v1/personas/import", s.importPersona)
 	mux.HandleFunc("GET /api/v1/config-profiles", s.listConfigProfiles)
 	mux.HandleFunc("POST /api/v1/config-profiles", s.createConfigProfile)
 	mux.HandleFunc("POST /api/v1/config-profiles/import", s.importConfigProfile)
@@ -399,6 +424,27 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/bots/{id}/group-admins/{userID}", s.removeBotGroupAdmin)
 	mux.HandleFunc("PUT /api/v1/conversations/{id}/persona", s.bindConversationPersona)
 	mux.HandleFunc("GET /api/v1/conversations/{id}/persona", s.getConversationPersona)
+	mux.HandleFunc("GET /api/v1/session-rules", s.listSessionRules)
+	mux.HandleFunc("POST /api/v1/session-rules", s.createSessionRule)
+	mux.HandleFunc("POST /api/v1/session-rules/batch", s.batchSessionRules)
+	mux.HandleFunc("GET /api/v1/session-rules/{source}", s.getSessionRule)
+	mux.HandleFunc("PUT /api/v1/session-rules/{source}", s.updateSessionRule)
+	mux.HandleFunc("DELETE /api/v1/session-rules/{source}", s.deleteSessionRule)
+	mux.HandleFunc("GET /api/v1/session-rule-groups", s.listSessionRuleGroups)
+	mux.HandleFunc("POST /api/v1/session-rule-groups", s.createSessionRuleGroup)
+	mux.HandleFunc("PUT /api/v1/session-rule-groups/{id}", s.updateSessionRuleGroup)
+	mux.HandleFunc("DELETE /api/v1/session-rule-groups/{id}", s.deleteSessionRuleGroup)
+	mux.HandleFunc("GET /api/v1/scheduled-tasks", s.listScheduledTasks)
+	mux.HandleFunc("POST /api/v1/scheduled-tasks", s.createScheduledTask)
+	mux.HandleFunc("GET /api/v1/scheduled-tasks/{id}", s.getScheduledTask)
+	mux.HandleFunc("PUT /api/v1/scheduled-tasks/{id}", s.updateScheduledTask)
+	mux.HandleFunc("DELETE /api/v1/scheduled-tasks/{id}", s.deleteScheduledTask)
+	mux.HandleFunc("POST /api/v1/scheduled-tasks/{id}/pause", s.pauseScheduledTask)
+	mux.HandleFunc("POST /api/v1/scheduled-tasks/{id}/resume", s.resumeScheduledTask)
+	mux.HandleFunc("GET /api/v1/data/stats", s.dataStats)
+	mux.HandleFunc("GET /api/v1/data/conversations", s.dataConversations)
+	mux.HandleFunc("GET /api/v1/data/traces", s.dataTraces)
+	mux.HandleFunc("GET /api/v1/data/logs", s.dataLogs)
 	mux.HandleFunc("GET /api/v1/local/directories", s.listLocalDirectories)
 	mux.HandleFunc("GET /api/v1/remote-targets", s.listRemoteTargets)
 	mux.HandleFunc("POST /api/v1/remote-targets", s.createRemoteTarget)
@@ -1418,9 +1464,19 @@ func decodeSingleJSONWithLimit(writer http.ResponseWriter, request *http.Request
 }
 
 func writeJSON(writer http.ResponseWriter, status int, value any) {
+	// 先编码并记录完整 JSON，再写回客户端，保证管理台和终端都能看到原始响应正文。
+	data, err := json.Marshal(value)
+	if err != nil {
+		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+		writer.WriteHeader(status)
+		slog.Error("编码 JSON 响应失败", "status", status, "error", err)
+		return
+	}
+	data = append(data, '\n')
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(status)
-	if err := json.NewEncoder(writer).Encode(value); err != nil {
+	slog.Info("HTTP JSON 响应正文", "status", status, "body", string(data))
+	if _, err := writer.Write(data); err != nil {
 		slog.Debug("写入 JSON 响应失败", "error", err)
 	}
 }
@@ -1430,6 +1486,8 @@ func writeSSE(writer http.ResponseWriter, event string, value any) error {
 	if err != nil {
 		return err
 	}
+	// SSE 每个事件都是一次独立响应，记录原始事件正文以便还原实时交互。
+	slog.Info("HTTP SSE 响应正文", "event", event, "body", string(data))
 	_, err = fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", event, data)
 	return err
 }
@@ -1604,9 +1662,126 @@ func isHTTPMaxBytesError(err error) bool {
 	return errors.As(err, &target)
 }
 
+// 聊天请求允许携带较大的 Base64 图片；日志上限与聊天 JSON 请求上限一致，避免大图片日志被过早截断。
+const requestLogBodyLimit int64 = 32 << 20
+
+// requestLogger 记录完整 HTTP 请求正文和响应状态；正文只设置有界上限，避免日志本身耗尽进程内存。
 func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		next.ServeHTTP(writer, request)
-		slog.Debug("HTTP 请求完成", "method", request.Method, "path", request.URL.Path)
+		startedAt := time.Now()
+		body, truncated, readErr := replayRequestBody(request)
+		requestAttrs := []any{
+			"method", request.Method,
+			"path", request.URL.Path,
+			"query", request.URL.RawQuery,
+			"url", request.URL.RequestURI(),
+			"content_type", request.Header.Get("Content-Type"),
+			"content_length", request.ContentLength,
+		}
+		if body != "" || request.ContentLength > 0 {
+			requestAttrs = append(requestAttrs, "body", body, "body_truncated", truncated)
+		}
+		if readErr != nil {
+			requestAttrs = append(requestAttrs, "body_read_error", readErr)
+		}
+		// 请求日志放在 Handler 前，确保即使业务返回错误也能看到原始输入。
+		slog.Info("HTTP 请求", requestAttrs...)
+
+		recorder := &responseRecorder{ResponseWriter: writer}
+		defer func() {
+			// 用 defer 记录响应，覆盖正常返回和 Handler 抛出异常前的已写状态。
+			slog.Info("HTTP 响应", "method", request.Method, "path", request.URL.Path, "status", recorder.statusCode(), "bytes", recorder.bytes, "duration", time.Since(startedAt))
+		}()
+		next.ServeHTTP(recorder, request)
 	})
+}
+
+// replayRequestBody 读取请求正文用于日志后再拼回原 Body，保证业务解码逻辑看到的内容完全不变。
+func replayRequestBody(request *http.Request) (string, bool, error) {
+	if request == nil || request.Body == nil || request.Body == http.NoBody {
+		return "", false, nil
+	}
+	original := request.Body
+	data, err := io.ReadAll(io.LimitReader(original, requestLogBodyLimit+1))
+	truncated := int64(len(data)) > requestLogBodyLimit
+	// LimitReader 为判断截断多读取了一个字节；回放时必须把已读取的全部字节放回去，不能丢掉这个字节。
+	replayData := data
+	if truncated {
+		data = data[:requestLogBodyLimit]
+	}
+	request.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(replayData), original), closer: original}
+	return string(data), truncated, err
+}
+
+// replayReadCloser 在重放日志前缀的同时保留原始 Body 的关闭语义。
+type replayReadCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (r *replayReadCloser) Close() error {
+	if r == nil || r.closer == nil {
+		return nil
+	}
+	return r.closer.Close()
+}
+
+// responseRecorder 只旁路记录状态和字节数，不缓存响应正文，因此不破坏 SSE、文件下载和 WebSocket。
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+	wrote  bool
+}
+
+func (r *responseRecorder) statusCode() int {
+	if r == nil || !r.wrote {
+		return http.StatusOK
+	}
+	return r.status
+}
+
+func (r *responseRecorder) WriteHeader(status int) {
+	if r.wrote {
+		return
+	}
+	r.status = status
+	r.wrote = true
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *responseRecorder) Write(data []byte) (int, error) {
+	if !r.wrote {
+		r.WriteHeader(http.StatusOK)
+	}
+	count, err := r.ResponseWriter.Write(data)
+	r.bytes += int64(count)
+	return count, err
+}
+
+func (r *responseRecorder) Flush() {
+	if !r.wrote {
+		r.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (r *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hijacker, ok := r.ResponseWriter.(http.Hijacker); ok {
+		return hijacker.Hijack()
+	}
+	return nil, nil, fmt.Errorf("底层响应写入器不支持 WebSocket hijack")
+}
+
+func (r *responseRecorder) Push(target string, options *http.PushOptions) error {
+	if pusher, ok := r.ResponseWriter.(http.Pusher); ok {
+		return pusher.Push(target, options)
+	}
+	return http.ErrNotSupported
+}
+
+func (r *responseRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }

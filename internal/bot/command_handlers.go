@@ -3,7 +3,6 @@ package bot
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -21,6 +20,44 @@ type CommandRuntimeInfo interface {
 	AvailableModels(context.Context) ([]CommandOption, error)
 	AvailablePersonas(context.Context) ([]CommandOption, error)
 	AvailableWorkspaces(context.Context) ([]CommandOption, error)
+}
+
+// CommandUsageValue 表示一项可选的 Token 用量；Known=false 时说明供应商没有返回该字段。
+type CommandUsageValue struct {
+	Value int
+	Known bool
+}
+
+// CommandUsageStats 是 /stats 对外展示的当前会话用量摘要。
+// 所有字段都只来自 Runtime 已持久化的模型调用事件，不自行估算供应商用量。
+type CommandUsageStats struct {
+	InvocationCount      int
+	ModelCalls           int
+	UnknownCalls         int
+	CompactionModelCalls int
+	TotalTokens          CommandUsageValue
+	PromptTokens         CommandUsageValue
+	CachedInputTokens    CommandUsageValue
+	ToolUsePromptTokens  CommandUsageValue
+	OutputTokens         CommandUsageValue
+	ReasoningTokens      CommandUsageValue
+}
+
+// CommandRuntimeStats 是 /stats 的可选读取边界，避免扩大既有配置查询接口。
+type CommandRuntimeStats interface {
+	ConversationUsage(context.Context, string, string) (CommandUsageStats, error)
+}
+
+// DashboardUpdateResult 描述管理台更新检查的实际结果。
+// Updated=false 并不表示命令失败，而是表示当前发布方式没有替换文件。
+type DashboardUpdateResult struct {
+	Updated bool
+	Message string
+}
+
+// CommandDashboardUpdater 是管理台更新命令的执行边界。
+type CommandDashboardUpdater interface {
+	UpdateDashboard(context.Context) (DashboardUpdateResult, error)
 }
 
 // CommandRuntimeAdmin applies configuration changes requested from a chat.
@@ -58,6 +95,26 @@ func (m *Manager) runtimeAdminProvider() (CommandRuntimeAdmin, bool) {
 	return admin, admin != nil
 }
 
+func (m *Manager) runtimeStatsProvider() (CommandRuntimeStats, bool) {
+	if m == nil {
+		return nil, false
+	}
+	m.mu.RLock()
+	stats := m.commandRuntimeStats
+	m.mu.RUnlock()
+	return stats, stats != nil
+}
+
+func (m *Manager) dashboardUpdater() (CommandDashboardUpdater, bool) {
+	if m == nil {
+		return nil, false
+	}
+	m.mu.RLock()
+	updater := m.commandDashboardUpdater
+	m.mu.RUnlock()
+	return updater, updater != nil
+}
+
 // SetCommandRuntimeInfo installs the read side of configuration commands.
 func (m *Manager) SetCommandRuntimeInfo(info CommandRuntimeInfo) {
 	if m == nil {
@@ -78,6 +135,26 @@ func (m *Manager) SetCommandRuntimeAdmin(admin CommandRuntimeAdmin) {
 	m.mu.Unlock()
 }
 
+// SetCommandRuntimeStats 安装当前会话用量查询器。
+func (m *Manager) SetCommandRuntimeStats(stats CommandRuntimeStats) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.commandRuntimeStats = stats
+	m.mu.Unlock()
+}
+
+// SetCommandDashboardUpdater 安装管理台更新检查器。
+func (m *Manager) SetCommandDashboardUpdater(updater CommandDashboardUpdater) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.commandDashboardUpdater = updater
+	m.mu.Unlock()
+}
+
 // dispatchBotCommand routes an authorised command to its handler.
 func (m *Manager) dispatchBotCommand(ctx context.Context, bot Bot, message Message, authorization commandAuthorization) error {
 	switch authorization.Command.ID {
@@ -85,14 +162,24 @@ func (m *Manager) dispatchBotCommand(ctx context.Context, bot Bot, message Messa
 		return m.commandHelp(ctx, bot, message, authorization)
 	case "id":
 		return m.commandIdentity(ctx, message)
+	case "sid":
+		return m.commandSessionIdentity(ctx, message)
+	case "name":
+		return m.commandSourceName(ctx, message, authorization.Arg)
 	case "status":
 		return m.send(ctx, message, m.statusText(ctx, message))
+	case "stats":
+		return m.commandStats(ctx, message)
 	case "config":
 		return m.commandConfig(ctx, bot, message, authorization)
 	case "cancel":
 		return m.cancelChatInvocation(ctx, message)
-	case "new":
+	case "stop":
+		return m.stopChatInvocation(ctx, message)
+	case "new", "reset":
 		return m.startNewConversation(ctx, message)
+	case "dashboard_update":
+		return m.commandDashboardUpdate(ctx, message)
 	case "model":
 		return m.commandModel(ctx, bot, message, authorization)
 	case "persona":
@@ -141,6 +228,129 @@ func (m *Manager) commandIdentity(ctx context.Context, message Message) error {
 		"类型：" + strings.TrimSpace(message.ChatType),
 	}
 	return m.send(ctx, message, strings.Join(lines, "\n"))
+}
+
+// commandSessionIdentity 展示 AstrBot /sid 约定的来源信息，供规则和权限配置直接复制使用。
+func (m *Manager) commandSessionIdentity(ctx context.Context, message Message) error {
+	source := messageSource(message)
+	lines := []string{
+		"当前消息来源：",
+		"UMO：" + source,
+		"UID：" + strings.TrimSpace(message.UserID),
+		"Bot ID：" + strings.TrimSpace(message.AdapterID),
+		"Message Type：" + messageUMOMessageType(message),
+		"Session ID：" + messageSessionID(message),
+	}
+	if alias, aliasErr := m.sourceName(ctx, source); aliasErr == nil && alias != "" {
+		lines = append(lines, "显示名称："+alias)
+	}
+	return m.send(ctx, message, strings.Join(lines, "\n"))
+}
+
+// commandSourceName 读取或设置当前 UMO 的显示名称；空参数只读取，不会意外清空名称。
+func (m *Manager) commandSourceName(ctx context.Context, message Message, argument string) error {
+	source := messageSource(message)
+	argument = strings.TrimSpace(argument)
+	if argument == "" {
+		alias, err := m.sourceName(ctx, source)
+		if err != nil {
+			return m.send(ctx, message, "读取来源名称失败："+trimError(err))
+		}
+		if alias == "" {
+			return m.send(ctx, message, "当前来源尚未设置显示名称。\nUMO："+source+"\n用法：/name <显示名称>")
+		}
+		return m.send(ctx, message, "当前来源显示名称："+alias+"\nUMO："+source)
+	}
+	if err := validateSourceName(argument); err != nil {
+		return m.send(ctx, message, "设置来源名称失败："+trimError(err))
+	}
+	if err := m.setSourceName(ctx, source, argument); err != nil {
+		return m.send(ctx, message, "设置来源名称失败："+trimError(err))
+	}
+	m.recordAudit(ctx, CommandAudit{
+		AdapterID: message.AdapterID, ChatID: message.ChatID, UserID: message.UserID,
+		Command: "name", Action: AuditSourceName, Target: argument, Result: "ok",
+	})
+	return m.send(ctx, message, "已将当前来源命名为："+argument)
+}
+
+// commandStats 只显示当前绑定会话的 Runtime 用量，避免把其他会话的成本混入结果。
+func (m *Manager) commandStats(ctx context.Context, message Message) error {
+	_, conversationID, err := m.conversationForMessage(ctx, message)
+	if err != nil {
+		return err
+	}
+	statsProvider, ok := m.runtimeStatsProvider()
+	if !ok {
+		return m.send(ctx, message, "当前部署未提供会话用量统计。")
+	}
+	stats, err := statsProvider.ConversationUsage(ctx, bindingUserID(message), conversationID)
+	if err != nil {
+		return m.send(ctx, message, "读取会话用量失败："+trimError(err))
+	}
+	lines := []string{"当前会话 Token 用量：", "会话：" + conversationID, fmt.Sprintf("模型调用：%d", stats.ModelCalls)}
+	if stats.InvocationCount > 0 {
+		lines = append(lines, fmt.Sprintf("任务数：%d", stats.InvocationCount))
+	}
+	if stats.ModelCalls == 0 {
+		lines = append(lines, "（当前会话暂无已记录的模型调用）")
+		return m.send(ctx, message, strings.Join(lines, "\n"))
+	}
+	inputOther := CommandUsageValue{}
+	if stats.PromptTokens.Known && stats.CachedInputTokens.Known && stats.PromptTokens.Value >= stats.CachedInputTokens.Value {
+		inputOther = CommandUsageValue{Value: stats.PromptTokens.Value - stats.CachedInputTokens.Value, Known: true}
+	}
+	lines = append(lines,
+		"总 Token："+formatCommandUsageValue(stats.TotalTokens),
+		"输入 Token（缓存）："+formatCommandUsageValue(stats.CachedInputTokens),
+		"输入 Token（其他）："+formatCommandUsageValue(inputOther),
+		"输出 Token："+formatCommandUsageValue(stats.OutputTokens),
+	)
+	if stats.ToolUsePromptTokens.Known {
+		lines = append(lines, "工具输入 Token："+formatCommandUsageValue(stats.ToolUsePromptTokens))
+	}
+	if stats.ReasoningTokens.Known {
+		lines = append(lines, "推理 Token："+formatCommandUsageValue(stats.ReasoningTokens))
+	}
+	if stats.CompactionModelCalls > 0 {
+		lines = append(lines, fmt.Sprintf("上下文压缩调用：%d", stats.CompactionModelCalls))
+	}
+	if stats.UnknownCalls > 0 {
+		lines = append(lines, fmt.Sprintf("未知用量调用：%d（供应商未返回完整 Token 字段）", stats.UnknownCalls))
+	}
+	return m.send(ctx, message, strings.Join(lines, "\n"))
+}
+
+func formatCommandUsageValue(value CommandUsageValue) string {
+	if !value.Known {
+		return "未知"
+	}
+	return fmt.Sprintf("%d", value.Value)
+}
+
+// commandDashboardUpdate 执行真实的内嵌资源检查，并明确告知运行时是否发生文件替换。
+func (m *Manager) commandDashboardUpdate(ctx context.Context, message Message) error {
+	updater, ok := m.dashboardUpdater()
+	if !ok {
+		return m.send(ctx, message, "当前部署未提供管理台更新器；Abot 管理台随二进制内嵌发布。")
+	}
+	result, err := updater.UpdateDashboard(ctx)
+	if err != nil {
+		return m.send(ctx, message, "管理台更新检查失败："+trimError(err))
+	}
+	m.recordAudit(ctx, CommandAudit{
+		AdapterID: message.AdapterID, ChatID: message.ChatID, UserID: message.UserID,
+		Command: "dashboard_update", Action: AuditDashboardUpdate, Result: "ok",
+	})
+	messageText := strings.TrimSpace(result.Message)
+	if messageText == "" {
+		if result.Updated {
+			messageText = "管理台资源已更新。"
+		} else {
+			messageText = "管理台资源检查完成，当前无需替换。"
+		}
+	}
+	return m.send(ctx, message, messageText)
 }
 
 func (m *Manager) commandConfig(ctx context.Context, bot Bot, message Message, authorization commandAuthorization) error {
@@ -352,11 +562,10 @@ func (m *Manager) commandAdminList(ctx context.Context, bot Bot, message Message
 	if len(admins) == 0 {
 		lines = append(lines, "（暂无）")
 	}
-	if len(bot.AdminUserIDs) > 0 {
+	globalAdmins := m.globalAdminIDsForMessage(ctx, bot, message)
+	if len(globalAdmins) > 0 {
 		lines = append(lines, "", "全局管理员（WebUI 配置）：")
-		sorted := append([]string(nil), bot.AdminUserIDs...)
-		sort.Strings(sorted)
-		for _, admin := range sorted {
+		for _, admin := range globalAdmins {
 			lines = append(lines, "· "+admin)
 		}
 	}
@@ -376,7 +585,7 @@ func (m *Manager) commandAdminAdd(ctx context.Context, bot Bot, message Message,
 	if err := validAdminTarget(target); err != nil {
 		return m.send(ctx, message, "请提供用户 ID，或回复对方的消息后再发送 /admin add。")
 	}
-	if isGlobalAdmin(bot, target) {
+	if m.globalAdminForUser(ctx, bot, message, target) {
 		return m.send(ctx, message, "该用户已经是全局管理员，无需重复授权。")
 	}
 	if err := repository.AddGroupAdmin(ctx, GroupAdmin{
@@ -422,7 +631,7 @@ func (m *Manager) commandAdminLeave(ctx context.Context, bot Bot, message Messag
 		return m.send(ctx, message, "该指令只能在群聊中使用。")
 	}
 	userID := strings.TrimSpace(message.UserID)
-	if isGlobalAdmin(bot, userID) {
+	if m.globalAdminForUser(ctx, bot, message, userID) {
 		return m.send(ctx, message, "全局管理员不能退出，请在 WebUI 中调整。")
 	}
 	if err := repository.RemoveGroupAdmin(ctx, bot.ID, message.ChatID, userID); err != nil {
@@ -511,7 +720,7 @@ func (m *Manager) unknownCommandText(ctx context.Context, bot Bot, message Messa
 			}
 		}
 	}
-	help := helpTextFor(commands, isGroupChatType(message.ChatType), isGlobalAdmin(bot, message.UserID), groupAdmin)
+	help := helpTextFor(commands, isGroupChatType(message.ChatType), m.globalAdminForMessage(ctx, bot, message), groupAdmin)
 	return "未知命令。\n\n" + help
 }
 

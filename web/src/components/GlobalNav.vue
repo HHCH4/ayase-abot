@@ -14,6 +14,7 @@ const navGroups = [
       { name: 'bots', label: '机器人', icon: '🤖' },
       { name: 'bot-commands', label: '指令', icon: '⌨️' },
       { name: 'providers', label: '模型供应商', icon: '✨' },
+      { name: 'config', label: '配置文件', icon: '⚙️' },
     ],
   },
   {
@@ -21,6 +22,10 @@ const navGroups = [
     items: [
       { name: 'memories', label: '长期记忆', icon: '🧠' },
       { name: 'remote-targets', label: '远程主机', icon: '🖥️' },
+      { name: 'personas', label: '人格设定', icon: '🎭' },
+      { name: 'data', label: '数据与日志', icon: '📈' },
+      { name: 'session-management', label: '自定义规则', icon: '🧩' },
+      { name: 'cron', label: '未来任务', icon: '⏰' },
     ],
   },
 ]
@@ -44,17 +49,5 @@ const navGroups = [
         </RouterLink>
       </div>
     </nav>
-
-    <div class="app-nav-footer">
-      <RouterLink
-        to="/config"
-        class="nav-item"
-        :class="{ active: route.name === 'config' }"
-        title="配置文件"
-      >
-        <span class="nav-item-icon" aria-hidden="true">⚙️</span>
-        <span class="nav-item-label">配置文件</span>
-      </RouterLink>
-    </div>
   </aside>
 </template>

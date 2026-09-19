@@ -141,6 +141,53 @@ func (s *Server) listPersonaRevisions(writer http.ResponseWriter, request *http.
 	writeJSON(writer, http.StatusOK, map[string]any{"revisions": items, "schema_version": configsvc.PersonaSchemaVersion})
 }
 
+// exportPersona 导出人格公开字段，不包含运行时密钥或会话内容。
+func (s *Server) exportPersona(writer http.ResponseWriter, request *http.Request) {
+	service, err := s.requirePersonas()
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	item, err := service.GetPersona(request.Context(), request.PathValue("id"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writer.Header().Set("Content-Disposition", `attachment; filename="abot-persona.json"`)
+	writeJSON(writer, http.StatusOK, map[string]any{"version": configsvc.PersonaSchemaVersion, "persona": item})
+}
+
+// importPersona 复用人格服务的校验和修订逻辑，避免导入文件绕过启停边界。
+func (s *Server) importPersona(writer http.ResponseWriter, request *http.Request) {
+	service, err := s.requirePersonas()
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	var payload struct {
+		Version int            `json:"version"`
+		Persona personaPayload `json:"persona"`
+	}
+	if err := decodeJSON(writer, request, &payload); err != nil {
+		writeError(writer, fmt.Errorf("请求体无效: %w", err))
+		return
+	}
+	if payload.Version != 0 && payload.Version != configsvc.PersonaSchemaVersion {
+		writeError(writer, fmt.Errorf("%w: 人格文件版本不受支持", configsvc.ErrInvalidRequest))
+		return
+	}
+	description := ""
+	if payload.Persona.Description != nil {
+		description = *payload.Persona.Description
+	}
+	item, err := service.SavePersona(request.Context(), payload.Persona.ID, payload.Persona.Name, description, payload.Persona.Instruction, payload.Persona.Enabled)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, item)
+}
+
 func (s *Server) deletePersona(writer http.ResponseWriter, request *http.Request) {
 	service, err := s.requirePersonas()
 	if err != nil {

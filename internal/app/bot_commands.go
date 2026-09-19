@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"strings"
 
+	agentruntime "Abot/internal/agent/runtime"
 	"Abot/internal/bot"
 	configsvc "Abot/internal/config"
 	"Abot/internal/conversation"
 	"Abot/internal/provider"
+	"Abot/internal/webui"
 	"Abot/internal/workspace"
 )
 
@@ -23,11 +25,14 @@ type commandRuntimeBridge struct {
 	personas      *configsvc.PersonaService
 	workspaces    *workspace.Service
 	conversations *conversation.Service
+	runtime       *agentruntime.Coordinator
 }
 
 var (
-	_ bot.CommandRuntimeInfo  = (*commandRuntimeBridge)(nil)
-	_ bot.CommandRuntimeAdmin = (*commandRuntimeBridge)(nil)
+	_ bot.CommandRuntimeInfo      = (*commandRuntimeBridge)(nil)
+	_ bot.CommandRuntimeAdmin     = (*commandRuntimeBridge)(nil)
+	_ bot.CommandRuntimeStats     = (*commandRuntimeBridge)(nil)
+	_ bot.CommandDashboardUpdater = (*commandRuntimeBridge)(nil)
 )
 
 // CurrentModel reports the model that is actually in effect for the chat, which
@@ -148,6 +153,89 @@ func (b *commandRuntimeBridge) SetModel(ctx context.Context, _, userID, conversa
 func (b *commandRuntimeBridge) SetWorkspace(ctx context.Context, userID, conversationID, workspaceID string) error {
 	_, err := b.conversations.SetWorkspace(ctx, userID, conversationID, strings.TrimSpace(workspaceID))
 	return err
+}
+
+// ConversationUsage 聚合当前会话的所有 Runtime invocation，保持 /stats 与管理台用量投影使用同一份事实源。
+func (b *commandRuntimeBridge) ConversationUsage(ctx context.Context, userID, conversationID string) (bot.CommandUsageStats, error) {
+	if b.runtime == nil {
+		return bot.CommandUsageStats{}, errors.New("Runtime 尚未装配")
+	}
+	items, err := b.runtime.ListInvocations(ctx, strings.TrimSpace(userID), nil)
+	if err != nil {
+		return bot.CommandUsageStats{}, err
+	}
+	stats := bot.CommandUsageStats{}
+	initializeCommandUsageValues(&stats)
+	for _, item := range items {
+		if item.ConversationID != strings.TrimSpace(conversationID) {
+			continue
+		}
+		stats.InvocationCount++
+		usage, usageErr := b.runtime.GetInvocationUsage(ctx, item.ID)
+		if usageErr != nil {
+			return bot.CommandUsageStats{}, usageErr
+		}
+		mergeCommandUsage(&stats, usage)
+	}
+	return stats, nil
+}
+
+// initializeCommandUsageValues 把“尚未聚合”和“已知为零”区分开，避免空会话被误报成未知。
+func initializeCommandUsageValues(stats *bot.CommandUsageStats) {
+	stats.TotalTokens.Known = true
+	stats.PromptTokens.Known = true
+	stats.CachedInputTokens.Known = true
+	stats.ToolUsePromptTokens.Known = true
+	stats.OutputTokens.Known = true
+	stats.ReasoningTokens.Known = true
+}
+
+// mergeCommandUsage 合并普通模型、上下文压缩和模态回退的持久化用量。
+func mergeCommandUsage(stats *bot.CommandUsageStats, usage agentruntime.UsageSummary) {
+	mergeUsageTotals(stats, usage.ModelCalls, usage.UnknownCalls, usage.PromptTokens, usage.CachedInputTokens, usage.ToolUsePromptTokens, usage.OutputTokens, usage.ReasoningTokens, usage.TotalTokens)
+	stats.CompactionModelCalls += usage.Compaction.ModelCalls
+	mergeUsageTotals(stats, usage.Compaction.ModelCalls, usage.Compaction.UnknownCalls, usage.Compaction.PromptTokens, usage.Compaction.CachedInputTokens, usage.Compaction.ToolUsePromptTokens, usage.Compaction.OutputTokens, usage.Compaction.ReasoningTokens, usage.Compaction.TotalTokens)
+	mergeUsageTotals(stats, usage.ModalFallback.ModelCalls, usage.ModalFallback.UnknownCalls, usage.ModalFallback.PromptTokens, usage.ModalFallback.CachedInputTokens, usage.ModalFallback.ToolUsePromptTokens, usage.ModalFallback.OutputTokens, usage.ModalFallback.ReasoningTokens, usage.ModalFallback.TotalTokens)
+}
+
+// mergeUsageTotals 只把有模型调用的分类计入总数，避免空分类的 Known=false 污染真实用量。
+func mergeUsageTotals(stats *bot.CommandUsageStats, modelCalls, unknownCalls int, prompt, cached, toolPrompt, output, reasoning, total agentruntime.UsageValue) {
+	if modelCalls <= 0 {
+		return
+	}
+	stats.ModelCalls += modelCalls
+	stats.UnknownCalls += unknownCalls
+	mergeCommandUsageValue(&stats.PromptTokens, prompt)
+	mergeCommandUsageValue(&stats.CachedInputTokens, cached)
+	mergeCommandUsageValue(&stats.ToolUsePromptTokens, toolPrompt)
+	mergeCommandUsageValue(&stats.OutputTokens, output)
+	mergeCommandUsageValue(&stats.ReasoningTokens, reasoning)
+	mergeCommandUsageValue(&stats.TotalTokens, total)
+}
+
+// mergeCommandUsageValue 在同一字段任一调用未知时保留未知状态，不把缺失数据假装成零。
+func mergeCommandUsageValue(target *bot.CommandUsageValue, value agentruntime.UsageValue) {
+	if !value.Known {
+		target.Known = false
+		return
+	}
+	if target.Known {
+		target.Value += value.Value
+	}
+}
+
+// UpdateDashboard 检查内嵌静态资源是否完整；Abot 不在运行时下载或替换前端文件。
+func (b *commandRuntimeBridge) UpdateDashboard(ctx context.Context) (bot.DashboardUpdateResult, error) {
+	if err := ctx.Err(); err != nil {
+		return bot.DashboardUpdateResult{}, err
+	}
+	if err := webui.CheckEmbeddedDashboard(); err != nil {
+		return bot.DashboardUpdateResult{}, err
+	}
+	return bot.DashboardUpdateResult{
+		Updated: false,
+		Message: "管理台资源检查完成：当前 WebUI 随 Abot 二进制内嵌，当前进程无需在线下载或替换；升级 Abot 后重启即可生效。",
+	}, nil
 }
 
 // providerForModel finds the provider that owns a model id.

@@ -14,6 +14,8 @@ import (
 	"Abot/internal/conversation"
 	"Abot/internal/memory"
 	"Abot/internal/provider"
+	"Abot/internal/schedule"
+	"Abot/internal/sessionrule"
 	"Abot/internal/workspace"
 	"github.com/glebarez/sqlite"
 	"google.golang.org/adk/v2/session"
@@ -41,7 +43,8 @@ func Open(dataDir string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("打开 SQLite 失败: %w", err)
 	}
-	if err := db.AutoMigrate(&providerRow{}, &modelRow{}, &capabilityObservationRow{}, &settingRow{}, &workspaceRow{}, &workspaceOperationRow{}, &workspaceCommandRunRow{}, &workspaceCommandOutputChunkRow{}, &remoteTargetRow{}, &conversationRow{}, &botRow{}, &configProfileRow{}, &configRevisionRow{}, &configBindingRow{}, &systemSettingsRow{}, &personaRow{}, &personaRevisionRow{}, &personaBindingRow{}, &memoryRow{}, &invocationRow{}, &invocationResumeRow{}, &invocationResumeOutboxRow{}, &worktreeBaselineRow{}, &agentEventRow{}, &runtimeEventOutboxRow{}, &runtimeEventDeliveryInboxRow{}, &runtimeEventDeliveryTransactionRow{}, &runtimeCheckpointDeliveryInboxRow{}, &runtimeCheckpointDeliveryOutboxRow{}, &runtimeCheckpointDeliveryTransactionRow{}, &runtimeApprovalRejectionDeliveryOutboxRow{}, &runtimeApprovalRejectionDeliveryInboxRow{}, &runtimeApprovalRejectionDeliveryTransactionRow{}, &runtimeConfigDeliveryInboxRow{}, &runtimeConfigDeliveryOutboxRow{}, &runtimeConfigDeliveryTransactionRow{}, &runtimeConfigDirectoryRow{}, &runtimeConfigDirectoryOutboxRow{}, &runtimeConfigDirectoryFanoutRow{}, &runtimeConfigDirectoryRebindPlanRow{}, &runtimeConfigDirectoryRebindConfirmationRow{}, &runtimeConfigDirectoryRebindApplyRow{}, &runtimeConfigDirectoryRebindMultiConfirmationRow{}, &runtimeConfigDirectoryRebindMultiApplyRow{}, &runtimeConfigDirectoryRebindInboxRow{}, &runtimeDeliveryAttemptRow{}, &runtimeDeliveryGroupRow{}, &runtimeDeliveryGroupTransactionRow{}, &runtimeDeliveryGroupFenceRow{}, &runtimeDeliveryGroupSettlementRow{}, &runtimeDeliveryGroupSagaRow{}, &runtimeDeliveryCompensationRow{}, &approvalRow{}, &toolCallRow{}, &taskPlanRow{}, &taskContractRow{}, &instructionSnapshotSetRow{}, &contextManifestRow{}, &workingSetRow{}, &verificationRunRow{}, &runtimeSnapshotRow{}, &toolSetSnapshotRow{}, &modelCapabilitySnapshotRow{}, &evalRunRow{}, &artifactRow{}, &artifactObjectDeletionRow{}, &botGroupAdminRow{}, &botCommandPolicyRow{}, &botCommandAuditRow{}); err != nil {
+	// 所有新增的管理台数据都纳入同一次迁移，保证旧数据目录升级后仍可直接启动。
+	if err := db.AutoMigrate(&providerRow{}, &modelRow{}, &capabilityObservationRow{}, &settingRow{}, &workspaceRow{}, &workspaceOperationRow{}, &workspaceCommandRunRow{}, &workspaceCommandOutputChunkRow{}, &remoteTargetRow{}, &conversationRow{}, &botRow{}, &botSourceNameRow{}, &configProfileRow{}, &configRevisionRow{}, &configBindingRow{}, &systemSettingsRow{}, &personaRow{}, &personaRevisionRow{}, &personaBindingRow{}, &memoryRow{}, &invocationRow{}, &invocationResumeRow{}, &invocationResumeOutboxRow{}, &worktreeBaselineRow{}, &agentEventRow{}, &runtimeEventOutboxRow{}, &runtimeEventDeliveryInboxRow{}, &runtimeEventDeliveryTransactionRow{}, &runtimeCheckpointDeliveryInboxRow{}, &runtimeCheckpointDeliveryOutboxRow{}, &runtimeCheckpointDeliveryTransactionRow{}, &runtimeApprovalRejectionDeliveryOutboxRow{}, &runtimeApprovalRejectionDeliveryInboxRow{}, &runtimeApprovalRejectionDeliveryTransactionRow{}, &runtimeConfigDeliveryInboxRow{}, &runtimeConfigDeliveryOutboxRow{}, &runtimeConfigDeliveryTransactionRow{}, &runtimeConfigDirectoryRow{}, &runtimeConfigDirectoryOutboxRow{}, &runtimeConfigDirectoryFanoutRow{}, &runtimeConfigDirectoryRebindPlanRow{}, &runtimeConfigDirectoryRebindConfirmationRow{}, &runtimeConfigDirectoryRebindApplyRow{}, &runtimeConfigDirectoryRebindMultiConfirmationRow{}, &runtimeConfigDirectoryRebindMultiApplyRow{}, &runtimeConfigDirectoryRebindInboxRow{}, &runtimeDeliveryAttemptRow{}, &runtimeDeliveryGroupRow{}, &runtimeDeliveryGroupTransactionRow{}, &runtimeDeliveryGroupFenceRow{}, &runtimeDeliveryGroupSettlementRow{}, &runtimeDeliveryGroupSagaRow{}, &runtimeDeliveryCompensationRow{}, &approvalRow{}, &toolCallRow{}, &taskPlanRow{}, &taskContractRow{}, &instructionSnapshotSetRow{}, &contextManifestRow{}, &workingSetRow{}, &verificationRunRow{}, &runtimeSnapshotRow{}, &toolSetSnapshotRow{}, &modelCapabilitySnapshotRow{}, &evalRunRow{}, &artifactRow{}, &artifactObjectDeletionRow{}, &botGroupAdminRow{}, &botCommandPolicyRow{}, &botCommandAuditRow{}, &botSourceNameRow{}, &sessionRuleRow{}, &sessionRuleGroupRow{}, &scheduledTaskRow{}); err != nil {
 		return nil, fmt.Errorf("迁移 Abot 表失败: %w", err)
 	}
 
@@ -156,6 +159,16 @@ func (s *Store) RuntimeConfigDirectoryMaterializer() agentruntime.RuntimeConfigD
 // PersonaRepository 返回独立人格目录、修订和选择绑定仓储。
 func (s *Store) PersonaRepository() config.PersonaRepository {
 	return &configRepository{db: s.db}
+}
+
+// SessionRuleRepository 返回按消息会话来源覆盖配置的规则仓储。
+func (s *Store) SessionRuleRepository() sessionrule.Repository {
+	return &sessionRuleRepository{db: s.db}
+}
+
+// ScheduleRepository 返回未来任务的持久化仓储。
+func (s *Store) ScheduleRepository() schedule.Repository {
+	return &scheduleRepository{db: s.db}
 }
 
 // MemoryRepository 返回长期记忆仓储。

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -366,6 +367,8 @@ func (m *Model) GenerateContent(ctx context.Context, req *adkmodel.LLMRequest, s
 	if err != nil {
 		return errorSequence(fmt.Errorf("编码上游请求失败: %w", err))
 	}
+	// 按用户要求完整记录模型请求 JSON，包含图片 data URL，便于核对实际上游线路格式。
+	slog.Info("OpenAI兼容模型请求", "endpoint", endpoint, "model", req.Model, "wire_format", format, "stream", stream, "request_body", string(body))
 	return func(yield func(*adkmodel.LLMResponse, error) bool) {
 		request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
@@ -376,6 +379,7 @@ func (m *Model) GenerateContent(ctx context.Context, req *adkmodel.LLMRequest, s
 		setAuthHeaders(request, m.apiKey)
 		response, err := m.client.Do(request)
 		if err != nil {
+			slog.Info("OpenAI兼容模型响应", "endpoint", endpoint, "model", req.Model, "wire_format", format, "status", 0, "response_error", err.Error())
 			yield(nil, fmt.Errorf("调用 OpenAI 兼容模型失败: %w", err))
 			return
 		}
@@ -383,25 +387,35 @@ func (m *Model) GenerateContent(ctx context.Context, req *adkmodel.LLMRequest, s
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			responseBody, readErr := readBody(response.Body)
 			if readErr != nil {
+				slog.Info("OpenAI兼容模型响应", "endpoint", endpoint, "model", req.Model, "wire_format", format, "status", response.StatusCode, "response_error", readErr.Error())
 				yield(nil, readErr)
 				return
 			}
+			// 错误响应也保留完整原文，确保能直接看到供应商拒绝的字段和原因。
+			slog.Info("OpenAI兼容模型响应", "endpoint", endpoint, "model", req.Model, "wire_format", format, "status", response.StatusCode, "response_body", string(responseBody))
 			yield(nil, upstreamError(response.StatusCode, responseBody))
 			return
 		}
 		if stream {
+			// TeeReader 不改变流式交付节奏，同时收集上游原文供请求结束后完整记录。
+			var responseCapture bytes.Buffer
+			streamBody := io.TeeReader(response.Body, &responseCapture)
 			if format == WireFormatResponses {
-				readResponsesStream(response.Body, yield)
+				readResponsesStream(streamBody, yield)
 			} else {
-				readChatStream(response.Body, yield)
+				readChatStream(streamBody, yield)
 			}
+			slog.Info("OpenAI兼容模型响应", "endpoint", endpoint, "model", req.Model, "wire_format", format, "status", response.StatusCode, "response_body", responseCapture.String())
 			return
 		}
 		responseBody, err := readBody(response.Body)
 		if err != nil {
+			slog.Info("OpenAI兼容模型响应", "endpoint", endpoint, "model", req.Model, "wire_format", format, "status", response.StatusCode, "response_error", err.Error())
 			yield(nil, err)
 			return
 		}
+		// 非流式响应在解析前完整落日志，便于和最终展示内容对照。
+		slog.Info("OpenAI兼容模型响应", "endpoint", endpoint, "model", req.Model, "wire_format", format, "status", response.StatusCode, "response_body", string(responseBody))
 		var converted *adkmodel.LLMResponse
 		if format == WireFormatResponses {
 			converted, err = parseResponsesResponse(responseBody)
@@ -691,8 +705,10 @@ func appendChatContent(messages *[]ChatMessage, content *genai.Content) error {
 		case part.Text != "":
 			textParts = append(textParts, ChatContentPart{Type: "text", Text: part.Text})
 		case part.InlineData != nil:
-			if isImageMIME(part.InlineData.MIMEType) {
-				textParts = append(textParts, ChatContentPart{Type: "image_url", ImageURL: &ChatImageURL{URL: dataURL(part.InlineData.MIMEType, part.InlineData.Data)}})
+			// 图片在上游边界统一识别实际格式并按体积策略压缩副本，避免把用户原始附件改写。
+			prepared := prepareInlineImage(part.InlineData.DisplayName, part.InlineData.MIMEType, part.InlineData.Data)
+			if isImageMIME(prepared.mimeType) {
+				textParts = append(textParts, ChatContentPart{Type: "image_url", ImageURL: &ChatImageURL{URL: dataURL(prepared.mimeType, prepared.data)}})
 				break
 			}
 			textParts = append(textParts, ChatContentPart{Type: "file", File: &ChatFile{
@@ -786,10 +802,12 @@ func appendResponseContent(items *[]map[string]any, content *genai.Content) erro
 			}
 			messageContent = append(messageContent, map[string]any{"type": typeName, "text": part.Text})
 		case part.InlineData != nil:
-			if isImageMIME(part.InlineData.MIMEType) {
+			// Responses API 同样使用 data URL；保持 Chat 与 Responses 的图片处理策略一致。
+			prepared := prepareInlineImage(part.InlineData.DisplayName, part.InlineData.MIMEType, part.InlineData.Data)
+			if isImageMIME(prepared.mimeType) {
 				messageContent = append(messageContent, map[string]any{
 					"type":      "input_image",
-					"image_url": dataURL(part.InlineData.MIMEType, part.InlineData.Data),
+					"image_url": dataURL(prepared.mimeType, prepared.data),
 				})
 				break
 			}

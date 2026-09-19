@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	configsvc "Abot/internal/config"
+	"Abot/internal/provider"
 )
 
 type configProfilePayload struct {
@@ -315,12 +316,52 @@ func (s *Server) setSystemSettings(writer http.ResponseWriter, request *http.Req
 		writeError(writer, fmt.Errorf("请求体无效: %w", err))
 		return
 	}
+	// 勾选多模态降级但没有手填图片模型时，优先从已探测或手动确认支持图片的
+	// 模型目录补全一个可用选择。这样系统设置只需要打开开关，模型引用仍由目录
+	// 统一提供；找不到明确支持图片的模型时保留原值，让用户可以继续保存其它设置。
+	s.completeModalFallbackSelection(&settings)
 	result, err := service.SaveSystemSettings(request.Context(), settings)
 	if err != nil {
 		writeError(writer, err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, result)
+}
+
+// completeModalFallbackSelection 只补全空的图片降级模型，不覆盖用户已经明确选择
+// 的供应商和模型，也不把未知能力猜成支持。能力未知时仍由 WebUI 的手动选择处理。
+func (s *Server) completeModalFallbackSelection(settings *configsvc.SystemSettings) {
+	if settings == nil || !settings.ModalFallbackEnabled || strings.TrimSpace(settings.ModalFallbackVisionModel) != "" || s.providers == nil {
+		return
+	}
+	providerID := strings.TrimSpace(settings.ModalFallbackProviderID)
+	if providerID == "" {
+		providerID = strings.TrimSpace(s.providers.Default().ProviderID)
+	}
+	if providerID == "" {
+		return
+	}
+	item, err := s.providers.Get(providerID)
+	if err != nil {
+		return
+	}
+	for _, model := range item.Models {
+		if !model.Enabled {
+			continue
+		}
+		profile := model.Capabilities
+		if profile == nil {
+			value := provider.DefaultCapabilities(item, model)
+			profile = &value
+		}
+		state := provider.NormalizeCapabilityProfile(*profile).Images.State
+		if state != provider.SupportSupported && state != provider.SupportDegraded {
+			continue
+		}
+		settings.ModalFallbackProviderID = providerID
+		settings.ModalFallbackVisionModel = model.ID
+		return
+	}
 }
 
 func (s *Server) bindBotConfigProfile(writer http.ResponseWriter, request *http.Request) {

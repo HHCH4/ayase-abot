@@ -37,6 +37,16 @@ type botRow struct {
 
 func (botRow) TableName() string { return "abot_bots" }
 
+// botSourceNameRow 保存 /name 为消息来源设置的显示名称；来源本身是稳定主键。
+type botSourceNameRow struct {
+	Source    string `gorm:"primaryKey;size:500"`
+	Name      string `gorm:"size:300;not null"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+func (botSourceNameRow) TableName() string { return "abot_bot_source_names" }
+
 type botRepository struct {
 	db *gorm.DB
 }
@@ -83,6 +93,10 @@ func (r *botRepository) Delete(ctx context.Context, id string) error {
 		if err := tx.Where("scope = ? AND target_id = ?", "bot", id).Delete(&configBindingRow{}).Error; err != nil {
 			return err
 		}
+		// 机器人删除后同步清理该 adapter 产生的来源别名，避免留下无法再管理的 UMO 元数据。
+		if err := tx.Where("source LIKE ?", "%:"+id+":%").Delete(&botSourceNameRow{}).Error; err != nil {
+			return err
+		}
 		result := tx.Where("id = ?", id).Delete(&botRow{})
 		if result.Error != nil {
 			return result.Error
@@ -92,6 +106,37 @@ func (r *botRepository) Delete(ctx context.Context, id string) error {
 		}
 		return nil
 	})
+}
+
+// GetSourceName 读取来源名称；没有配置名称时按空值返回，避免正常首次读取制造错误日志。
+func (r *botRepository) GetSourceName(ctx context.Context, source string) (string, error) {
+	var row botSourceNameRow
+	err := r.db.WithContext(ctx).Where("source = ?", strings.TrimSpace(source)).First(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(row.Name), nil
+}
+
+// SetSourceName 保存来源名称；空名称用于显式清除旧别名，名称内容不进入其他配置表。
+func (r *botRepository) SetSourceName(ctx context.Context, source, name string) error {
+	source = strings.TrimSpace(source)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return r.db.WithContext(ctx).Where("source = ?", source).Delete(&botSourceNameRow{}).Error
+	}
+	now := time.Now().UTC()
+	row := botSourceNameRow{Source: source, Name: name, CreatedAt: now, UpdatedAt: now}
+	var existing botSourceNameRow
+	if err := r.db.WithContext(ctx).Where("source = ?", source).First(&existing).Error; err == nil {
+		row.CreatedAt = existing.CreatedAt
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	return r.db.WithContext(ctx).Save(&row).Error
 }
 
 func botFromRow(row botRow) bot.Bot {
