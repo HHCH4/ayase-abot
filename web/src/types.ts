@@ -527,6 +527,17 @@ export interface SessionRule {
   updated_at?: string
 }
 
+export interface SessionSource {
+  source: string
+  source_name?: string
+  user_id: string
+  platform?: string
+  message_type?: string
+  session_id?: string
+  status: string
+  updated_at?: string
+}
+
 export interface SessionRuleGroup {
   id: string
   name: string

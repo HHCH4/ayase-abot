@@ -30,6 +30,7 @@ import type {
   PersonaRevision,
   SessionRule,
   SessionRuleGroup,
+  SessionSource,
   ScheduledTask,
   DashboardStats,
   DataLogEntry,
@@ -140,6 +141,12 @@ export async function deletePersona(personaID: string): Promise<void> {
 export async function readSessionRules(query = ''): Promise<SessionRule[]> {
   const result = await request<{ rules: SessionRule[] }>(`/api/v1/session-rules${query.trim() ? `?q=${encodeURIComponent(query.trim())}` : ''}`)
   return result.rules || []
+}
+
+// 读取已经产生过平台消息的会话来源，规则页面据此提供可选 UMO。
+export async function readSessionSources(query = ''): Promise<SessionSource[]> {
+  const result = await request<{ sources: SessionSource[] }>(`/api/v1/session-sources${query.trim() ? `?q=${encodeURIComponent(query.trim())}` : ''}`)
+  return result.sources || []
 }
 
 export async function saveSessionRule(value: Partial<SessionRule> & { source: string }): Promise<SessionRule> {

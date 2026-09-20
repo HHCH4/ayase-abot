@@ -56,6 +56,29 @@ func (r *conversationRepository) List(ctx context.Context, userID, workspaceID s
 	return result, nil
 }
 
+// ListAll 返回实例内的全部会话；该方法只被明确的管理查询调用。
+func (r *conversationRepository) ListAll(ctx context.Context, workspaceID string, includeArchived bool) ([]conversation.Conversation, error) {
+	query := r.db.WithContext(ctx)
+	switch workspaceID {
+	case "", "*":
+		// 空值和星号都表示不限定工作区，便于管理台复用统一查询入口。
+	default:
+		query = query.Where("workspace_id = ?", workspaceID)
+	}
+	if !includeArchived {
+		query = query.Where("status = ?", string(conversation.StatusActive))
+	}
+	var rows []conversationRow
+	if err := query.Order("updated_at DESC, id DESC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	result := make([]conversation.Conversation, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, conversationFromRow(row))
+	}
+	return result, nil
+}
+
 func (r *conversationRepository) Get(ctx context.Context, userID, id string) (conversation.Conversation, error) {
 	var row conversationRow
 	if err := r.db.WithContext(ctx).Where("user_id = ? AND id = ?", userID, id).First(&row).Error; err != nil {

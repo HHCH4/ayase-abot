@@ -425,6 +425,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/v1/conversations/{id}/persona", s.bindConversationPersona)
 	mux.HandleFunc("GET /api/v1/conversations/{id}/persona", s.getConversationPersona)
 	mux.HandleFunc("GET /api/v1/session-rules", s.listSessionRules)
+	mux.HandleFunc("GET /api/v1/session-sources", s.listSessionSources)
 	mux.HandleFunc("POST /api/v1/session-rules", s.createSessionRule)
 	mux.HandleFunc("POST /api/v1/session-rules/batch", s.batchSessionRules)
 	mux.HandleFunc("GET /api/v1/session-rules/{source}", s.getSessionRule)

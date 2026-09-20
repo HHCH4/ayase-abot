@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { NButton, NCard, NCheckbox, NEmpty, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, NSpace, NTag, useMessage } from 'naive-ui'
-import { batchSessionRules, createSessionRule, deleteSessionRule, deleteSessionRuleGroup, readPersonas, readSessionRuleGroups, readSessionRules, saveSessionRule, saveSessionRuleGroup } from '@/api'
+import { batchSessionRules, createSessionRule, deleteSessionRule, deleteSessionRuleGroup, readPersonas, readSessionRuleGroups, readSessionRules, readSessionSources, saveSessionRule, saveSessionRuleGroup } from '@/api'
 import { useAppStore } from '@/stores/app'
-import type { Persona, SessionRule, SessionRuleGroup } from '@/types'
+import type { Persona, SessionRule, SessionRuleGroup, SessionSource } from '@/types'
 
 const store = useAppStore()
 const message = useMessage()
 const rules = ref<SessionRule[]>([])
+const sources = ref<SessionSource[]>([])
 const groups = ref<SessionRuleGroup[]>([])
 const personas = ref<Persona[]>([])
 const selectedSources = ref<string[]>([])
@@ -46,16 +47,30 @@ const modelOptions = computed(() => {
   return values
 })
 const selectedCount = computed(() => selectedSources.value.length)
+const sourceOptions = computed(() => {
+  const options = new Map<string, { label: string; value: string }>()
+  // 优先展示已有消息的来源，让用户像 AstrBot 一样从活跃会话中选择 UMO。
+  for (const item of sources.value) {
+    const detail = [item.platform, item.message_type, item.session_id].filter(Boolean).join(' · ')
+    options.set(item.source, { label: item.source_name ? `${item.source} · ${item.source_name}` : `${item.source}${detail ? `（${detail}）` : ''}`, value: item.source })
+  }
+  // 保留没有最近消息但已经存在规则的来源，避免编辑旧规则时选项消失。
+  for (const item of rules.value) {
+    if (!options.has(item.source)) options.set(item.source, { label: `${item.source}（已有规则）`, value: item.source })
+  }
+  return [...options.values()]
+})
 
 // 读取规则、分组和人格目录，编辑页只使用已存在的配置实体。
 async function load() {
   loading.value = true
   try {
     await store.loadAll()
-    const [ruleItems, groupItems, personaResult] = await Promise.all([readSessionRules(), readSessionRuleGroups(), readPersonas()])
+    const [ruleItems, groupItems, personaResult, sourceItems] = await Promise.all([readSessionRules(), readSessionRuleGroups(), readPersonas(), readSessionSources()])
     rules.value = ruleItems
     groups.value = groupItems
     personas.value = personaResult.personas || []
+    sources.value = sourceItems
     selectedSources.value = selectedSources.value.filter((source) => rules.value.some((item) => item.source === source))
   } catch (error) {
     message.error(error instanceof Error ? error.message : '读取会话规则失败')
@@ -84,6 +99,10 @@ function resetForm(item?: SessionRule) {
 }
 
 function openCreate() {
+  if (!sourceOptions.value.length) {
+    message.info('还没有可配置的消息会话来源，请先让机器人收到一条消息')
+    return
+  }
   resetForm()
   showEditor.value = true
 }
@@ -214,13 +233,13 @@ async function removeGroup(item: SessionRuleGroup) {
       <div>
         <p class="eyebrow">SESSION RULES</p>
         <h2>自定义规则</h2>
-        <p>按 UMO 或 /sid 返回的来源标识覆盖处理、内置 AI、模型、人格和知识库选项；所有规则都在本地内置 Agent 边界内执行。</p>
+        <p>来源从已经产生过消息的会话中选择，按 UMO 覆盖处理、内置 AI、模型、人格和知识库选项；所有规则都在本地内置 Agent 边界内执行。</p>
       </div>
       <NSpace><NButton secondary :loading="loading" @click="load">刷新</NButton><NButton type="primary" @click="openCreate">＋ 新建规则</NButton></NSpace>
     </div>
 
     <NCard class="detail-card" :bordered="false">
-      <div class="section-heading-row"><div><h3>会话来源规则</h3><p>已选 {{ selectedCount }} 条；来源值建议直接复制聊天中的 /sid 结果。</p></div><NButton secondary @click="openGroupCreate">管理分组</NButton></div>
+      <div class="section-heading-row"><div><h3>会话来源规则</h3><p>已选 {{ selectedCount }} 条；可用来源 {{ sources.length }} 个，来源和 UMO 与 AstrBot 保持一致。</p></div><NButton secondary @click="openGroupCreate">管理分组</NButton></div>
       <div class="batch-toolbar">
         <NSelect v-model:value="batchScope" :options="[{ label: '选中会话', value: 'selected' }, { label: '全部会话', value: 'all' }, { label: '群聊来源', value: 'groups' }, { label: '私聊来源', value: 'private' }, { label: '指定分组', value: 'group' }]" style="width: 140px" />
         <NSelect v-if="batchScope === 'group'" v-model:value="batchGroupID" :options="groups.map((item) => ({ label: item.name, value: item.id }))" placeholder="选择分组" style="width: 180px" />
@@ -241,7 +260,7 @@ async function removeGroup(item: SessionRuleGroup) {
 
     <NModal v-model:show="showEditor" preset="card" :mask-closable="false" style="width: min(820px, calc(100vw - 32px))" :title="editingSource ? '编辑会话规则' : '新建会话规则'">
       <NForm label-placement="top" :show-feedback="false">
-        <NFormItem label="消息会话来源" required><NInput v-model:value="form.source" :disabled="Boolean(editingSource)" placeholder="例如：telegram:123456 或 onebot:group:987" /></NFormItem>
+        <NFormItem label="消息会话来源" required><NSelect v-model:value="form.source" :options="sourceOptions" filterable :disabled="Boolean(editingSource)" placeholder="从已产生消息的会话中选择来源" /></NFormItem>
         <div class="form-grid-3"><NFormItem label="处理消息"><NCheckbox v-model:checked="form.process_enabled">启用</NCheckbox></NFormItem><NFormItem label="内置 AI"><NCheckbox v-model:checked="form.llm_enabled">允许调用</NCheckbox></NFormItem><NFormItem label="TTS"><NCheckbox v-model:checked="form.tts_enabled">启用</NCheckbox></NFormItem></div>
         <div class="form-grid-2"><NFormItem label="覆盖聊天模型"><NSelect v-model:value="form.chat_model" clearable filterable :options="modelOptions" placeholder="沿用配置文件模型" /></NFormItem><NFormItem label="人格"><NSelect v-model:value="form.persona_id" clearable :options="personaOptions" placeholder="沿用默认人格" /></NFormItem></div>
         <div class="form-grid-2"><NFormItem label="配置文件"><NSelect v-model:value="form.profile_id" clearable :options="profileOptions" placeholder="沿用当前配置" /></NFormItem><NFormItem label="跟随配置文件"><NCheckbox v-model:checked="form.follow_profile">切换时应用配置文件</NCheckbox></NFormItem></div>

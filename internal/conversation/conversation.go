@@ -88,6 +88,12 @@ type Repository interface {
 	Delete(context.Context, string, string) error
 }
 
+// AllLister 是管理台读取实例级会话的可选仓储扩展。
+// 普通对话接口仍然必须携带 user_id；只有明确的管理查询才允许使用该扩展。
+type AllLister interface {
+	ListAll(context.Context, string, bool) ([]Conversation, error)
+}
+
 // TotalCounter 是仓储的可选统计扩展，用于总览页展示实例内的会话数量。
 // 采用可选接口不改变第三方内存仓储的最小实现契约。
 type TotalCounter interface {
@@ -145,6 +151,25 @@ func (s *Service) List(ctx context.Context, userID, workspaceID string, includeA
 		return nil, fmt.Errorf("%w: user_id 不能为空", ErrInvalidRequest)
 	}
 	items, err := s.repository.List(ctx, userID, strings.TrimSpace(workspaceID), includeArchived)
+	if err != nil {
+		return nil, err
+	}
+	for index := range items {
+		if err := s.enrichSourceName(ctx, &items[index]); err != nil {
+			return nil, err
+		}
+	}
+	return items, nil
+}
+
+// ListAll 列出当前实例的全部会话，供管理台和来源目录使用。
+// 通过可选接口保留第三方仓储的最小实现契约，避免普通用户查询意外越权。
+func (s *Service) ListAll(ctx context.Context, workspaceID string, includeArchived bool) ([]Conversation, error) {
+	lister, ok := s.repository.(AllLister)
+	if !ok {
+		return nil, errors.New("对话 Repository 不支持实例级列表")
+	}
+	items, err := lister.ListAll(ctx, strings.TrimSpace(workspaceID), includeArchived)
 	if err != nil {
 		return nil, err
 	}

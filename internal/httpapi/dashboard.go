@@ -10,6 +10,7 @@ import (
 	"time"
 
 	agentruntime "Abot/internal/agent/runtime"
+	"Abot/internal/conversation"
 	"Abot/internal/logging"
 )
 
@@ -132,10 +133,14 @@ func (s *Server) dataConversations(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	userID := strings.TrimSpace(request.URL.Query().Get("user_id"))
+	var items []conversation.Conversation
 	if userID == "" {
-		userID = "webui-user"
+		// 管理台不应把机器人会话误当成 webui-user；无 user_id 时明确读取实例级数据。
+		items, err = service.ListAll(request.Context(), "*", true)
+	} else {
+		// 保留带 user_id 的查询，兼容需要按用户隔离的调用方。
+		items, err = service.List(request.Context(), userID, "*", true)
 	}
-	items, err := service.List(request.Context(), userID, "*", true)
 	if err != nil {
 		writeError(writer, err)
 		return
@@ -147,7 +152,8 @@ func (s *Server) dataConversations(writer http.ResponseWriter, request *http.Req
 		if status != "" && string(item.Status) != status {
 			continue
 		}
-		if query != "" && !strings.Contains(strings.ToLower(item.Title), query) && !strings.Contains(strings.ToLower(item.ID), query) {
+		searchable := strings.ToLower(strings.Join([]string{item.Title, item.ID, item.UserID, item.Source, item.SourceName}, " "))
+		if query != "" && !strings.Contains(searchable, query) {
 			continue
 		}
 		filtered = append(filtered, item)

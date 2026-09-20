@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { NButton, NCard, NEmpty, NInput, NSelect, NSpace, NTabPane, NTag, NTabs, useMessage } from 'naive-ui'
-import { openDataLogStream, readDataConversations, readDataTraces, readDashboardStats, readInvocationTrace } from '@/api'
-import type { Conversation, DashboardStats, DataLogEntry, InvocationTrace } from '@/types'
+import { NButton, NCard, NEmpty, NInput, NModal, NSelect, NSpace, NTabPane, NTag, NTabs, useMessage } from 'naive-ui'
+import { openDataLogStream, readConversationMessages, readDataConversations, readDataTraces, readDashboardStats, readInvocationTrace } from '@/api'
+import type { Conversation, ConversationMessage, DashboardStats, DataLogEntry, InvocationTrace } from '@/types'
 
 const message = useMessage()
 const activeTab = ref('overview')
@@ -10,6 +10,10 @@ const range = ref('1d')
 const loading = ref(false)
 const stats = ref<DashboardStats | null>(null)
 const conversations = ref<Conversation[]>([])
+const selectedConversation = ref<Conversation | null>(null)
+const conversationMessages = ref<ConversationMessage[]>([])
+const conversationDetailVisible = ref(false)
+const conversationDetailLoading = ref(false)
 const traces = ref<Record<string, unknown>[]>([])
 const logs = ref<DataLogEntry[]>([])
 const conversationQuery = ref('')
@@ -48,6 +52,21 @@ async function loadConversations() {
     conversations.value = result.conversations || []
   } catch (error) {
     message.error(error instanceof Error ? error.message : '读取对话数据失败')
+  }
+}
+
+// 管理台点击会话时复用正式消息接口，确保机器人会话和 WebUI 会话展示同一份历史。
+async function openConversation(item: Conversation) {
+  selectedConversation.value = item
+  conversationMessages.value = []
+  conversationDetailVisible.value = true
+  conversationDetailLoading.value = true
+  try {
+    conversationMessages.value = await readConversationMessages(item.user_id, item.id)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '读取会话消息失败')
+  } finally {
+    conversationDetailLoading.value = false
   }
 }
 
@@ -235,8 +254,8 @@ watch(autoScrollLogs, () => {
       </NTabPane>
 
       <NTabPane name="conversations" tab="对话">
-        <div class="data-toolbar"><NInput v-model:value="conversationQuery" clearable placeholder="搜索标题或对话 ID" /><NSelect v-model:value="conversationStatus" :options="statusOptions" style="width: 140px" /></div>
-        <div v-if="conversations.length" class="data-table-wrap"><table class="data-table"><thead><tr><th>标题 / 来源</th><th>用户</th><th>状态</th><th>更新时间</th></tr></thead><tbody><tr v-for="item in conversations" :key="item.id"><td><strong>{{ item.title || '未命名对话' }}</strong><code>{{ item.source_name || item.source || item.id }}</code></td><td>{{ item.user_id }}</td><td><NTag size="small" :bordered="false">{{ item.status === 'active' ? '进行中' : '已归档' }}</NTag></td><td>{{ formatTime(item.updated_at || item.created_at) }}</td></tr></tbody></table></div>
+        <div class="data-toolbar"><NInput v-model:value="conversationQuery" clearable placeholder="搜索标题、来源或对话 ID" /><NSelect v-model:value="conversationStatus" :options="statusOptions" style="width: 140px" /></div>
+        <div v-if="conversations.length" class="data-table-wrap"><table class="data-table"><thead><tr><th>标题 / 来源</th><th>用户</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody><tr v-for="item in conversations" :key="item.id"><td><strong>{{ item.title || '未命名对话' }}</strong><code>{{ item.source_name || item.source || item.id }}</code></td><td>{{ item.user_id }}</td><td><NTag size="small" :bordered="false">{{ item.status === 'active' ? '进行中' : '已归档' }}</NTag></td><td>{{ formatTime(item.updated_at || item.created_at) }}</td><td><NButton size="small" secondary @click="openConversation(item)">查看对话</NButton></td></tr></tbody></table></div>
         <NEmpty v-else description="暂无匹配对话" />
       </NTabPane>
 
@@ -270,5 +289,24 @@ watch(autoScrollLogs, () => {
         </div>
       </NTabPane>
     </NTabs>
+
+    <NModal v-model:show="conversationDetailVisible" preset="card" :mask-closable="false" style="width: min(860px, calc(100vw - 32px))" :title="selectedConversation?.title || '对话详情'">
+      <div class="conversation-detail-meta">
+        <code>{{ selectedConversation?.source_name || selectedConversation?.source || selectedConversation?.id }}</code>
+        <span>{{ selectedConversation?.user_id }}</span>
+      </div>
+      <div v-if="conversationDetailLoading" class="conversation-detail-loading">正在读取会话消息…</div>
+      <div v-else-if="conversationMessages.length" class="message-panel conversation-detail-panel">
+        <div v-for="(item, index) in conversationMessages" :key="`${item.timestamp || 'message'}-${index}`" class="message-line" :class="{ 'from-user': item.role === 'user' }">
+          <div class="message-avatar">{{ item.role === 'user' ? '你' : 'AI' }}</div>
+          <div class="message-bubble">
+            <pre>{{ item.text || (item.attachment_count ? `附件 ${item.attachment_count} 个` : '（无文本内容）') }}</pre>
+            <div v-if="item.attachment_count" class="message-attachment-count">附件 {{ item.attachment_count }} 个</div>
+            <small>{{ formatTime(item.timestamp) }}</small>
+          </div>
+        </div>
+      </div>
+      <NEmpty v-else description="这个会话暂无可展示消息" />
+    </NModal>
   </div>
 </template>
