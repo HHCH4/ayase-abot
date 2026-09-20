@@ -103,8 +103,8 @@ func Parse(ctx context.Context, name, mimeType string, data []byte) (Result, err
 	}
 
 	// 文件签名优先于上传时的 MIME，避免客户端错误标注导致错误解析器被调用。
-	if bytes.HasPrefix(data, []byte("%PDF-")) {
-		result.Kind = "pdf"
+	if sniffed := sniffDocumentKind(data); sniffed != "" {
+		result.Kind = sniffed
 	}
 
 	switch result.Kind {
@@ -120,10 +120,74 @@ func Parse(ctx context.Context, name, mimeType string, data []byte) (Result, err
 		result.addWarning("旧版 .doc 二进制格式未接入本地解析器，请先转换为 .docx 或 PDF")
 	case "xls":
 		result.addWarning("旧版 .xls 二进制格式未接入本地解析器，请先转换为 .xlsx 或 CSV")
+	case "ole":
+		result.addWarning("旧版 Office 二进制格式未接入本地解析器，请先转换为 .docx、.xlsx 或 PDF")
 	default:
 		result.addWarning("该附件类型没有可用的本地文档解析器")
 	}
 	return result, nil
+}
+
+// IsDocumentData 根据文件内容补充判断文档类型，解决平台把 Word/Excel 文件名
+// 改成随机 ID、MIME 标成 application/octet-stream 时无法进入解析层的问题。
+func IsDocumentData(name, mimeType string, data []byte) bool {
+	if IsDocumentAttachment(name, mimeType) {
+		return true
+	}
+	return sniffDocumentKind(data) != ""
+}
+
+// sniffDocumentKind 只读取文件签名和 ZIP 中央目录，不解压成员，避免为了识别格式
+// 扩大内存占用；真正解析时仍由各格式解析器执行独立大小限制。
+func sniffDocumentKind(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	// PDF 通常从文件头开始；允许前面存在 UTF-8 BOM 或少量空白，兼容部分上传器。
+	prefix := data
+	if len(prefix) > 1024 {
+		prefix = prefix[:1024]
+	}
+	if bytes.Contains(prefix, []byte("%PDF-")) {
+		return "pdf"
+	}
+	if !bytes.HasPrefix(data, []byte("PK\x03\x04")) && !bytes.HasPrefix(data, []byte("PK\x05\x06")) && !bytes.HasPrefix(data, []byte("PK\x07\x08")) {
+		if bytes.HasPrefix(data, []byte("\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")) {
+			return "ole"
+		}
+		return ""
+	}
+	archive, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return ""
+	}
+	hasWord := false
+	hasSpreadsheet := false
+	hasMacro := false
+	for _, file := range archive.File {
+		name := strings.ReplaceAll(file.Name, "\\", "/")
+		switch {
+		case name == "word/document.xml":
+			hasWord = true
+		case name == "xl/workbook.xml":
+			hasSpreadsheet = true
+		case name == "word/vbaProject.bin" || name == "xl/vbaProject.bin":
+			hasMacro = true
+		}
+	}
+	if hasWord {
+		if hasMacro {
+			return "docm"
+		}
+		return "docx"
+	}
+	if hasSpreadsheet {
+		if hasMacro {
+			return "xlsm"
+		}
+		return "xlsx"
+	}
+	return ""
 }
 
 // Render 将解析块按请求需要渲染为带来源标记的模型文本，并执行最终大小限制。

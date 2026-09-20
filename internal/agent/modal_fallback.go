@@ -10,6 +10,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"Abot/internal/document"
 	"Abot/internal/provider"
 	adkmodel "google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
@@ -37,6 +38,16 @@ func (k *Kernel) applyModalFallback(ctx context.Context, request *ChatRequest, p
 		}
 		if mimeType == "" {
 			mimeType = "application/octet-stream"
+		}
+		attachmentName := strings.TrimSpace(attachment.Name)
+		if attachmentName == "" && attachment.Ref != nil {
+			attachmentName = strings.TrimSpace(attachment.Ref.Name)
+		}
+		// PDF、DOCX、XLSX 等办公文档会在 provider 边界由本地解析层转成文本，
+		// 不需要主模型声明原生 file 能力；这里必须保留附件，不能提前降级成“无法读取”。
+		if document.IsDocumentAttachment(attachmentName, mimeType) {
+			kept = append(kept, attachment)
+			continue
 		}
 		if modalCapabilitySupported(mimeType, profile) {
 			kept = append(kept, attachment)

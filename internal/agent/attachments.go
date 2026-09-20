@@ -203,7 +203,9 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 		if text == "" {
 			text = attachmentDescription(ref.Name, ref.MIMEType, ref.Size)
 		}
-		if document.IsDocumentAttachment(ref.Name, ref.MIMEType) {
+		// 除了文件名和 MIME 外，再检查实际文件签名，兼容 OneBot/NapCat 把文档
+		// 文件名改成内部 ID 或把 MIME 标成 application/octet-stream 的情况。
+		if document.IsDocumentData(ref.Name, ref.MIMEType, data) {
 			// PDF、Word、Excel 等格式通常不能直接作为通用模型的 file 输入；
 			// 在 provider 边界转换为带来源定位的文本，原始 Artifact 仍保持不变。
 			parsed, parseErr := document.Parse(ctx, ref.Name, ref.MIMEType, data)
