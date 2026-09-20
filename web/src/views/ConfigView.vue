@@ -53,7 +53,8 @@ const currentFields = computed(() => (store.configSchema.fields || []).filter((f
 }))
 
 // 这些字段保存的都是供应商模型 ID，统一改用已配置目录选择，避免同一个模型在不同页面重复手写。
-const modelFieldKeys = new Set(['ai.default_model_id', 'image.caption_model', 'voice.stt_model', 'voice.tts_model'])
+// 群图片转述与普通多模态降级一样，从现有模型目录选择，避免再次手写模型 ID。
+const modelFieldKeys = new Set(['ai.default_model_id', 'image.caption_model', 'voice.stt_model', 'voice.tts_model', 'extensions.group_image_caption_model'])
 
 function clone(value: unknown): unknown {
   return JSON.parse(JSON.stringify(value ?? {}))

@@ -639,6 +639,18 @@ func Run(opts bootstrap.Options) error {
 			AdminUserIDs:          append([]string(nil), runtime.PlatformAdminIDs...),
 			WakeupWords:           append([]string(nil), runtime.WakeupWords...),
 			PrivateRequiresWakeup: runtime.PrivateRequiresWakeup,
+			// 扩展页设置必须接到实际 Bot 消息链路；列表复制避免配置草稿共享切片。
+			Extensions: bot.ExtensionConfig{
+				SegmentedReplyEnabled: runtime.Extensions.SegmentedReplyEnabled, SegmentOnlyLLM: runtime.Extensions.SegmentOnlyLLM,
+				SegmentIntervalMethod: runtime.Extensions.SegmentIntervalMethod, SegmentInterval: runtime.Extensions.SegmentInterval,
+				SegmentLogBase: runtime.Extensions.SegmentLogBase, SegmentWordsThreshold: runtime.Extensions.SegmentWordsThreshold,
+				SegmentSplitMode: runtime.Extensions.SegmentSplitMode, SegmentRegex: runtime.Extensions.SegmentRegex,
+				SegmentSplitWords: append([]string(nil), runtime.Extensions.SegmentSplitWords...), SegmentCleanupRegex: runtime.Extensions.SegmentCleanupRegex,
+				GroupContextEnabled: runtime.Extensions.GroupContextEnabled, GroupMessageMaxCount: runtime.Extensions.GroupMessageMaxCount,
+				GroupImageCaption: runtime.Extensions.GroupImageCaption, GroupImageCaptionModel: runtime.Extensions.GroupImageCaptionModel,
+				ProactiveReplyEnabled: runtime.Extensions.ProactiveReplyEnabled, ProactiveReplyMethod: runtime.Extensions.ProactiveReplyMethod,
+				ProactiveReplyProbability: runtime.Extensions.ProactiveReplyProbability, ProactiveReplyWhitelist: append([]string(nil), runtime.Extensions.ProactiveReplyWhitelist...),
+			},
 		}, nil
 	})
 	// Chat commands read and (where supported) change configuration through the
@@ -651,6 +663,10 @@ func Run(opts bootstrap.Options) error {
 	botManager.SetCommandRuntimeAdmin(commandBridge)
 	botManager.SetCommandRuntimeStats(commandBridge)
 	botManager.SetCommandDashboardUpdater(commandBridge)
+	// 群图片转述复用已配置的模型目录，消息入口仅接收有界文字结果。
+	botManager.SetGroupImageCaptioner(func(captionCtx context.Context, modelID string, attachment agent.Attachment) (string, error) {
+		return captionGroupImage(captionCtx, registry, modelID, attachment)
+	})
 	botManager.SetAttachmentStorer(func(storeCtx context.Context, request bot.AttachmentStoreRequest) (agent.Attachment, error) {
 		input := request.Attachment
 		if input.Ref != nil {

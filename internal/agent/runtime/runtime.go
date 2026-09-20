@@ -144,6 +144,10 @@ type Invocation struct {
 	ConfigSnapshot       string `json:"-"`
 	ConfigSnapshotDigest string `json:"config_snapshot_digest,omitempty"`
 	Message              string `json:"message,omitempty"`
+	// 群历史是低信任背景，持久化供排队任务重启恢复，但不公开为任务目标。
+	GroupContext string `json:"-"`
+	// 主动回复标记随任务持久化，确保恢复后仍保持无工具权限。
+	Proactive bool `json:"-"`
 	// Attachments are persisted with the accepted input so a queued
 	// invocation recovered after restart is semantically identical. They are
 	// intentionally excluded from the API envelope; future Artifact refs can
@@ -1922,7 +1926,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		request := agent.ChatRequest{
 			UserID: invocation.UserID, IdempotencyKey: invocation.IdempotencyKey, BotID: invocation.BotID, ConversationID: invocation.ConversationID,
 			SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID, WorkspaceID: workspaceID, TargetPath: invocation.TargetPath,
-			Message: invocation.Message, Attachments: cloneAttachments(invocation.Attachments), ConfigSnapshot: invocation.ConfigSnapshot, Stream: true,
+			Message: invocation.Message, GroupContext: invocation.GroupContext, Proactive: invocation.Proactive, Attachments: cloneAttachments(invocation.Attachments), ConfigSnapshot: invocation.ConfigSnapshot, Stream: true,
 		}
 		if resume, resumeErr := c.resumeContentForInvocation(ctx, invocation.ID); resumeErr != nil {
 			message := "runtime_recovery: 读取待恢复工具响应失败: " + resumeErr.Error()
@@ -1935,6 +1939,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		} else if resume != nil {
 			request.ResumeContent = resume
 			request.Message = ""
+			request.GroupContext = ""
 			request.Attachments = nil
 		}
 		c.launch(invocation.ID, request)
@@ -2137,7 +2142,7 @@ func (c *Coordinator) dispatchDueResumeOutbox(ctx context.Context, now time.Time
 		request := agent.ChatRequest{
 			UserID: invocation.UserID, IdempotencyKey: invocation.IdempotencyKey, BotID: invocation.BotID, ConversationID: invocation.ConversationID,
 			SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID, WorkspaceID: workspaceID, TargetPath: invocation.TargetPath,
-			ConfigSnapshot: invocation.ConfigSnapshot, Stream: true,
+			ConfigSnapshot: invocation.ConfigSnapshot, Proactive: invocation.Proactive, Stream: true,
 		}
 		if resume, resumeErr := c.resumeContentForInvocation(ctx, invocation.ID); resumeErr != nil {
 			continue
@@ -4040,6 +4045,10 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 	if strings.TrimSpace(request.Message) == "" && request.ResumeContent == nil && len(request.Attachments) == 0 {
 		return Invocation{}, errors.New("消息内容不能为空")
 	}
+	// 群历史只接收有界内容，避免持久化任务和模型上下文被群消息无限放大。
+	if len(request.GroupContext) > 64*1024 {
+		return Invocation{}, errors.New("群聊背景超出长度上限")
+	}
 	// Serialize the read/check/create admission window. The persistent store's
 	// invocation lease protects execution after admission; this lock closes the
 	// duplicate active invocation race for the current process.
@@ -4099,7 +4108,7 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 		ID: newID("invocation"), UserID: request.UserID, IdempotencyKey: request.IdempotencyKey, BotID: request.BotID,
 		ConversationID: request.ConversationID, WorkspaceID: workspaceID, TargetPath: strings.TrimSpace(request.TargetPath), SessionID: request.SessionID,
 		ProviderID: strings.TrimSpace(request.ProviderID), ModelID: strings.TrimSpace(request.ModelID),
-		Message: request.Message, Attachments: cloneAttachments(request.Attachments),
+		Message: request.Message, GroupContext: request.GroupContext, Proactive: request.Proactive, Attachments: cloneAttachments(request.Attachments),
 		Status: InvocationQueued, CreatedAt: now, UpdatedAt: now,
 	}
 	if err := c.repo.CreateInvocation(ctx, item); err != nil {
@@ -6194,7 +6203,7 @@ func (c *Coordinator) ResolveApprovalChoice(ctx context.Context, approvalID, cho
 	c.launch(invocation.ID, agent.ChatRequest{
 		UserID: invocation.UserID, BotID: invocation.BotID, ConversationID: invocation.ConversationID,
 		SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID, WorkspaceID: workspaceID, TargetPath: invocation.TargetPath,
-		ConfigSnapshot: invocation.ConfigSnapshot, ResumeContent: resume, Stream: true,
+		ConfigSnapshot: invocation.ConfigSnapshot, Proactive: invocation.Proactive, ResumeContent: resume, Stream: true,
 	})
 	return approval, nil
 }
@@ -6764,7 +6773,7 @@ func (c *Coordinator) ResumeInvocation(ctx context.Context, invocationID string,
 	c.launch(invocationID, agent.ChatRequest{
 		UserID: invocation.UserID, BotID: invocation.BotID, ConversationID: invocation.ConversationID,
 		SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID,
-		WorkspaceID: workspaceID, TargetPath: invocation.TargetPath, ConfigSnapshot: invocation.ConfigSnapshot, ResumeContent: resume, Stream: true,
+		WorkspaceID: workspaceID, TargetPath: invocation.TargetPath, ConfigSnapshot: invocation.ConfigSnapshot, Proactive: invocation.Proactive, ResumeContent: resume, Stream: true,
 	})
 	return invocation, nil
 }

@@ -13,6 +13,30 @@ type MessageConfig struct {
 	AdminUserIDs          []string
 	WakeupWords           []string
 	PrivateRequiresWakeup bool
+	// Extensions 在每条消息和每次投递时解析，保证配置文件保存后立即生效。
+	Extensions ExtensionConfig
+}
+
+// ExtensionConfig 仅包含平台消息入口需要的扩展策略，Bot 包不依赖配置中心。
+type ExtensionConfig struct {
+	SegmentedReplyEnabled     bool
+	SegmentOnlyLLM            bool
+	SegmentIntervalMethod     string
+	SegmentInterval           string
+	SegmentLogBase            float64
+	SegmentWordsThreshold     int
+	SegmentSplitMode          string
+	SegmentRegex              string
+	SegmentSplitWords         []string
+	SegmentCleanupRegex       string
+	GroupContextEnabled       bool
+	GroupMessageMaxCount      int
+	GroupImageCaption         bool
+	GroupImageCaptionModel    string
+	ProactiveReplyEnabled     bool
+	ProactiveReplyMethod      string
+	ProactiveReplyProbability float64
+	ProactiveReplyWhitelist   []string
 }
 
 // MessageConfigResolver 按机器人和基础会话读取当前生效的平台配置。
@@ -36,6 +60,10 @@ func (m *Manager) resolveMessageConfig(ctx context.Context, message Message) (Me
 	_, conversationID := bindingFor(message)
 	m.mu.RLock()
 	resolver := m.messageConfigResolver
+	// /new 后优先读取当前会话绑定，避免仍使用旧基础会话的扩展配置。
+	if current := strings.TrimSpace(m.activeConversations[chatBindingKey(message)]); current != "" {
+		conversationID = current
+	}
 	m.mu.RUnlock()
 	if resolver == nil {
 		return MessageConfig{}, nil

@@ -318,6 +318,10 @@ type Manager struct {
 	pendingApprovals    map[string][]approvalTicket
 	pendingUserInputs   map[string][]userInputTicket
 	progressInterval    time.Duration
+	// 群历史只保留有界的近期文本，避免机器人长期运行耗尽树莓派内存。
+	groupHistory      map[string][]string
+	groupHistoryOrder []string
+	groupImageCaption func(context.Context, string, agent.Attachment) (string, error)
 	// commands is the chat command catalog. It is replaced only during
 	// construction or plugin registration, never while dispatching.
 	commands *CommandRegistry
@@ -369,6 +373,7 @@ func NewManager(ctx context.Context, repository Repository, kernel *agent.Kernel
 		progressInterval: 30 * time.Second,
 		commands:         commands,
 		sourceNames:      make(map[string]string),
+		groupHistory:     make(map[string][]string),
 	}
 	for _, item := range items {
 		if item.Status == "" {
@@ -815,6 +820,11 @@ func (m *Manager) send(ctx context.Context, message Message, text string) error 
 
 // Send 允许内置能力或后续插件向已连接的平台主动推送消息。
 func (m *Manager) Send(ctx context.Context, message Message, text string) error {
+	return m.sendConfigured(ctx, message, text, false)
+}
+
+// sendRaw 将一段文本交给平台；分段逻辑在调用前决定，避免递归拆分。
+func (m *Manager) sendRaw(ctx context.Context, message Message, text string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}

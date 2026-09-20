@@ -31,16 +31,19 @@ type invocationRow struct {
 	ModelID                        string `gorm:"size:300"`
 	ConfigSnapshot                 string `gorm:"type:text"`
 	Message                        string `gorm:"type:text"`
-	AttachmentsJSON                string `gorm:"type:text"`
-	Status                         string `gorm:"index;size:40;not null"`
-	Error                          string `gorm:"type:text"`
-	ActiveApprovalID               string `gorm:"index;size:100"`
-	LeaseOwner                     string `gorm:"index;size:160"`
-	LeaseExpiresAt                 *time.Time
-	CreatedAt                      time.Time
-	UpdatedAt                      time.Time
-	StartedAt                      *time.Time
-	FinishedAt                     *time.Time
+	// 群历史与主动回复权限随任务保存，避免重启后恢复时语义改变。
+	GroupContext     string `gorm:"type:text"`
+	Proactive        bool
+	AttachmentsJSON  string `gorm:"type:text"`
+	Status           string `gorm:"index;size:40;not null"`
+	Error            string `gorm:"type:text"`
+	ActiveApprovalID string `gorm:"index;size:100"`
+	LeaseOwner       string `gorm:"index;size:160"`
+	LeaseExpiresAt   *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	StartedAt        *time.Time
+	FinishedAt       *time.Time
 }
 
 func (invocationRow) TableName() string { return "abot_agent_invocations" }
@@ -3475,7 +3478,7 @@ func (r *runtimeRepository) ReplaceInstructionSnapshotSet(ctx context.Context, i
 
 func invocationToRow(item agentruntime.Invocation) *invocationRow {
 	attachments, _ := json.Marshal(item.Attachments)
-	return &invocationRow{ID: item.ID, UserID: item.UserID, IdempotencyKey: item.IdempotencyKey, BotID: item.BotID, ConversationID: item.ConversationID, WorkspaceID: item.WorkspaceID, TargetPath: item.TargetPath, SessionID: item.SessionID, ParentInvocationID: item.ParentInvocationID, ContinuationDecision: string(item.ContinuationDecision), ContinuationSourcePlanRevision: item.ContinuationSourcePlanRevision, ProviderID: item.ProviderID, ModelID: item.ModelID, ConfigSnapshot: item.ConfigSnapshot, Message: item.Message, AttachmentsJSON: string(attachments), Status: string(item.Status), Error: item.Error, ActiveApprovalID: item.ActiveApprovalID, LeaseOwner: item.LeaseOwner, LeaseExpiresAt: item.LeaseExpiresAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt, StartedAt: item.StartedAt, FinishedAt: item.FinishedAt}
+	return &invocationRow{ID: item.ID, UserID: item.UserID, IdempotencyKey: item.IdempotencyKey, BotID: item.BotID, ConversationID: item.ConversationID, WorkspaceID: item.WorkspaceID, TargetPath: item.TargetPath, SessionID: item.SessionID, ParentInvocationID: item.ParentInvocationID, ContinuationDecision: string(item.ContinuationDecision), ContinuationSourcePlanRevision: item.ContinuationSourcePlanRevision, ProviderID: item.ProviderID, ModelID: item.ModelID, ConfigSnapshot: item.ConfigSnapshot, Message: item.Message, GroupContext: item.GroupContext, Proactive: item.Proactive, AttachmentsJSON: string(attachments), Status: string(item.Status), Error: item.Error, ActiveApprovalID: item.ActiveApprovalID, LeaseOwner: item.LeaseOwner, LeaseExpiresAt: item.LeaseExpiresAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt, StartedAt: item.StartedAt, FinishedAt: item.FinishedAt}
 }
 
 func invocationFromRow(row invocationRow) agentruntime.Invocation {
@@ -3483,7 +3486,7 @@ func invocationFromRow(row invocationRow) agentruntime.Invocation {
 	if strings.TrimSpace(row.AttachmentsJSON) != "" {
 		_ = json.Unmarshal([]byte(row.AttachmentsJSON), &attachments)
 	}
-	return agentruntime.Invocation{ID: row.ID, UserID: row.UserID, IdempotencyKey: row.IdempotencyKey, BotID: row.BotID, ConversationID: row.ConversationID, WorkspaceID: row.WorkspaceID, TargetPath: row.TargetPath, SessionID: row.SessionID, ParentInvocationID: row.ParentInvocationID, ContinuationDecision: agentruntime.WorkflowContinuationDecision(row.ContinuationDecision), ContinuationSourcePlanRevision: row.ContinuationSourcePlanRevision, ProviderID: row.ProviderID, ModelID: row.ModelID, ConfigSnapshot: row.ConfigSnapshot, ConfigSnapshotDigest: agent.RuntimeConfigSnapshotDigest(row.ConfigSnapshot), Message: row.Message, Attachments: attachments, Status: agentruntime.InvocationStatus(row.Status), Error: row.Error, ActiveApprovalID: row.ActiveApprovalID, LeaseOwner: row.LeaseOwner, LeaseExpiresAt: row.LeaseExpiresAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt}
+	return agentruntime.Invocation{ID: row.ID, UserID: row.UserID, IdempotencyKey: row.IdempotencyKey, BotID: row.BotID, ConversationID: row.ConversationID, WorkspaceID: row.WorkspaceID, TargetPath: row.TargetPath, SessionID: row.SessionID, ParentInvocationID: row.ParentInvocationID, ContinuationDecision: agentruntime.WorkflowContinuationDecision(row.ContinuationDecision), ContinuationSourcePlanRevision: row.ContinuationSourcePlanRevision, ProviderID: row.ProviderID, ModelID: row.ModelID, ConfigSnapshot: row.ConfigSnapshot, ConfigSnapshotDigest: agent.RuntimeConfigSnapshotDigest(row.ConfigSnapshot), Message: row.Message, GroupContext: row.GroupContext, Proactive: row.Proactive, Attachments: attachments, Status: agentruntime.InvocationStatus(row.Status), Error: row.Error, ActiveApprovalID: row.ActiveApprovalID, LeaseOwner: row.LeaseOwner, LeaseExpiresAt: row.LeaseExpiresAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt}
 }
 
 func invocationResumeFromRow(row invocationResumeRow) agentruntime.InvocationResume {

@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -178,9 +180,33 @@ type Runtime struct {
 	PlatformAdminIDs      []string
 	WakeupWords           []string
 	PrivateRequiresWakeup bool
-	MemoryEnabled         bool
-	MemoryAutoRetrieve    bool
-	MemoryMaxResults      int
+	// 扩展配置由 Bot 入口消费；按配置文件解析，避免界面开关只停留在数据库。
+	Extensions         ExtensionSettings
+	MemoryEnabled      bool
+	MemoryAutoRetrieve bool
+	MemoryMaxResults   int
+}
+
+// ExtensionSettings 汇总 AstrBot 扩展页的三组内置行为，所有上限都在 Schema 校验。
+type ExtensionSettings struct {
+	SegmentedReplyEnabled     bool
+	SegmentOnlyLLM            bool
+	SegmentIntervalMethod     string
+	SegmentInterval           string
+	SegmentLogBase            float64
+	SegmentWordsThreshold     int
+	SegmentSplitMode          string
+	SegmentRegex              string
+	SegmentSplitWords         []string
+	SegmentCleanupRegex       string
+	GroupContextEnabled       bool
+	GroupMessageMaxCount      int
+	GroupImageCaption         bool
+	GroupImageCaptionModel    string
+	ProactiveReplyEnabled     bool
+	ProactiveReplyMethod      string
+	ProactiveReplyProbability float64
+	ProactiveReplyWhitelist   []string
 }
 
 // Repository 是配置中心需要的持久化能力，SQLite 实现位于 storage/sqlite，便于单元测试替换。
@@ -443,6 +469,25 @@ func (s *Service) ValidateValues(ctx context.Context, values Values) error {
 	if err := validateSlidingCompactionValues(values); err != nil {
 		return err
 	}
+	// 正则和间隔在保存时检查，避免运行中的平台回复因无效配置丢失。
+	for _, key := range []string{"extensions.segment_regex", "extensions.segment_cleanup_regex"} {
+		if pattern := stringOr(values[key]); pattern != "" {
+			if len(pattern) > 512 {
+				return fmt.Errorf("%w: %s 长度不能超过 512", ErrInvalidRequest, key)
+			}
+			if _, err := regexp.Compile(pattern); err != nil {
+				return fmt.Errorf("%w: %s 正则表达式无效: %v", ErrInvalidRequest, key, err)
+			}
+		}
+	}
+	if _, exists := values["extensions.segment_interval"]; exists {
+		if _, _, err := parseSegmentInterval(stringOr(values["extensions.segment_interval"])); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	}
+	if boolOr(values["extensions.group_image_caption"], false) && strings.TrimSpace(stringOr(values["extensions.group_image_caption_model"])) == "" {
+		return fmt.Errorf("%w: 自动理解群图片需要选择群图片转述模型", ErrInvalidRequest)
+	}
 	providerID, _ := values["ai.default_provider_id"].(string)
 	modelID, _ := values["ai.default_model_id"].(string)
 	if s.modelValidator != nil {
@@ -451,6 +496,21 @@ func (s *Service) ValidateValues(ctx context.Context, values Values) error {
 		}
 	}
 	return nil
+}
+
+// parseSegmentInterval 要求两个有界秒数且下限不大于上限，防止异常配置造成长时间阻塞。
+func parseSegmentInterval(value string) (float64, float64, error) {
+	// 严格拆分两个数字，拒绝带额外尾随内容的设置。
+	parts := strings.Split(value, ",")
+	if len(parts) != 2 {
+		return 0, 0, errors.New("分段随机间隔必须是 0-10 秒内的 最小值,最大值")
+	}
+	minimum, minErr := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	maximum, maxErr := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if minErr != nil || maxErr != nil || math.IsNaN(minimum) || math.IsNaN(maximum) || math.IsInf(minimum, 0) || math.IsInf(maximum, 0) || minimum < 0 || maximum > 10 || minimum > maximum {
+		return 0, 0, errors.New("分段随机间隔必须是 0-10 秒内的 最小值,最大值")
+	}
+	return minimum, maximum, nil
 }
 
 // validateSlidingCompactionValues enforces the relationship between the two
@@ -736,9 +796,27 @@ func buildSchema() Schema {
 		{Key: "platform.private_requires_wakeup", Group: "platform", Label: "私聊需要唤醒词", Type: "boolean", Default: false, Help: "平台适配器可据此过滤未唤醒消息。"},
 		{Key: "platform.reply_prefix", Group: "platform", Label: "回复文本前缀", Type: "string", Default: "", Help: "平台输出前追加的前缀。"},
 		{Key: "platform.reply_mention", Group: "platform", Label: "回复时 @ 发送人", Type: "boolean", Default: false, Help: "平台适配器支持时引用发送人。"},
-		{Key: "extensions.segmented_reply_enabled", Group: "extensions", Label: "分段回复", Type: "boolean", Default: false, Help: "按平台能力将内置 Agent 的长回复拆分。"},
-		{Key: "extensions.group_context_enabled", Group: "extensions", Label: "群聊上下文感知", Type: "boolean", Default: false, Help: "将群聊历史作为会话上下文，仍受当前会话边界限制。"},
-		{Key: "extensions.proactive_reply_enabled", Group: "extensions", Label: "主动回复", Type: "boolean", Default: false, Help: "平台主动回复需要白名单和本地调度器共同启用。"},
+		// 分段回复只作用于平台文本投递；短消息按标点拆段，长消息保持原样。
+		{Key: "extensions.segmented_reply_enabled", Group: "extensions", Label: "启用分段回复", Type: "boolean", Default: false, Help: "按下列规则将 Bot 文本回复分段发送。"},
+		{Key: "extensions.segment_only_llm", Group: "extensions", Label: "仅对 LLM 结果分段", Type: "boolean", Default: true, DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}, Help: "开启时指令、审批和运行状态消息不会被拆分。"},
+		{Key: "extensions.segment_interval_method", Group: "extensions", Label: "分段间隔方法", Type: "select", Default: "random", Options: []SchemaOption{{Value: "random", Label: "随机间隔"}, {Value: "log", Label: "按字数计算"}}, DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}},
+		{Key: "extensions.segment_interval", Group: "extensions", Label: "随机间隔（秒）", Type: "string", Default: "1.5,3.5", DisplayIf: map[string]any{"extensions.segment_interval_method": "random", "extensions.segmented_reply_enabled": true}, Help: "填写最小值,最大值，例如 1.5,3.5。"},
+		{Key: "extensions.segment_log_base", Group: "extensions", Label: "对数底数", Type: "number", Default: 2.6, Min: floatPtr(1.01), Max: floatPtr(10), DisplayIf: map[string]any{"extensions.segment_interval_method": "log", "extensions.segmented_reply_enabled": true}},
+		{Key: "extensions.segment_words_threshold", Group: "extensions", Label: "分段字数阈值", Type: "integer", Default: 150, Min: floatPtr(1), Max: floatPtr(5000), DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}, Help: "超过阈值的长回复直接发送，不拆段。"},
+		{Key: "extensions.segment_split_mode", Group: "extensions", Label: "分段模式", Type: "select", Default: "regex", Options: []SchemaOption{{Value: "regex", Label: "正则表达式"}, {Value: "words", Label: "分段词列表"}}, DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}},
+		{Key: "extensions.segment_regex", Group: "extensions", Label: "分段正则表达式", Type: "string", Default: ".*?[。？！~…]+|.+$", DisplayIf: map[string]any{"extensions.segment_split_mode": "regex", "extensions.segmented_reply_enabled": true}, Help: "按正则匹配片段，使用 Go/RE2 语法。"},
+		{Key: "extensions.segment_split_words", Group: "extensions", Label: "分段词列表", Type: "list", Default: []string{"。", "？", "！", "~", "…"}, DisplayIf: map[string]any{"extensions.segment_split_mode": "words", "extensions.segmented_reply_enabled": true}, Help: "逐项添加分隔词；发送时移除命中的分隔词。"},
+		{Key: "extensions.segment_cleanup_regex", Group: "extensions", Label: "内容过滤正则表达式", Type: "string", Default: "", DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}, Help: "在拆分后移除匹配文本。"},
+		// 群聊历史记录所有入站群消息，包括未唤醒消息；仅在触发 AI 时注入同一 UMO 的有界历史。
+		{Key: "extensions.group_context_enabled", Group: "extensions", Label: "群聊上下文感知", Type: "boolean", Default: false, Help: "记录同一群来源的近期消息，并在触发 AI 时提供给模型。"},
+		{Key: "extensions.group_message_max_count", Group: "extensions", Label: "最多注入群消息数", Type: "integer", Default: 300, Min: floatPtr(1), Max: floatPtr(300), DisplayIf: map[string]any{"extensions.group_context_enabled": true}},
+		{Key: "extensions.group_image_caption", Group: "extensions", Label: "自动理解群图片", Type: "boolean", Default: false, DisplayIf: map[string]any{"extensions.group_context_enabled": true}, Help: "群图片转述需要选择支持图片的模型。"},
+		{Key: "extensions.group_image_caption_model", Group: "extensions", Label: "群图片转述模型", Type: "string", Default: "", DisplayIf: map[string]any{"extensions.group_image_caption": true, "extensions.group_context_enabled": true}, Help: "从已配置模型中选择；与普通图片降级模型独立。"},
+		// 主动回复只在未明确唤醒的群消息上抽样，来源白名单使用 /sid 显示的 UMO。
+		{Key: "extensions.proactive_reply_enabled", Group: "extensions", Label: "主动回复", Type: "boolean", Default: false, Help: "按概率回复未唤醒的群消息。"},
+		{Key: "extensions.proactive_reply_method", Group: "extensions", Label: "主动回复方法", Type: "select", Default: "possibility_reply", Options: []SchemaOption{{Value: "possibility_reply", Label: "概率回复"}}, DisplayIf: map[string]any{"extensions.proactive_reply_enabled": true}},
+		{Key: "extensions.proactive_reply_probability", Group: "extensions", Label: "主动回复概率", Type: "number", Default: 0.1, Min: floatPtr(0), Max: floatPtr(1), DisplayIf: map[string]any{"extensions.proactive_reply_enabled": true}},
+		{Key: "extensions.proactive_reply_whitelist", Group: "extensions", Label: "主动回复白名单", Type: "list", Default: []string{}, DisplayIf: map[string]any{"extensions.proactive_reply_enabled": true}, Help: "逐项添加 UMO 或群 ID；留空允许所有群。"},
 		{Key: "memory.enabled", Group: "memory", Label: "启用长期记忆", Type: "boolean", Default: false, Help: "开启后 Agent 可以检索并在用户明确要求时保存跨会话记忆。"},
 		{Key: "memory.auto_retrieve", Group: "memory", Label: "每轮自动检索", Type: "boolean", Default: false, DisplayIf: map[string]any{"memory.enabled": true}, Help: "每轮请求自动把相关记忆放入提示词；关闭时仍可由 Agent 按需检索。"},
 		{Key: "memory.max_results", Group: "memory", Label: "最多检索记忆数", Type: "integer", Default: 8, Min: floatPtr(1), Max: floatPtr(50), DisplayIf: map[string]any{"memory.enabled": true}, Help: "限制单轮注入或返回给 Agent 的记忆数量。"},
@@ -778,9 +856,20 @@ func runtimeFromValues(values Values) Runtime {
 		PlatformAdminIDs:              stringListOr(values["platform.admin_ids"]),
 		WakeupWords:                   stringListOr(values["platform.wakeup_words"]),
 		PrivateRequiresWakeup:         boolOr(values["platform.private_requires_wakeup"], false),
-		MemoryEnabled:                 boolOr(values["memory.enabled"], false),
-		MemoryAutoRetrieve:            boolOr(values["memory.auto_retrieve"], false),
-		MemoryMaxResults:              intOr(values["memory.max_results"], 8),
+		Extensions: ExtensionSettings{
+			SegmentedReplyEnabled: boolOr(values["extensions.segmented_reply_enabled"], false), SegmentOnlyLLM: boolOr(values["extensions.segment_only_llm"], true),
+			SegmentIntervalMethod: stringOrDefault(values["extensions.segment_interval_method"], "random"), SegmentInterval: stringOrDefault(values["extensions.segment_interval"], "1.5,3.5"),
+			SegmentLogBase: numberOr(values["extensions.segment_log_base"], 2.6), SegmentWordsThreshold: intOr(values["extensions.segment_words_threshold"], 150),
+			SegmentSplitMode: stringOrDefault(values["extensions.segment_split_mode"], "regex"), SegmentRegex: stringOrDefault(values["extensions.segment_regex"], ".*?[。？！~…]+|.+$"),
+			SegmentSplitWords: stringListOr(values["extensions.segment_split_words"]), SegmentCleanupRegex: stringOr(values["extensions.segment_cleanup_regex"]),
+			GroupContextEnabled: boolOr(values["extensions.group_context_enabled"], false), GroupMessageMaxCount: intOr(values["extensions.group_message_max_count"], 300),
+			GroupImageCaption: boolOr(values["extensions.group_image_caption"], false), GroupImageCaptionModel: stringOr(values["extensions.group_image_caption_model"]),
+			ProactiveReplyEnabled: boolOr(values["extensions.proactive_reply_enabled"], false), ProactiveReplyMethod: stringOrDefault(values["extensions.proactive_reply_method"], "possibility_reply"),
+			ProactiveReplyProbability: numberOr(values["extensions.proactive_reply_probability"], 0.1), ProactiveReplyWhitelist: stringListOr(values["extensions.proactive_reply_whitelist"]),
+		},
+		MemoryEnabled:      boolOr(values["memory.enabled"], false),
+		MemoryAutoRetrieve: boolOr(values["memory.auto_retrieve"], false),
+		MemoryMaxResults:   intOr(values["memory.max_results"], 8),
 	}
 }
 

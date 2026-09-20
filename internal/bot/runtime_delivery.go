@@ -137,6 +137,13 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	if message.Control != nil {
 		return m.handleApprovalControl(ctx, message)
 	}
+	// 群历史在唤醒判断前记录，使未 @ 的成员发言也能进入同一来源的背景。
+	extensionConfig, extensionErr := m.resolveMessageConfig(ctx, message)
+	if extensionErr == nil {
+		m.recordGroupContext(ctx, message, extensionConfig.Extensions)
+	} else {
+		slog.Warn("读取群聊扩展配置失败", "adapter_id", message.AdapterID, "error", extensionErr)
+	}
 	if message.Text == "" && len(message.Attachments) == 0 {
 		// 空消息不会进入 Agent，但仍保留忽略原因，方便排查平台事件解析问题。
 		slog.Info("机器人请求已忽略", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "reason", "empty")
@@ -156,6 +163,13 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	if admissionErr != nil {
 		return fmt.Errorf("读取平台消息配置失败: %w", admissionErr)
 	}
+	proactive := false
+	if !allowed && extensionErr == nil && shouldProactiveReply(message, extensionConfig.Extensions) {
+		// 主动回复只改变本轮的触发判定，后续仍走普通内置 Runtime 和会话权限。
+		allowed = true
+		proactive = true
+		slog.Info("群聊主动回复已触发", "source", messageSource(message), "user_id", message.UserID)
+	}
 	if !allowed {
 		// 未满足群聊触发或私聊唤醒条件时忽略，同时打印完整判断上下文。
 		slog.Info("机器人请求已忽略", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "text", rawText, "mentioned", message.Mentioned, "reason", "wakeup_not_met")
@@ -169,6 +183,12 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	command, isCommand := parseBotCommand(message.Text)
 	if isCommand {
 		return m.handleBotCommand(ctx, message, command)
+	}
+	// 群历史独立传递，不能混进任务目标或授权判断。
+	idempotencyKey := botMessageIdempotencyKey(message)
+	groupContext := ""
+	if extensionErr == nil && (extensionConfig.Extensions.GroupContextEnabled || proactive) {
+		groupContext = m.groupContextText(message, extensionConfig.Extensions)
 	}
 
 	userID, conversationID, err := m.conversationForMessage(ctx, message)
@@ -200,14 +220,14 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	if coordinator == nil {
 		// 兼容没有装配 Durable Runtime 的嵌入方，并记录本次完整输入。
 		slog.Info("机器人请求进入兼容 Agent 执行", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "text", message.Text, "attachments", attachments, "timeout", timeout)
-		return m.handleLegacyMessage(ctx, message, userID, conversationID, attachments, timeout)
+		return m.handleLegacyMessage(ctx, message, groupContext, proactive, userID, conversationID, attachments, timeout)
 	}
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
 	request := agent.ChatRequest{
 		UserID: userID, BotID: message.AdapterID, ConversationID: conversationID, SessionID: conversationID,
-		Message: message.Text, Attachments: attachments, IdempotencyKey: botMessageIdempotencyKey(message), Stream: true,
+		Message: message.Text, GroupContext: groupContext, Proactive: proactive, Attachments: attachments, IdempotencyKey: idempotencyKey, Stream: true,
 	}
 	if workspaceID := strings.TrimSpace(item.WorkspaceID); workspaceID != "" {
 		request.WorkspaceID = &workspaceID
@@ -229,13 +249,13 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	return nil
 }
 
-func (m *Manager) handleLegacyMessage(ctx context.Context, message Message, userID, conversationID string, attachments []agent.Attachment, timeout time.Duration) error {
+func (m *Manager) handleLegacyMessage(ctx context.Context, message Message, groupContext string, proactive bool, userID, conversationID string, attachments []agent.Attachment, timeout time.Duration) error {
 	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var response string
 	for event, runErr := range m.kernel.Run(requestCtx, agent.ChatRequest{
 		UserID: userID, BotID: message.AdapterID, ConversationID: conversationID, SessionID: conversationID,
-		Message: message.Text, Attachments: attachments,
+		Message: message.Text, GroupContext: groupContext, Proactive: proactive, Attachments: attachments,
 	}) {
 		if runErr != nil {
 			_ = m.send(requestCtx, message, "处理失败："+trimError(runErr))
@@ -253,7 +273,7 @@ func (m *Manager) handleLegacyMessage(ctx context.Context, message Message, user
 	}
 	// 兼容执行模式直接得到最终文本，发送动作本身还会由 Manager.Send 记录。
 	slog.Info("机器人兼容 Agent 返回响应", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "text", response)
-	return m.send(requestCtx, message, response)
+	return m.sendLLM(requestCtx, message, response)
 }
 
 func (m *Manager) groupMessageAllowed(message Message) bool {
@@ -732,7 +752,7 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 			case agentruntime.EventAssistantMessage:
 				if text := eventString(event.Data, "text"); text != "" {
 					sentResponse = true
-					_ = m.send(baseCtx, message, text)
+					_ = m.sendLLM(baseCtx, message, text)
 				}
 			case agentruntime.EventApprovalRequested:
 				m.deliverApproval(baseCtx, message, event)
