@@ -71,12 +71,7 @@ type Result struct {
 // 旧版 .doc/.xls 也返回 true，这样它们不会被误当作可直接阅读的二进制送给模型，
 // 而是得到明确的“不支持该格式”的提示。
 func IsDocumentAttachment(name, mimeType string) bool {
-	switch documentKind(name, mimeType) {
-	case "pdf", "docx", "docm", "doc", "xlsx", "xlsm", "xls", "csv", "tsv":
-		return true
-	default:
-		return false
-	}
+	return isDocumentKind(documentKind(name, mimeType))
 }
 
 // Parse 按文件类型执行本地解析。解析失败会保留在 Result.Warnings 中，
@@ -131,10 +126,57 @@ func Parse(ctx context.Context, name, mimeType string, data []byte) (Result, err
 // IsDocumentData 根据文件内容补充判断文档类型，解决平台把 Word/Excel 文件名
 // 改成随机 ID、MIME 标成 application/octet-stream 时无法进入解析层的问题。
 func IsDocumentData(name, mimeType string, data []byte) bool {
-	if IsDocumentAttachment(name, mimeType) {
-		return true
+	return DetectDocumentKind(name, mimeType, data) != ""
+}
+
+// DetectDocumentKind 返回元数据或内容签名推断出的文档类型。元数据已明确时优先
+// 使用元数据；只有平台没有给出可识别类型时才读取内容签名，避免覆盖合法扩展名。
+func DetectDocumentKind(name, mimeType string, data []byte) string {
+	kind := documentKind(name, mimeType)
+	if isDocumentKind(kind) {
+		return kind
 	}
-	return sniffDocumentKind(data) != ""
+	return sniffDocumentKind(data)
+}
+
+// CanonicalMIMEType 把解析器识别出的类型转换成稳定 MIME，供能力协商和后续
+// provider 边界共用；旧 Office 容器使用内部标记，仍会进入可解释的提示路径。
+func CanonicalMIMEType(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "pdf":
+		return "application/pdf"
+	case "docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case "docm":
+		return "application/vnd.ms-word.document.macroenabled.12"
+	case "doc":
+		return "application/msword"
+	case "xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case "xlsm":
+		return "application/vnd.ms-excel.sheet.macroenabled.12"
+	case "xls":
+		return "application/vnd.ms-excel"
+	case "csv":
+		return "text/csv"
+	case "tsv":
+		return "text/tab-separated-values"
+	case "ole":
+		return "application/x-ole-storage"
+	default:
+		return ""
+	}
+}
+
+// isDocumentKind 集中维护可以进入本地解析层的格式，防止格式识别和能力协商
+// 各自维护一套列表后再次出现分支不一致。
+func isDocumentKind(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "pdf", "docx", "docm", "doc", "xlsx", "xlsm", "xls", "csv", "tsv", "ole":
+		return true
+	default:
+		return false
+	}
 }
 
 // sniffDocumentKind 只读取文件签名和 ZIP 中央目录，不解压成员，避免为了识别格式
@@ -269,6 +311,8 @@ func documentKind(name, mimeType string) string {
 		return "doc"
 	case "application/vnd.ms-excel":
 		return "xls"
+	case "application/x-ole-storage":
+		return "ole"
 	case "text/csv", "application/csv":
 		return "csv"
 	case "text/tab-separated-values":

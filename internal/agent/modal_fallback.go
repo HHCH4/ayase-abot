@@ -53,6 +53,24 @@ func (k *Kernel) applyModalFallback(ctx context.Context, request *ChatRequest, p
 			kept = append(kept, attachment)
 			continue
 		}
+		// 平台可能不给 Office 文件扩展名或 MIME；在能力降级前用受限读取做一次
+		// 内容识别，避免文件还没到文档解析层就被当作不支持的通用二进制丢弃。
+		if !strings.HasPrefix(mimeType, "image/") && !strings.HasPrefix(mimeType, "audio/") {
+			if data, readErr := k.materializeFallbackAttachment(ctx, request.UserID, attachment); readErr == nil {
+				if kind := document.DetectDocumentKind(attachmentName, mimeType, data); kind != "" {
+					if inferredMIME := document.CanonicalMIMEType(kind); inferredMIME != "" {
+						attachment.MIMEType = inferredMIME
+						if attachment.Ref != nil {
+							ref := *attachment.Ref
+							ref.MIMEType = inferredMIME
+							attachment.Ref = &ref
+						}
+						kept = append(kept, attachment)
+						continue
+					}
+				}
+			}
+		}
 
 		modality, fallbackModel := modalFallbackTarget(mimeType, runtime)
 		text := ""
