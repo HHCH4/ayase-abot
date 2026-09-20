@@ -221,6 +221,8 @@ func (p *telegramPlatform) SendApproval(ctx context.Context, message Message, pr
 	if prompt.ExpiresAt != nil {
 		text += "\n有效期至：" + prompt.ExpiresAt.UTC().Format(time.RFC3339)
 	}
+	// Telegram 提供按钮，同时允许用户直接发送确认词，保证与 OneBot 文本交互一致。
+	text += "\n也可以直接回复“批准”或“拒绝”。"
 	payload := map[string]any{
 		"chat_id": chatID,
 		"text":    text,

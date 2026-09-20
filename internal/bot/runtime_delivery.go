@@ -67,6 +67,10 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 		slog.Info("机器人请求已忽略", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "reason", "empty")
 		return nil
 	}
+	// 审批回复是对当前待办任务的直接控制，不应被群聊 @ 规则或私聊唤醒词拦截。
+	if handled, approvalErr := m.handleDirectApprovalReply(ctx, message); handled {
+		return approvalErr
+	}
 	allowed, admissionErr := m.messageAllowed(ctx, &message)
 	if admissionErr != nil {
 		return fmt.Errorf("读取平台消息配置失败: %w", admissionErr)
@@ -84,13 +88,6 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	command, isCommand := parseBotCommand(message.Text)
 	if isCommand {
 		return m.handleBotCommand(ctx, message, command)
-	}
-	// A bare number is the compact OneBot approval form. It is checked before
-	// ordinary chat admission and only resolves a ticket bound to this chat.
-	if strings.TrimSpace(message.Text) != "" && isDecimalApprovalChoice(message.Text) {
-		if handled, err := m.resolveApprovalChoice(ctx, message, message.Text, true); handled {
-			return err
-		}
 	}
 
 	userID, conversationID, err := m.conversationForMessage(ctx, message)
@@ -710,6 +707,13 @@ func (m *Manager) deliverApproval(ctx context.Context, message Message, event ag
 	chatKey := chatBindingKey(message)
 	m.mu.Lock()
 	tickets := m.pendingApprovals[chatKey]
+	for _, ticket := range tickets {
+		if ticket.ID == approvalID && ticket.InvocationID == event.InvocationID {
+			// Runtime 回放可能再次投递同一事件；去重后避免用户看到重复审批卡片。
+			m.mu.Unlock()
+			return
+		}
+	}
 	tickets = append(tickets, approvalTicket{ID: approvalID, InvocationID: event.InvocationID})
 	if len(tickets) > 20 {
 		tickets = tickets[len(tickets)-20:]
@@ -739,7 +743,8 @@ func (m *Manager) deliverApproval(ctx context.Context, message Message, event ag
 	if prompt.ExpiresAt != nil {
 		text += "\n有效期至：" + prompt.ExpiresAt.Format(time.RFC3339)
 	}
-	text += fmt.Sprintf("\n回复 /approve %d 批准，/reject %d 拒绝。", position, position)
+	text += "\n请直接回复“批准”或“拒绝”，机器人会继续处理当前任务。"
+	text += fmt.Sprintf("\n兼容方式：/approve %d 或 /reject %d。", position, position)
 	_ = m.send(ctx, message, text)
 }
 
@@ -748,6 +753,14 @@ func (m *Manager) handleApprovalControl(ctx context.Context, message Message) er
 		return nil
 	}
 	approved := message.Control.Decision
+	allowed, authErr := m.approvalReplyAllowed(ctx, message, approved)
+	if authErr != nil {
+		_ = m.send(ctx, message, "审批权限校验失败："+trimError(authErr))
+		return authErr
+	}
+	if !allowed {
+		return nil
+	}
 	if _, err := m.resolveApproval(ctx, message, message.Control.ApprovalID, approved); err != nil {
 		_ = m.send(ctx, message, "审批处理失败："+trimError(err))
 		return err
@@ -755,24 +768,93 @@ func (m *Manager) handleApprovalControl(ctx context.Context, message Message) er
 	return nil
 }
 
+// handleDirectApprovalReply 把“批准/拒绝”等普通聊天文本转换成当前会话的审批决定。
+// 只有存在属于当前聊天的待审批请求时才会拦截文本，普通对话不会被误判为审批。
+func (m *Manager) handleDirectApprovalReply(ctx context.Context, message Message) (bool, error) {
+	text := strings.TrimSpace(message.Text)
+	approved, isDecision := parseApprovalDecision(text)
+	isNumber := isDecimalApprovalChoice(text)
+	if !isDecision && !isNumber {
+		return false, nil
+	}
+	tickets, err := m.pendingApprovalTickets(ctx, message)
+	if err != nil {
+		return true, err
+	}
+	if len(tickets) == 0 {
+		// 没有待审批任务时，保留原消息给普通对话和唤醒词逻辑处理。
+		return false, nil
+	}
+	allowed, authErr := m.approvalReplyAllowed(ctx, message, approved)
+	if authErr != nil {
+		_ = m.send(ctx, message, "审批权限校验失败："+trimError(authErr))
+		return true, authErr
+	}
+	if !allowed {
+		return true, nil
+	}
+	if isNumber {
+		if handled, resolveErr := m.resolveApprovalChoice(ctx, message, text, true); handled {
+			return true, resolveErr
+		}
+		return true, m.send(ctx, message, "审批序号无效，请回复审批提示中的序号，或直接回复“批准/拒绝”。")
+	}
+	if len(tickets) != 1 {
+		return true, m.send(ctx, message, "当前有多个待审批请求，请回复对应序号；也可使用 /approve 序号 或 /reject 序号。")
+	}
+	_, err = m.resolveApproval(ctx, message, tickets[0].ID, approved)
+	return true, err
+}
+
+// approvalReplyAllowed 让按钮、自然语言和兼容命令共用同一套权限策略，避免直接回复绕过管理员限制。
+func (m *Manager) approvalReplyAllowed(ctx context.Context, message Message, approved bool) (bool, error) {
+	registry := m.commandRegistry()
+	if registry == nil {
+		return false, errors.New("指令系统未初始化")
+	}
+	bot, err := m.Get(strings.TrimSpace(message.AdapterID))
+	if err != nil {
+		return false, fmt.Errorf("读取机器人配置失败: %w", err)
+	}
+	commandID := commandReject
+	if approved {
+		commandID = commandApprove
+	}
+	descriptor, ok := registry.Lookup(commandID)
+	if !ok {
+		return false, fmt.Errorf("审批指令 %q 未注册", commandID)
+	}
+	authorization, err := m.authorizeCommand(ctx, bot, message, descriptor, "")
+	if err != nil {
+		return false, err
+	}
+	if !authorization.Command.Enabled {
+		return false, m.send(ctx, message, "该审批入口当前已停用。")
+	}
+	if authorization.allows() {
+		return true, nil
+	}
+	m.recordAudit(ctx, CommandAudit{
+		AdapterID: bot.ID, ChatID: message.ChatID, UserID: message.UserID,
+		Command: descriptor.ID, Action: AuditCommandDenied, Result: "denied",
+	})
+	return false, m.send(ctx, message, authorization.denyReason())
+}
+
 func (m *Manager) resolveApprovalChoice(ctx context.Context, message Message, choice string, approved bool) (bool, error) {
 	choice = strings.TrimSpace(choice)
-	chatKey := chatBindingKey(message)
-	m.mu.RLock()
-	tickets := append([]approvalTicket(nil), m.pendingApprovals[chatKey]...)
-	m.mu.RUnlock()
+	tickets, err := m.pendingApprovalTickets(ctx, message)
+	if err != nil {
+		return false, err
+	}
 	if len(tickets) == 0 {
-		var hydrateErr error
-		tickets, hydrateErr = m.hydratePendingApprovals(ctx, message)
-		if hydrateErr != nil {
-			return false, hydrateErr
-		}
-		if len(tickets) == 0 {
-			return false, nil
-		}
+		return false, nil
 	}
 	approvalID := choice
-	if number, err := parsePositiveInt(choice); err == nil && number <= len(tickets) {
+	if choice == "" && len(tickets) == 1 {
+		// 单个待审批请求时，/approve 和 /reject 允许省略序号，行为与直接回复一致。
+		approvalID = tickets[0].ID
+	} else if number, parseErr := parsePositiveInt(choice); parseErr == nil && number <= len(tickets) {
 		approvalID = tickets[number-1].ID
 	}
 	for _, ticket := range tickets {
@@ -782,6 +864,18 @@ func (m *Manager) resolveApprovalChoice(ctx context.Context, message Message, ch
 		}
 	}
 	return false, nil
+}
+
+// pendingApprovalTickets 优先读取内存票据，进程重启后再从 Durable Runtime 恢复当前聊天的审批。
+func (m *Manager) pendingApprovalTickets(ctx context.Context, message Message) ([]approvalTicket, error) {
+	chatKey := chatBindingKey(message)
+	m.mu.RLock()
+	tickets := append([]approvalTicket(nil), m.pendingApprovals[chatKey]...)
+	m.mu.RUnlock()
+	if len(tickets) > 0 {
+		return tickets, nil
+	}
+	return m.hydratePendingApprovals(ctx, message)
 }
 
 func (m *Manager) hydratePendingApprovals(ctx context.Context, message Message) ([]approvalTicket, error) {
@@ -858,8 +952,29 @@ func (m *Manager) resolveApproval(ctx context.Context, message Message, approval
 	if err != nil {
 		return agentruntime.Approval{}, err
 	}
+	// 决定已经持久化后立刻删除本地票据，避免用户重复回复造成二次决议错误。
+	m.removePendingApproval(message, approvalID)
 	_ = m.send(ctx, message, map[bool]string{true: "已批准该操作。", false: "已拒绝该操作。"}[approved])
 	return resolved, nil
+}
+
+// removePendingApproval 只删除当前聊天中指定的审批票据，不影响其他任务或聊天。
+func (m *Manager) removePendingApproval(message Message, approvalID string) {
+	chatKey := chatBindingKey(message)
+	m.mu.Lock()
+	tickets := m.pendingApprovals[chatKey]
+	filtered := tickets[:0]
+	for _, ticket := range tickets {
+		if ticket.ID != approvalID {
+			filtered = append(filtered, ticket)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(m.pendingApprovals, chatKey)
+	} else {
+		m.pendingApprovals[chatKey] = filtered
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) clearActiveInvocation(message Message, invocationID string) {
@@ -1022,6 +1137,20 @@ func safeProgressText(value string) string {
 func isDecimalApprovalChoice(value string) bool {
 	_, err := parsePositiveInt(value)
 	return err == nil
+}
+
+// parseApprovalDecision 只接受完整的确认词，避免把包含“可以/不可以”的普通问题误当成审批。
+func parseApprovalDecision(value string) (bool, bool) {
+	value = strings.TrimSpace(strings.ToLower(value))
+	value = strings.Trim(value, " \t\r\n\"'“”‘’.,，。!！?？:：;；")
+	switch value {
+	case "批准", "同意", "允许", "确认", "继续", "继续执行", "确认执行", "是", "好", "可以", "approve", "approved", "yes", "y":
+		return true, true
+	case "拒绝", "不同意", "不允许", "否决", "拒绝执行", "否", "不要", "不用", "取消", "reject", "rejected", "deny", "no", "n":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func parsePositiveInt(value string) (int, error) {

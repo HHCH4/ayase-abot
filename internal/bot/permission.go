@@ -320,7 +320,7 @@ func helpTextFor(commands []EffectiveCommand, isGroup, globalAdmin, groupAdmin b
 	var builder strings.Builder
 	builder.WriteString("可用命令：")
 	hiddenCount := 0
-	approvalUsage := make([]string, 0, 2)
+	approvalVisible := false
 	for _, command := range commands {
 		if !command.Enabled {
 			continue
@@ -333,26 +333,23 @@ func helpTextFor(commands []EffectiveCommand, isGroup, globalAdmin, groupAdmin b
 			hiddenCount++
 			continue
 		}
+		if command.ID == "approve" || command.ID == "reject" {
+			// 审批的主入口是当前会话直接回复，不把兼容命令误导成必填步骤。
+			approvalVisible = true
+			continue
+		}
 		builder.WriteString("\n/")
 		builder.WriteString(command.Name)
 		builder.WriteString("  ")
 		builder.WriteString(command.Description)
-		switch command.ID {
-		case "approve":
-			approvalUsage = append(approvalUsage, "/approve 序号 批准")
-		case "reject":
-			approvalUsage = append(approvalUsage, "/reject 序号 拒绝")
-		}
 	}
 	if hiddenCount > 0 {
 		// 不向普通用户泄露受限命令名称，但明确说明帮助不是完整目录，避免误以为指令不存在。
 		builder.WriteString(fmt.Sprintf("\n\n另有 %d 条管理员指令未显示；请在 WebUI 配置全局管理员 UID。", hiddenCount))
 	}
-	if len(approvalUsage) > 0 {
-		// 只有当前调用者确实能执行且指令仍启用时才展示审批用法，避免帮助文本泄露或引用停用指令。
-		builder.WriteString("\n\n审批：")
-		builder.WriteString(strings.Join(approvalUsage, "，"))
-		builder.WriteString("。")
+	if approvalVisible {
+		// 兼容命令仍可用，但帮助明确把直接回复放在第一顺位。
+		builder.WriteString("\n\n审批：收到审批提示后直接回复“批准”或“拒绝”；多个请求可用 /approve 序号 或 /reject 序号。")
 	}
 	return builder.String()
 }
