@@ -262,6 +262,29 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (Conversati
 	return item, nil
 }
 
+// EnsureSource 为历史上没有保存来源的机器人会话补齐稳定的 UMO；已有来源不会被覆盖。
+// 这样升级前创建的会话在下一次收到平台消息后，也能出现在会话规则目录中。
+func (s *Service) EnsureSource(ctx context.Context, userID, id, source string) (Conversation, error) {
+	userID = strings.TrimSpace(userID)
+	id = strings.TrimSpace(id)
+	source = strings.TrimSpace(source)
+	if userID == "" || id == "" || source == "" {
+		return Conversation{}, fmt.Errorf("%w: user_id、conversation_id 和 source 不能为空", ErrInvalidRequest)
+	}
+	item, err := s.Get(ctx, userID, id)
+	if err != nil {
+		return Conversation{}, err
+	}
+	if strings.TrimSpace(item.Source) != "" {
+		return item, nil
+	}
+	item.Source = source
+	if err := s.repository.Save(ctx, item); err != nil {
+		return Conversation{}, err
+	}
+	return item, nil
+}
+
 // enrichSourceName 只补充展示字段，任何持久化写入仍以 Source 稳定键为准。
 func (s *Service) enrichSourceName(ctx context.Context, item *Conversation) error {
 	if s == nil || item == nil || strings.TrimSpace(item.Source) == "" {

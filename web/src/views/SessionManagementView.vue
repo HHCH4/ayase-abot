@@ -52,7 +52,7 @@ const sourceOptions = computed(() => {
   // 优先展示已有消息的来源，让用户像 AstrBot 一样从活跃会话中选择 UMO。
   for (const item of sources.value) {
     const detail = [item.platform, item.message_type, item.session_id].filter(Boolean).join(' · ')
-    options.set(item.source, { label: item.source_name ? `${item.source} · ${item.source_name}` : `${item.source}${detail ? `（${detail}）` : ''}`, value: item.source })
+    options.set(item.source, { label: item.source_name ? `${item.source_name} · ${item.source}${detail ? `（${detail}）` : ''}` : `${item.source}${detail ? `（${detail}）` : ''}`, value: item.source })
   }
   // 保留没有最近消息但已经存在规则的来源，避免编辑旧规则时选项消失。
   for (const item of rules.value) {
@@ -60,6 +60,26 @@ const sourceOptions = computed(() => {
   }
   return [...options.values()]
 })
+
+const sourceRule = (source: string) => rules.value.find((item) => item.source === source)
+
+function sourceLabel(item: SessionSource) {
+  return item.source_name?.trim() || item.source
+}
+
+function sourceStatusLabel(status: string) {
+  if (status === 'active') return '活跃'
+  if (status === 'archived') return '已归档'
+  return status || '未知'
+}
+
+function sourceStatusType(status: string) {
+  return status === 'active' ? 'success' : 'warning'
+}
+
+function formatSourceTime(value?: string) {
+  return value ? new Date(value).toLocaleString() : '—'
+}
 
 // 读取规则、分组和人格目录，编辑页只使用已存在的配置实体。
 async function load() {
@@ -98,13 +118,20 @@ function resetForm(item?: SessionRule) {
   form.knowledge_rerank = item?.knowledge_rerank ?? false
 }
 
-function openCreate() {
+function openCreate(source = '') {
   if (!sourceOptions.value.length) {
     message.info('还没有可配置的消息会话来源，请先让机器人收到一条消息')
     return
   }
   resetForm()
+  form.source = source
   showEditor.value = true
+}
+
+function openSource(item: SessionSource) {
+  const rule = sourceRule(item.source)
+  if (rule) openEdit(rule)
+  else openCreate(item.source)
 }
 
 function openEdit(item: SessionRule) {
@@ -235,8 +262,14 @@ async function removeGroup(item: SessionRuleGroup) {
         <h2>自定义规则</h2>
         <p>来源从已经产生过消息的会话中选择，按 UMO 覆盖处理、内置 AI、模型、人格和知识库选项；所有规则都在本地内置 Agent 边界内执行。</p>
       </div>
-      <NSpace><NButton secondary :loading="loading" @click="load">刷新</NButton><NButton type="primary" @click="openCreate">＋ 新建规则</NButton></NSpace>
+      <NSpace><NButton secondary :loading="loading" @click="load">刷新</NButton><NButton type="primary" @click="openCreate()">＋ 新建规则</NButton></NSpace>
     </div>
+
+    <NCard class="detail-card" :bordered="false">
+      <div class="section-heading-row"><div><h3>可配置会话</h3><p>以下来源来自已经收到过平台消息的会话；选择一个会话即可创建或编辑对应的 UMO 规则。</p></div><NButton secondary :loading="loading" @click="load">刷新会话</NButton></div>
+      <div v-if="sources.length" class="data-table-wrap"><table class="data-table"><thead><tr><th>会话来源</th><th>平台 / 类型</th><th>Session ID</th><th>状态</th><th>规则</th><th>最近活动</th><th>操作</th></tr></thead><tbody><tr v-for="item in sources" :key="item.source"><td><strong>{{ sourceLabel(item) }}</strong><code>{{ item.source }}</code></td><td><span>{{ item.platform || '—' }}</span><code>{{ item.message_type || '—' }}</code></td><td><code>{{ item.session_id || '—' }}</code></td><td><NTag size="small" :bordered="false" :type="sourceStatusType(item.status)">{{ sourceStatusLabel(item.status) }}</NTag></td><td><NTag v-if="sourceRule(item.source)" size="small" :bordered="false" type="info">已配置</NTag><span v-else class="muted">未配置</span></td><td>{{ formatSourceTime(item.updated_at) }}</td><td><NButton size="small" secondary @click="openSource(item)">{{ sourceRule(item.source) ? '编辑规则' : '配置规则' }}</NButton></td></tr></tbody></table></div>
+      <NEmpty v-else description="还没有可配置的会话；请先让机器人收到一条平台消息，再点击刷新" />
+    </NCard>
 
     <NCard class="detail-card" :bordered="false">
       <div class="section-heading-row"><div><h3>会话来源规则</h3><p>已选 {{ selectedCount }} 条；可用来源 {{ sources.length }} 个，来源和 UMO 与 AstrBot 保持一致。</p></div><NButton secondary @click="openGroupCreate">管理分组</NButton></div>

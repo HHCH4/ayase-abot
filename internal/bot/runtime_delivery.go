@@ -337,11 +337,17 @@ func (m *Manager) conversationForMessage(ctx context.Context, message Message) (
 	m.mu.RUnlock()
 	if current != "" {
 		if item, err := m.conversations.Get(ctx, userID, current); err == nil && item.Status == conversation.StatusActive {
+			if err := m.ensureConversationSource(ctx, message, item); err != nil {
+				return "", "", err
+			}
 			return userID, current, nil
 		}
 	}
 	if item, err := m.conversations.Get(ctx, userID, baseConversationID); err == nil {
 		if item.Status == conversation.StatusActive {
+			if err := m.ensureConversationSource(ctx, message, item); err != nil {
+				return "", "", err
+			}
 			m.setActiveConversation(key, item.ID)
 			return userID, item.ID, nil
 		}
@@ -363,6 +369,9 @@ func (m *Manager) conversationForMessage(ctx context.Context, message Message) (
 			}
 		}
 		if newest.ID != "" {
+			if err := m.ensureConversationSource(ctx, message, newest); err != nil {
+				return "", "", err
+			}
 			m.setActiveConversation(key, newest.ID)
 			return userID, newest.ID, nil
 		}
@@ -377,6 +386,17 @@ func (m *Manager) conversationForMessage(ctx context.Context, message Message) (
 	}
 	m.setActiveConversation(key, item.ID)
 	return userID, item.ID, nil
+}
+
+// ensureConversationSource 只为旧会话补齐来源，不改变已经存在的稳定 UMO。
+func (m *Manager) ensureConversationSource(ctx context.Context, message Message, item conversation.Conversation) error {
+	if strings.TrimSpace(item.Source) != "" {
+		return nil
+	}
+	if _, err := m.conversations.EnsureSource(ctx, item.UserID, item.ID, messageSource(message)); err != nil {
+		return fmt.Errorf("补齐机器人会话来源失败: %w", err)
+	}
+	return nil
 }
 
 func (m *Manager) setActiveConversation(key, id string) {
