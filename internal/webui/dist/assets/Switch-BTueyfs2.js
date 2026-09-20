@@ -1,4 +1,4 @@
-import{v as L,a8 as a,au as Y,a6 as A,a7 as l,a9 as G,d as ve,x as Q,g as u,c as m,a as p,a0 as r,z as n,e as q,y as J,A as ge,r as E,B as we,n as P,aW as me,E as pe,ax as ye,aX as ke,ae as v,G as xe}from"./index-pMn8Wim7.js";import{i as H,r as g,a as Se,b as M,p as I,d as s}from"./use-message-BNiKe024.js";import{a as ze}from"./Space-Cf2Z8rLy.js";var _e=L("switch",`
+import{v as Y,a8 as a,aw as L,a6 as A,a7 as l,a9 as G,d as ve,x as Q,g as u,c as m,a as p,a0 as r,z as n,e as q,y as J,A as ge,r as E,B as we,n as P,aX as me,E as pe,az as ye,aY as ke,ae as v,G as xe}from"./index-COCbPh4K.js";import{i as H,r as g,a as Se,b as M,p as I,d as s}from"./use-message-DE8MVSa4.js";import{a as ze}from"./Space-BNhAHqdN.js";var _e=Y("switch",`
  height: var(--n-height);
  min-width: var(--n-width);
  vertical-align: middle;
@@ -21,7 +21,7 @@ import{v as L,a8 as a,au as Y,a6 as A,a7 as l,a9 as G,d as ve,x as Q,g as u,c as
  `),a("button-placeholder",`
  width: calc(1.75 * var(--n-rail-height));
  height: var(--n-rail-height);
- `),L("base-loading",`
+ `),Y("base-loading",`
  position: absolute;
  top: 50%;
  left: 50%;
@@ -29,7 +29,7 @@ import{v as L,a8 as a,au as Y,a6 as A,a7 as l,a9 as G,d as ve,x as Q,g as u,c as
  font-size: calc(var(--n-button-width) - 4px);
  color: var(--n-loading-color);
  transition: color .3s var(--n-bezier);
- `,[Y({left:"50%",top:"50%",originalTransform:"translateX(-50%) translateY(-50%)"})]),a("checked, unchecked",`
+ `,[L({left:"50%",top:"50%",originalTransform:"translateX(-50%) translateY(-50%)"})]),a("checked, unchecked",`
  transition: color .3s var(--n-bezier);
  color: var(--n-text-color);
  box-sizing: border-box;
@@ -74,7 +74,7 @@ import{v as L,a8 as a,au as Y,a6 as A,a7 as l,a9 as G,d as ve,x as Q,g as u,c as
  justify-content: center;
  align-items: center;
  line-height: 1;
- `,[Y()]),a("button",`
+ `,[L()]),a("button",`
  align-items: center; 
  top: var(--n-offset);
  left: var(--n-offset);

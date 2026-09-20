@@ -61,6 +61,9 @@ func Run(opts bootstrap.Options) error {
 		return err
 	}
 	defer func() { _ = store.Close() }()
+	// 复用同一个机器人仓储实例装配来源目录、别名和机器人生命周期，确保
+	// WebUI、消息入口与批量规则看到的是同一份 UMO 数据。
+	botRepository := store.BotRepository()
 	dataDir := opts.DataDir
 	if strings.TrimSpace(dataDir) == "" {
 		dataDir = "./data"
@@ -108,6 +111,34 @@ func Run(opts bootstrap.Options) error {
 	if err != nil {
 		return err
 	}
+	if sourceRegistry, ok := botRepository.(bot.MessageSourceRegistry); ok {
+		// 批量规则需要对“已知来源”而不是仅对“已有规则”执行；这里保持
+		// sessionrule 包只依赖窄回调，不把 SQLite 或 Bot 实现泄漏进去。
+		sessionRuleService.SetSourceLister(func(ctx context.Context, query string) ([]string, error) {
+			items, listErr := sourceRegistry.ListMessageSources(ctx, query)
+			if listErr != nil {
+				return nil, listErr
+			}
+			sources := make([]string, 0, len(items))
+			for _, item := range items {
+				if source := strings.TrimSpace(item.Source); source != "" {
+					sources = append(sources, source)
+				}
+			}
+			if aliasLister, aliasOK := botRepository.(bot.SourceNameLister); aliasOK {
+				aliases, aliasErr := aliasLister.ListSourceNames(ctx, query)
+				if aliasErr != nil {
+					return nil, aliasErr
+				}
+				for _, alias := range aliases {
+					if source := strings.TrimSpace(alias.Source); source != "" {
+						sources = append(sources, source)
+					}
+				}
+			}
+			return sources, nil
+		})
+	}
 	scheduleService, err := schedule.NewService(store.ScheduleRepository())
 	if err != nil {
 		return err
@@ -143,7 +174,7 @@ func Run(opts bootstrap.Options) error {
 		return err
 	}
 	// 会话列表复用 /name 的来源名称仓储，让聊天指令设置的别名能在 WebUI 中显示。
-	if sourceNames, ok := store.BotRepository().(conversation.SourceNameResolver); ok {
+	if sourceNames, ok := botRepository.(conversation.SourceNameResolver); ok {
 		conversationService.SetSourceNameResolver(sourceNames)
 	}
 	conversationService.SetArtifactDeletionHook(artifactService.DeleteConversation)
@@ -422,21 +453,21 @@ func Run(opts bootstrap.Options) error {
 			if ruleErr != nil {
 				return agent.RuntimeOptions{}, ruleErr
 			} else if found {
-				if rule.ProfileID != "" && rule.FollowProfile {
+				if rule.HasOverride("profile_id") && rule.HasOverride("follow_profile") && rule.ProfileID != "" && rule.FollowProfile {
 					profileRuntime, profileErr := configService.RuntimeForProfile(ctx, rule.ProfileID)
 					if profileErr != nil {
 						return agent.RuntimeOptions{}, profileErr
 					}
 					runtime = profileRuntime
 				}
-				if !rule.ProcessEnabled || !rule.LLMEnabled {
+				if (rule.HasOverride("process_enabled") && !rule.ProcessEnabled) || (rule.HasOverride("llm_enabled") && !rule.LLMEnabled) {
 					runtime.AIEnabled = false
 				}
 				// 模型覆盖放在配置文件切换之后，确保会话规则具有最终优先级。
-				if rule.ChatModel != "" {
+				if rule.HasOverride("chat_model") && rule.ChatModel != "" {
 					runtime.ModelID = rule.ChatModel
 				}
-				if rule.PersonaID != "" {
+				if rule.HasOverride("persona_id") && rule.PersonaID != "" {
 					runtime.PersonaID = rule.PersonaID
 				}
 			}
@@ -586,7 +617,7 @@ func Run(opts bootstrap.Options) error {
 	}
 	defer func() { _ = runtimeCoordinator.Close() }()
 
-	botManager, err := bot.NewManager(ctx, store.BotRepository(), kernel, conversationService)
+	botManager, err := bot.NewManager(ctx, botRepository, kernel, conversationService)
 	if err != nil {
 		return err
 	}
@@ -683,6 +714,9 @@ func Run(opts bootstrap.Options) error {
 	server.SetMemoryService(longMemory)
 	server.SetArtifactService(artifactService)
 	server.SetSessionRuleService(sessionRuleService)
+	if sourceRegistry, ok := botRepository.(bot.MessageSourceRegistry); ok {
+		server.SetMessageSourceRegistry(sourceRegistry)
+	}
 	server.SetScheduleService(scheduleService)
 	server.SetLogStore(logStore)
 	httpServer := &http.Server{

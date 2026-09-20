@@ -162,6 +162,11 @@ export async function deleteSessionRule(source: string): Promise<void> {
   await request<void>(`/api/v1/session-rules/${encodeURIComponent(source)}`, { method: 'DELETE' })
 }
 
+// 只清除指定规则项，保留同一来源的其他覆盖配置和 UMO 来源记录。
+export async function resetSessionRuleField(source: string, key: string): Promise<void> {
+  await request<void>(`/api/v1/session-rules/${encodeURIComponent(source)}/reset`, { method: 'POST', body: JSON.stringify({ key }) })
+}
+
 export async function batchSessionRules(value: Record<string, unknown>): Promise<SessionRule[]> {
   const result = await request<{ rules: SessionRule[] }>('/api/v1/session-rules/batch', { method: 'POST', body: JSON.stringify(value) })
   return result.rules || []

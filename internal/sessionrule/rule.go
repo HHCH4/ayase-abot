@@ -20,25 +20,48 @@ var (
 	ErrConflict = errors.New("会话规则已存在")
 )
 
+const (
+	// 以下键是独立可清除的会话覆盖项；它们对应 WebUI 表单字段和 Runtime
+	// 能理解的内置配置，不包含任何外部插件执行器。
+	OverrideProcessEnabled  = "process_enabled"
+	OverrideLLMEnabled      = "llm_enabled"
+	OverrideTTSEnabled      = "tts_enabled"
+	OverrideNote            = "note"
+	OverrideChatModel       = "chat_model"
+	OverrideSTTModel        = "stt_model"
+	OverrideTTSModel        = "tts_model"
+	OverrideFollowProfile   = "follow_profile"
+	OverrideProfileID       = "profile_id"
+	OverridePersonaID       = "persona_id"
+	OverrideDisabledPlugins = "disabled_plugins"
+	OverrideKnowledgeBases  = "knowledge_bases"
+	OverrideKnowledgeTopK   = "knowledge_top_k"
+	OverrideKnowledgeRerank = "knowledge_rerank"
+)
+
 // Rule 是一个消息会话来源的独立覆盖规则。来源使用 UMO 或 /sid 返回的稳定标识。
 type Rule struct {
-	Source          string    `json:"source"`
-	ProcessEnabled  bool      `json:"process_enabled"`
-	LLMEnabled      bool      `json:"llm_enabled"`
-	TTSEnabled      bool      `json:"tts_enabled"`
-	Note            string    `json:"note,omitempty"`
-	ChatModel       string    `json:"chat_model,omitempty"`
-	STTModel        string    `json:"stt_model,omitempty"`
-	TTSModel        string    `json:"tts_model,omitempty"`
-	FollowProfile   bool      `json:"follow_profile"`
-	ProfileID       string    `json:"profile_id,omitempty"`
-	PersonaID       string    `json:"persona_id,omitempty"`
-	DisabledPlugins []string  `json:"disabled_plugins,omitempty"`
-	KnowledgeBases  []string  `json:"knowledge_bases,omitempty"`
-	KnowledgeTopK   int       `json:"knowledge_top_k"`
-	KnowledgeRerank bool      `json:"knowledge_rerank"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	Source          string   `json:"source"`
+	ProcessEnabled  bool     `json:"process_enabled"`
+	LLMEnabled      bool     `json:"llm_enabled"`
+	TTSEnabled      bool     `json:"tts_enabled"`
+	Note            string   `json:"note,omitempty"`
+	ChatModel       string   `json:"chat_model,omitempty"`
+	STTModel        string   `json:"stt_model,omitempty"`
+	TTSModel        string   `json:"tts_model,omitempty"`
+	FollowProfile   bool     `json:"follow_profile"`
+	ProfileID       string   `json:"profile_id,omitempty"`
+	PersonaID       string   `json:"persona_id,omitempty"`
+	DisabledPlugins []string `json:"disabled_plugins,omitempty"`
+	KnowledgeBases  []string `json:"knowledge_bases,omitempty"`
+	KnowledgeTopK   int      `json:"knowledge_top_k"`
+	KnowledgeRerank bool     `json:"knowledge_rerank"`
+	// ConfiguredFields 区分“该字段覆盖了全局配置”和“该字段恢复继承”。
+	// nil 表示旧版本整行规则，读取时按所有字段兼容；非 nil（包括空切片）
+	// 表示新版本逐项覆盖状态。
+	ConfiguredFields []string  `json:"configured_fields,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // Group 是一组可批量应用规则的会话来源集合。
@@ -73,10 +96,15 @@ type Repository interface {
 	DeleteGroup(context.Context, string) error
 }
 
+// SourceLister 返回已经从消息入口观察到的 UMO 列表。它是可选扩展，避免
+// 会话规则服务反向依赖 Bot 包，同时让批量规则能够覆盖尚未创建规则的来源。
+type SourceLister func(context.Context, string) ([]string, error)
+
 // Service 负责校验、排序和批量更新，保证 HTTP 层不直接操作仓储。
 type Service struct {
 	repository Repository
 	writeMu    sync.Mutex
+	sourceList SourceLister
 }
 
 // NewService 创建会话规则服务。
@@ -85,6 +113,14 @@ func NewService(repository Repository) (*Service, error) {
 		return nil, errors.New("会话规则 Repository 不能为空")
 	}
 	return &Service{repository: repository}, nil
+}
+
+// SetSourceLister 装配来源目录查询；生产应用使用 Bot 的持久化 UMO 目录，
+// 没有该扩展的嵌入方仍按历史规则列表工作。
+func (s *Service) SetSourceLister(lister SourceLister) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.sourceList = lister
 }
 
 // List 返回按来源排序的规则，可用 query 对来源和备注做模糊过滤。
@@ -134,6 +170,11 @@ func (s *Service) Save(ctx context.Context, item Rule) (Rule, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	item = normalizeRule(item)
+	if item.ConfiguredFields == nil {
+		// 旧调用方直接构造 Rule 时保持原有“整行覆盖”语义；HTTP 新建规则
+		// 会显式传入空切片，从而可以真正支持逐项清除。
+		item.ConfiguredFields = allOverrideKeys()
+	}
 	if err := validateRule(item); err != nil {
 		return Rule{}, err
 	}
@@ -154,6 +195,42 @@ func (s *Service) Save(ctx context.Context, item Rule) (Rule, error) {
 	return item, nil
 }
 
+// ResetField 清除一个独立覆盖项；最后一个覆盖项被清除后删除规则行，
+// 这样列表中只保留真正有会话偏好的来源，行为与 AstrBot 删除对应偏好键一致。
+func (s *Service) ResetField(ctx context.Context, source, key string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	source = strings.TrimSpace(source)
+	key = strings.TrimSpace(key)
+	if err := validateSource(source); err != nil {
+		return err
+	}
+	if !isOverrideKey(key) {
+		return fmt.Errorf("%w: 不支持清除规则项 %q", ErrInvalidRequest, key)
+	}
+	item, err := s.repository.Get(ctx, source)
+	if err != nil {
+		return err
+	}
+	if item.ConfiguredFields == nil {
+		// 旧数据没有逐项掩码，先把它视为所有字段已配置，再移除当前项。
+		item.ConfiguredFields = allOverrideKeys()
+	}
+	item.ConfiguredFields = removeString(item.ConfiguredFields, key)
+	if len(item.ConfiguredFields) == 0 {
+		if err := s.repository.Delete(ctx, source); err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		return nil
+	}
+	item = normalizeRule(item)
+	item.UpdatedAt = time.Now().UTC()
+	if err := s.repository.Save(ctx, item); err != nil {
+		return fmt.Errorf("清除会话规则项失败: %w", err)
+	}
+	return nil
+}
+
 // Delete 删除指定来源规则。
 func (s *Service) Delete(ctx context.Context, source string) error {
 	s.writeMu.Lock()
@@ -165,7 +242,8 @@ func (s *Service) Delete(ctx context.Context, source string) error {
 }
 
 // ApplyBatch 按选中会话、所有会话、所有群聊或所有私聊更新规则。
-// 群聊和私聊的判断依赖 UMO 常见前缀，未知来源仍可通过“选中会话”精确修改。
+// 批量范围以完整 UMO 来源目录为准；没有旧规则的来源会在这里创建默认规则，
+// 这与 AstrBot 的“批量覆盖偏好”行为一致。
 func (s *Service) ApplyBatch(ctx context.Context, update BatchUpdate) ([]Rule, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -177,30 +255,78 @@ func (s *Service) ApplyBatch(ctx context.Context, update BatchUpdate) ([]Rule, e
 	if err != nil {
 		return nil, err
 	}
-	selected := make(map[string]struct{}, len(update.Sources))
-	for _, source := range update.Sources {
-		// 选中范围统一按小写比较，避免 WebUI 传入大小写不同而漏更新。
-		selected[strings.ToLower(strings.TrimSpace(source))] = struct{}{}
-	}
-	changed := make([]Rule, 0)
+	existing := make(map[string]Rule, len(items))
+	existingByLower := make(map[string]string, len(items))
 	for _, item := range items {
-		if !batchMatches(update.Scope, item.Source, selected) {
-			continue
+		item = normalizeRule(item)
+		existing[item.Source] = item
+		existingByLower[strings.ToLower(item.Source)] = item.Source
+	}
+	targets := make(map[string]struct{})
+	addTarget := func(source string) {
+		source = strings.TrimSpace(source)
+		if source == "" {
+			return
+		}
+		if existingSource, ok := existingByLower[strings.ToLower(source)]; ok {
+			source = existingSource
+		}
+		targets[source] = struct{}{}
+	}
+	if update.Scope == "selected" {
+		for _, source := range update.Sources {
+			addTarget(source)
+		}
+	} else {
+		// 先把没有规则的来源加入候选集，再合并旧规则，兼容升级前的历史数据。
+		if s.sourceList != nil {
+			knownSources, listErr := s.sourceList(ctx, "")
+			if listErr != nil {
+				return nil, fmt.Errorf("读取消息来源目录失败: %w", listErr)
+			}
+			for _, source := range knownSources {
+				if batchMatches(update.Scope, source, nil) {
+					addTarget(source)
+				}
+			}
+		}
+		for source := range existing {
+			if batchMatches(update.Scope, source, nil) {
+				addTarget(source)
+			}
+		}
+	}
+	changed := make([]Rule, 0, len(targets))
+	for source := range targets {
+		item, ok := existing[source]
+		if !ok {
+			item = defaultRule(source)
 		}
 		if update.LLMEnabled != nil {
 			item.LLMEnabled = *update.LLMEnabled
+			item.ConfiguredFields = addString(item.ConfiguredFields, OverrideLLMEnabled)
 		}
 		if update.TTSEnabled != nil {
 			item.TTSEnabled = *update.TTSEnabled
+			item.ConfiguredFields = addString(item.ConfiguredFields, OverrideTTSEnabled)
 		}
 		if update.ChatModel != nil {
 			item.ChatModel = strings.TrimSpace(*update.ChatModel)
+			item.ConfiguredFields = addString(item.ConfiguredFields, OverrideChatModel)
 		}
 		if update.ProcessState != nil {
 			item.ProcessEnabled = *update.ProcessState
+			item.ConfiguredFields = addString(item.ConfiguredFields, OverrideProcessEnabled)
 		}
 		item = normalizeRule(item)
-		item.UpdatedAt = time.Now().UTC()
+		if err := validateRule(item); err != nil {
+			return nil, err
+		}
+		now := time.Now().UTC()
+		if item.CreatedAt.IsZero() {
+			item.CreatedAt = now
+		}
+		item.UpdatedAt = now
 		if err := s.repository.Save(ctx, item); err != nil {
 			return nil, fmt.Errorf("批量保存会话规则失败: %w", err)
 		}
@@ -208,6 +334,15 @@ func (s *Service) ApplyBatch(ctx context.Context, update BatchUpdate) ([]Rule, e
 	}
 	sort.Slice(changed, func(i, j int) bool { return changed[i].Source < changed[j].Source })
 	return changed, nil
+}
+
+// defaultRule 是首次对某个已知 UMO 执行批量操作时的安全初始状态；只有
+// 批量请求显式覆盖的字段会改变它，其余字段沿用全局内置 AI 配置。
+func defaultRule(source string) Rule {
+	return Rule{
+		Source: source, ProcessEnabled: true, LLMEnabled: true, TTSEnabled: false,
+		FollowProfile: true, KnowledgeTopK: 5, ConfiguredFields: []string{},
+	}
 }
 
 // ListGroups 返回分组列表。
@@ -279,6 +414,10 @@ func batchMatches(scope, source string, selected map[string]struct{}) bool {
 		_, ok := selected[source]
 		return ok
 	case "groups":
+		parts := strings.Split(source, ":")
+		if len(parts) > 1 {
+			return parts[1] == strings.ToLower("GroupMessage")
+		}
 		return strings.Contains(source, "group") || strings.Contains(source, "guild") || strings.Contains(source, "群")
 	case "private":
 		return !batchMatches("groups", source, nil)
@@ -297,10 +436,76 @@ func normalizeRule(item Rule) Rule {
 	item.PersonaID = strings.TrimSpace(item.PersonaID)
 	item.DisabledPlugins = uniqueStrings(item.DisabledPlugins)
 	item.KnowledgeBases = uniqueStrings(item.KnowledgeBases)
+	if item.ConfiguredFields != nil {
+		item.ConfiguredFields = uniqueStrings(item.ConfiguredFields)
+	}
 	if item.KnowledgeTopK <= 0 {
 		item.KnowledgeTopK = 5
 	}
 	return item
+}
+
+// HasOverride 判断一个规则字段是否真正覆盖全局配置；旧数据没有掩码时按
+// 全部字段兼容，避免升级后历史规则突然失效。
+func (item Rule) HasOverride(key string) bool {
+	if item.ConfiguredFields == nil {
+		return isOverrideKey(key)
+	}
+	for _, configured := range item.ConfiguredFields {
+		if configured == key {
+			return true
+		}
+	}
+	return false
+}
+
+// MarkOverride 将一个 HTTP 表单字段标记为显式覆盖；旧规则没有掩码时先
+// 按兼容语义初始化为全量覆盖，避免部分更新把历史字段意外清空。
+func (item *Rule) MarkOverride(key string) {
+	if item == nil || !isOverrideKey(key) {
+		return
+	}
+	item.ConfiguredFields = addString(item.ConfiguredFields, key)
+}
+
+func allOverrideKeys() []string {
+	return []string{
+		OverrideProcessEnabled, OverrideLLMEnabled, OverrideTTSEnabled, OverrideNote,
+		OverrideChatModel, OverrideSTTModel, OverrideTTSModel, OverrideFollowProfile,
+		OverrideProfileID, OverridePersonaID, OverrideDisabledPlugins, OverrideKnowledgeBases,
+		OverrideKnowledgeTopK, OverrideKnowledgeRerank,
+	}
+}
+
+func isOverrideKey(key string) bool {
+	for _, item := range allOverrideKeys() {
+		if item == key {
+			return true
+		}
+	}
+	return false
+}
+
+func addString(values []string, value string) []string {
+	if values == nil {
+		values = allOverrideKeys()
+	}
+	for _, item := range values {
+		if item == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func removeString(values []string, value string) []string {
+	result := make([]string, 0, len(values))
+	for _, item := range values {
+		if item != value {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 func normalizeGroup(item Group) Group {

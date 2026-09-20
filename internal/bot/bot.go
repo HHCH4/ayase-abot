@@ -109,12 +109,15 @@ type TestResult struct {
 
 // Message 是所有平台适配器统一输出的入站消息。
 type Message struct {
-	ID          string
-	AdapterID   string
-	Platform    Type
-	UserID      string
-	ChatID      string
-	ChatType    string
+	ID        string
+	AdapterID string
+	Platform  Type
+	UserID    string
+	ChatID    string
+	ChatType  string
+	// AutoName 是平台提供的群名、昵称或用户名，仅用于 UMO 目录展示；它不
+	// 参与来源键计算，也不会覆盖用户通过 /name 设置的手工别名。
+	AutoName    string
 	Text        string
 	Attachments []agent.Attachment
 	// Mentioned is set by a platform adapter when a group message explicitly

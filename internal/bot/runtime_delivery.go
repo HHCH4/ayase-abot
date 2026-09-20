@@ -120,6 +120,9 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// 先登记来源，再做任何消息过滤；这样 AstrBot 风格的“所有已知 UMO”
+	// 目录不会因为未 @、未配置唤醒词或只执行内置指令而漏项。
+	m.recordMessageSource(ctx, message)
 	// 先记录平台送入的完整消息，再做规范化和权限判断，确保被忽略的请求也能追踪。
 	rawText := message.Text
 	message.Text = strings.TrimSpace(message.Text)

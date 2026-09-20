@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -13,6 +14,19 @@ const maxSourceNameRunes = 100
 type SourceNameRepository interface {
 	GetSourceName(context.Context, string) (string, error)
 	SetSourceName(context.Context, string, string) error
+}
+
+// SourceNameLister 是来源目录读取别名的可选扩展，用于把升级前已经保存的
+// /name 别名也合并进 UMO 下拉框，即使它们没有对应的历史 Conversation。
+type SourceNameLister interface {
+	ListSourceNames(context.Context, string) ([]SourceName, error)
+}
+
+// SourceName 是来源键和用户手工别名的目录记录。
+type SourceName struct {
+	Source    string
+	Name      string
+	UpdatedAt time.Time
 }
 
 func (m *Manager) sourceNameRepository() (SourceNameRepository, bool) {

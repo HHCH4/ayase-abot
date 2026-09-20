@@ -76,7 +76,9 @@ func (s *Server) saveSessionRule(writer http.ResponseWriter, request *http.Reque
 		}
 		source = pathSource
 	}
-	item := sessionrule.Rule{Source: source, ProcessEnabled: true, LLMEnabled: true, TTSEnabled: false, FollowProfile: true, KnowledgeTopK: 5}
+	// 新建规则显式使用空覆盖掩码；这样后续可以按单个规则项清除，而不是
+	// 把所有默认值误当成用户覆盖。
+	item := sessionrule.Rule{Source: source, ProcessEnabled: true, LLMEnabled: true, TTSEnabled: false, FollowProfile: true, KnowledgeTopK: 5, ConfiguredFields: []string{}}
 	if pathSource != "" {
 		item, err = service.Get(request.Context(), pathSource)
 		if err != nil {
@@ -118,6 +120,28 @@ func (s *Server) deleteSessionRule(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	if err := service.Delete(request.Context(), request.PathValue("source")); err != nil {
+		writeError(writer, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+// resetSessionRuleField 清除指定来源的单个覆盖项；它不会删除消息来源目录，
+// 只会在最后一个覆盖项也被清除时删除规则行。
+func (s *Server) resetSessionRuleField(writer http.ResponseWriter, request *http.Request) {
+	service, err := s.requireSessionRules()
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	var payload struct {
+		Key string `json:"key"`
+	}
+	if err := decodeJSON(writer, request, &payload); err != nil {
+		writeError(writer, fmt.Errorf("请求体无效: %w", err))
+		return
+	}
+	if err := service.ResetField(request.Context(), request.PathValue("source"), payload.Key); err != nil {
 		writeError(writer, err)
 		return
 	}
@@ -213,44 +237,58 @@ func mergeSessionRulePayload(item *sessionrule.Rule, payload sessionRulePayload)
 	}
 	if payload.ProcessEnabled != nil {
 		item.ProcessEnabled = *payload.ProcessEnabled
+		item.MarkOverride("process_enabled")
 	}
 	if payload.LLMEnabled != nil {
 		item.LLMEnabled = *payload.LLMEnabled
+		item.MarkOverride("llm_enabled")
 	}
 	if payload.TTSEnabled != nil {
 		item.TTSEnabled = *payload.TTSEnabled
+		item.MarkOverride("tts_enabled")
 	}
 	if payload.Note != nil {
 		item.Note = *payload.Note
+		item.MarkOverride("note")
 	}
 	if payload.ChatModel != nil {
 		item.ChatModel = *payload.ChatModel
+		item.MarkOverride("chat_model")
 	}
 	if payload.STTModel != nil {
 		item.STTModel = *payload.STTModel
+		item.MarkOverride("stt_model")
 	}
 	if payload.TTSModel != nil {
 		item.TTSModel = *payload.TTSModel
+		item.MarkOverride("tts_model")
 	}
 	if payload.FollowProfile != nil {
 		item.FollowProfile = *payload.FollowProfile
+		item.MarkOverride("follow_profile")
 	}
 	if payload.ProfileID != nil {
 		item.ProfileID = *payload.ProfileID
+		item.MarkOverride("profile_id")
 	}
 	if payload.PersonaID != nil {
 		item.PersonaID = *payload.PersonaID
+		item.MarkOverride("persona_id")
 	}
 	if payload.DisabledPlugins != nil {
 		item.DisabledPlugins = *payload.DisabledPlugins
+		item.MarkOverride("disabled_plugins")
 	}
 	if payload.KnowledgeBases != nil {
 		item.KnowledgeBases = *payload.KnowledgeBases
+		item.MarkOverride("knowledge_bases")
 	}
 	if payload.KnowledgeTopK != nil {
 		item.KnowledgeTopK = *payload.KnowledgeTopK
+		item.MarkOverride("knowledge_top_k")
 	}
 	if payload.KnowledgeRerank != nil {
 		item.KnowledgeRerank = *payload.KnowledgeRerank
+		item.MarkOverride("knowledge_rerank")
 	}
 }

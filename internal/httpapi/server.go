@@ -38,6 +38,7 @@ type Server struct {
 	providers                  *provider.Registry
 	kernel                     *agent.Kernel
 	bots                       *bot.Manager
+	sourceRegistry             bot.MessageSourceRegistry
 	workspaces                 *workspace.Service
 	remoteTargets              *workspace.RemoteTargetService
 	conversations              *conversation.Service
@@ -132,6 +133,12 @@ func (s *Server) SetArtifactService(service *artifact.Service) {
 // SetSessionRuleService 装配按消息会话来源覆盖配置的规则服务。
 func (s *Server) SetSessionRuleService(service *sessionrule.Service) {
 	s.sessionRules = service
+}
+
+// SetMessageSourceRegistry 装配独立的 UMO 来源目录；它记录所有入站消息，
+// 不要求消息已经创建对话或进入内置 AI。
+func (s *Server) SetMessageSourceRegistry(registry bot.MessageSourceRegistry) {
+	s.sourceRegistry = registry
 }
 
 // SetScheduleService 装配未来任务和本地调度服务。
@@ -430,6 +437,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/session-rules/batch", s.batchSessionRules)
 	mux.HandleFunc("GET /api/v1/session-rules/{source}", s.getSessionRule)
 	mux.HandleFunc("PUT /api/v1/session-rules/{source}", s.updateSessionRule)
+	mux.HandleFunc("POST /api/v1/session-rules/{source}/reset", s.resetSessionRuleField)
 	mux.HandleFunc("DELETE /api/v1/session-rules/{source}", s.deleteSessionRule)
 	mux.HandleFunc("GET /api/v1/session-rule-groups", s.listSessionRuleGroups)
 	mux.HandleFunc("POST /api/v1/session-rule-groups", s.createSessionRuleGroup)

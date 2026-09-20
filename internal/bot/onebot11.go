@@ -45,7 +45,15 @@ type oneBotEvent struct {
 	MessageID   json.RawMessage `json:"message_id"`
 	UserID      json.RawMessage `json:"user_id"`
 	GroupID     json.RawMessage `json:"group_id"`
+	Sender      *oneBotSender   `json:"sender"`
 	Message     json.RawMessage `json:"message"`
+}
+
+// oneBotSender 是 OneBot v11 事件中可选的用户展示信息；不同实现可能只
+// 填 nickname、card 其中一个，因此这里全部按可选字段处理。
+type oneBotSender struct {
+	Nickname string `json:"nickname"`
+	Card     string `json:"card"`
 }
 
 type oneBotSegment struct {
@@ -392,10 +400,36 @@ func (p *oneBotPlatform) messageFromEvent(ctx context.Context, event oneBotEvent
 		UserID:      userID,
 		ChatID:      chatID,
 		ChatType:    chatType,
+		AutoName:    oneBotMessageAutoName(event, chatID, userID),
 		Text:        strings.TrimSpace(text),
 		Attachments: attachments,
 		Mentioned:   !isGroupChat(chatType) || p.oneBotMessageMentioned(event),
 	}, nil
+}
+
+// oneBotMessageAutoName 将群名缺失时可获得的群号和用户昵称组合成可读名称；
+// 该名称只用于来源目录展示，不能替代稳定的 UMO 来源键。
+func oneBotMessageAutoName(event oneBotEvent, chatID, userID string) string {
+	name := ""
+	if event.Sender != nil {
+		name = strings.TrimSpace(event.Sender.Card)
+		if name == "" {
+			name = strings.TrimSpace(event.Sender.Nickname)
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(event.MessageType), "group") {
+		if name != "" {
+			return "群聊 " + chatID + " · " + name
+		}
+		return "群聊 " + chatID
+	}
+	if name != "" {
+		return name
+	}
+	if userID != "" {
+		return "用户 " + userID
+	}
+	return ""
 }
 
 func (p *oneBotPlatform) oneBotMessageMentioned(event oneBotEvent) bool {

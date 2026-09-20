@@ -523,6 +523,7 @@ export interface SessionRule {
   knowledge_bases?: string[]
   knowledge_top_k: number
   knowledge_rerank: boolean
+  configured_fields?: string[]
   created_at?: string
   updated_at?: string
 }
@@ -530,11 +531,15 @@ export interface SessionRule {
 export interface SessionSource {
   source: string
   source_name?: string
+  auto_name?: string
   user_id: string
   platform?: string
   message_type?: string
   session_id?: string
   status: string
+  has_rule?: boolean
+  first_seen_at?: string
+  last_seen_at?: string
   updated_at?: string
 }
 

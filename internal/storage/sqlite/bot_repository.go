@@ -47,6 +47,22 @@ type botSourceNameRow struct {
 
 func (botSourceNameRow) TableName() string { return "abot_bot_source_names" }
 
+// botMessageSourceRow 保存消息入口观察到的 UMO；它不依赖是否创建了对话，
+// 因而能完整覆盖被唤醒规则拦截的消息和只执行内置指令的消息。
+type botMessageSourceRow struct {
+	Source      string `gorm:"primaryKey;size:500"`
+	AdapterID   string `gorm:"size:64;index"`
+	Platform    string `gorm:"size:32;index"`
+	MessageType string `gorm:"size:64;index"`
+	SessionID   string `gorm:"size:300;index"`
+	UserID      string `gorm:"size:300;index"`
+	AutoName    string `gorm:"size:300"`
+	FirstSeenAt time.Time
+	LastSeenAt  time.Time `gorm:"index"`
+}
+
+func (botMessageSourceRow) TableName() string { return "abot_bot_message_sources" }
+
 type botRepository struct {
 	db *gorm.DB
 }
@@ -94,7 +110,12 @@ func (r *botRepository) Delete(ctx context.Context, id string) error {
 			return err
 		}
 		// 机器人删除后同步清理该 adapter 产生的来源别名，避免留下无法再管理的 UMO 元数据。
-		if err := tx.Where("source LIKE ?", "%:"+id+":%").Delete(&botSourceNameRow{}).Error; err != nil {
+		if err := tx.Where("source LIKE ?", id+":%").Delete(&botSourceNameRow{}).Error; err != nil {
+			return err
+		}
+		// 来源目录按 adapter_id 清理；UMO 的第一段就是 adapter ID，不能用
+		// 中间包含字符串的模糊匹配，否则删除某个机器人时会误删其他来源。
+		if err := tx.Where("adapter_id = ?", id).Delete(&botMessageSourceRow{}).Error; err != nil {
 			return err
 		}
 		result := tx.Where("id = ?", id).Delete(&botRow{})
@@ -121,6 +142,25 @@ func (r *botRepository) GetSourceName(ctx context.Context, source string) (strin
 	return strings.TrimSpace(row.Name), nil
 }
 
+// ListSourceNames 返回历史别名目录，兼容来源登记表启用前通过 /name 保存的 UMO。
+func (r *botRepository) ListSourceNames(ctx context.Context, query string) ([]bot.SourceName, error) {
+	db := r.db.WithContext(ctx)
+	query = strings.TrimSpace(query)
+	if query != "" {
+		like := "%" + query + "%"
+		db = db.Where("source LIKE ? OR name LIKE ?", like, like)
+	}
+	var rows []botSourceNameRow
+	if err := db.Order("updated_at DESC").Order("source ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	items := make([]bot.SourceName, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, bot.SourceName{Source: row.Source, Name: row.Name, UpdatedAt: row.UpdatedAt})
+	}
+	return items, nil
+}
+
 // SetSourceName 保存来源名称；空名称用于显式清除旧别名，名称内容不进入其他配置表。
 func (r *botRepository) SetSourceName(ctx context.Context, source, name string) error {
 	source = strings.TrimSpace(source)
@@ -137,6 +177,63 @@ func (r *botRepository) SetSourceName(ctx context.Context, source, name string) 
 		return err
 	}
 	return r.db.WithContext(ctx).Save(&row).Error
+}
+
+// UpsertMessageSource 登记或刷新一个 UMO；FirstSeenAt 只在首次观察时写入，
+// LastSeenAt 每次收到消息都会刷新，供 WebUI 排序和状态展示使用。
+func (r *botRepository) UpsertMessageSource(ctx context.Context, item bot.MessageSource) error {
+	item.Source = strings.TrimSpace(item.Source)
+	if item.Source == "" {
+		return errors.New("消息来源不能为空")
+	}
+	now := time.Now().UTC()
+	if item.LastSeenAt.IsZero() {
+		item.LastSeenAt = now
+	}
+	var existing botMessageSourceRow
+	err := r.db.WithContext(ctx).Where("source = ?", item.Source).First(&existing).Error
+	if err == nil {
+		item.FirstSeenAt = existing.FirstSeenAt
+	} else if errors.Is(err, gorm.ErrRecordNotFound) {
+		if item.FirstSeenAt.IsZero() {
+			item.FirstSeenAt = item.LastSeenAt
+		}
+	} else {
+		return err
+	}
+	if item.FirstSeenAt.IsZero() {
+		item.FirstSeenAt = now
+	}
+	row := botMessageSourceRow{
+		Source: item.Source, AdapterID: strings.TrimSpace(item.AdapterID), Platform: strings.TrimSpace(item.Platform),
+		MessageType: strings.TrimSpace(item.MessageType), SessionID: strings.TrimSpace(item.SessionID), UserID: strings.TrimSpace(item.UserID),
+		AutoName: strings.TrimSpace(item.AutoName), FirstSeenAt: item.FirstSeenAt, LastSeenAt: item.LastSeenAt,
+	}
+	return r.db.WithContext(ctx).Save(&row).Error
+}
+
+// ListMessageSources 返回已观察到的 UMO，查询覆盖来源键、自动名称、平台、
+// 消息类型、会话 ID 和用户 ID，满足 AstrBot 来源选择器的检索习惯。
+func (r *botRepository) ListMessageSources(ctx context.Context, query string) ([]bot.MessageSource, error) {
+	db := r.db.WithContext(ctx)
+	query = strings.TrimSpace(query)
+	if query != "" {
+		like := "%" + query + "%"
+		db = db.Where("source LIKE ? OR auto_name LIKE ? OR adapter_id LIKE ? OR platform LIKE ? OR message_type LIKE ? OR session_id LIKE ? OR user_id LIKE ?", like, like, like, like, like, like, like)
+	}
+	var rows []botMessageSourceRow
+	if err := db.Order("last_seen_at DESC").Order("source ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	items := make([]bot.MessageSource, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, bot.MessageSource{
+			Source: row.Source, AdapterID: row.AdapterID, Platform: row.Platform, MessageType: row.MessageType,
+			SessionID: row.SessionID, UserID: row.UserID, AutoName: row.AutoName,
+			FirstSeenAt: row.FirstSeenAt, LastSeenAt: row.LastSeenAt,
+		})
+	}
+	return items, nil
 }
 
 func botFromRow(row botRow) bot.Bot {

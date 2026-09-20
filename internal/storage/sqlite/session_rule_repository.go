@@ -13,23 +13,24 @@ import (
 
 // sessionRuleRow 保存会话来源规则；列表字段使用 JSON，便于规则字段平滑扩展。
 type sessionRuleRow struct {
-	Source              string `gorm:"primaryKey;size:500"`
-	ProcessEnabled      bool
-	LLMEnabled          bool
-	TTSEnabled          bool
-	Note                string `gorm:"type:text"`
-	ChatModel           string `gorm:"size:300"`
-	STTModel            string `gorm:"size:300"`
-	TTSModel            string `gorm:"size:300"`
-	FollowProfile       bool
-	ProfileID           string `gorm:"size:64"`
-	PersonaID           string `gorm:"size:64"`
-	DisabledPluginsJSON string `gorm:"type:text"`
-	KnowledgeBasesJSON  string `gorm:"type:text"`
-	KnowledgeTopK       int
-	KnowledgeRerank     bool
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	Source               string `gorm:"primaryKey;size:500"`
+	ProcessEnabled       bool
+	LLMEnabled           bool
+	TTSEnabled           bool
+	Note                 string `gorm:"type:text"`
+	ChatModel            string `gorm:"size:300"`
+	STTModel             string `gorm:"size:300"`
+	TTSModel             string `gorm:"size:300"`
+	FollowProfile        bool
+	ProfileID            string `gorm:"size:64"`
+	PersonaID            string `gorm:"size:64"`
+	DisabledPluginsJSON  string `gorm:"type:text"`
+	KnowledgeBasesJSON   string `gorm:"type:text"`
+	KnowledgeTopK        int
+	KnowledgeRerank      bool
+	ConfiguredFieldsJSON string `gorm:"type:text"`
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 func (sessionRuleRow) TableName() string { return "abot_session_rules" }
@@ -90,12 +91,16 @@ func (r *sessionRuleRepository) Save(ctx context.Context, item sessionrule.Rule)
 	if err != nil {
 		return err
 	}
+	configuredFields, err := json.Marshal(item.ConfiguredFields)
+	if err != nil {
+		return err
+	}
 	row := sessionRuleRow{
 		Source: item.Source, ProcessEnabled: item.ProcessEnabled, LLMEnabled: item.LLMEnabled, TTSEnabled: item.TTSEnabled,
 		Note: item.Note, ChatModel: item.ChatModel, STTModel: item.STTModel, TTSModel: item.TTSModel,
 		FollowProfile: item.FollowProfile, ProfileID: item.ProfileID, PersonaID: item.PersonaID,
 		DisabledPluginsJSON: string(disabled), KnowledgeBasesJSON: string(knowledge), KnowledgeTopK: item.KnowledgeTopK,
-		KnowledgeRerank: item.KnowledgeRerank, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
+		KnowledgeRerank: item.KnowledgeRerank, ConfiguredFieldsJSON: string(configuredFields), CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 	}
 	return r.db.WithContext(ctx).Save(&row).Error
 }
@@ -159,7 +164,7 @@ func (r *sessionRuleRepository) DeleteGroup(ctx context.Context, id string) erro
 }
 
 func ruleFromRow(row sessionRuleRow) (sessionrule.Rule, error) {
-	var disabled, knowledge []string
+	var disabled, knowledge, configuredFields []string
 	if strings.TrimSpace(row.DisabledPluginsJSON) != "" {
 		if err := json.Unmarshal([]byte(row.DisabledPluginsJSON), &disabled); err != nil {
 			return sessionrule.Rule{}, err
@@ -170,12 +175,17 @@ func ruleFromRow(row sessionRuleRow) (sessionrule.Rule, error) {
 			return sessionrule.Rule{}, err
 		}
 	}
+	if strings.TrimSpace(row.ConfiguredFieldsJSON) != "" {
+		if err := json.Unmarshal([]byte(row.ConfiguredFieldsJSON), &configuredFields); err != nil {
+			return sessionrule.Rule{}, err
+		}
+	}
 	return sessionrule.Rule{
 		Source: row.Source, ProcessEnabled: row.ProcessEnabled, LLMEnabled: row.LLMEnabled, TTSEnabled: row.TTSEnabled,
 		Note: row.Note, ChatModel: row.ChatModel, STTModel: row.STTModel, TTSModel: row.TTSModel,
 		FollowProfile: row.FollowProfile, ProfileID: row.ProfileID, PersonaID: row.PersonaID,
 		DisabledPlugins: disabled, KnowledgeBases: knowledge, KnowledgeTopK: row.KnowledgeTopK,
-		KnowledgeRerank: row.KnowledgeRerank, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+		KnowledgeRerank: row.KnowledgeRerank, ConfiguredFields: configuredFields, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}, nil
 }
 

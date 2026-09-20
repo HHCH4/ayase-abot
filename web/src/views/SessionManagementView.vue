@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { NButton, NCard, NCheckbox, NEmpty, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, NSpace, NTag, useMessage } from 'naive-ui'
-import { batchSessionRules, createSessionRule, deleteSessionRule, deleteSessionRuleGroup, readPersonas, readSessionRuleGroups, readSessionRules, readSessionSources, saveSessionRule, saveSessionRuleGroup } from '@/api'
+import { batchSessionRules, createSessionRule, deleteSessionRule, deleteSessionRuleGroup, readPersonas, readSessionRuleGroups, readSessionRules, readSessionSources, resetSessionRuleField, saveSessionRule, saveSessionRuleGroup } from '@/api'
 import { useAppStore } from '@/stores/app'
 import type { Persona, SessionRule, SessionRuleGroup, SessionSource } from '@/types'
 
@@ -24,6 +24,8 @@ const batchLLM = ref('keep')
 const batchProcess = ref('keep')
 const batchTTS = ref('keep')
 const batchModel = ref('')
+const sourceQuery = ref('')
+const resetFieldKey = ref('')
 const form = reactive({
   source: '', process_enabled: true, llm_enabled: true, tts_enabled: false, note: '', chat_model: '', stt_model: '', tts_model: '',
   follow_profile: true, profile_id: '', persona_id: '', disabled_plugins: '', knowledge_bases: '', knowledge_top_k: 5, knowledge_rerank: false,
@@ -49,10 +51,11 @@ const modelOptions = computed(() => {
 const selectedCount = computed(() => selectedSources.value.length)
 const sourceOptions = computed(() => {
   const options = new Map<string, { label: string; value: string }>()
-  // 优先展示已有消息的来源，让用户像 AstrBot 一样从活跃会话中选择 UMO。
+  // 优先展示来源目录中的全部 UMO，让用户像 AstrBot 一样直接从已知会话选择。
   for (const item of sources.value) {
     const detail = [item.platform, item.message_type, item.session_id].filter(Boolean).join(' · ')
-    options.set(item.source, { label: item.source_name ? `${item.source_name} · ${item.source}${detail ? `（${detail}）` : ''}` : `${item.source}${detail ? `（${detail}）` : ''}`, value: item.source })
+    const name = item.source_name?.trim() || item.auto_name?.trim()
+    options.set(item.source, { label: name ? `${name} · ${item.source}${detail ? `（${detail}）` : ''}` : `${item.source}${detail ? `（${detail}）` : ''}`, value: item.source })
   }
   // 保留没有最近消息但已经存在规则的来源，避免编辑旧规则时选项消失。
   for (const item of rules.value) {
@@ -62,9 +65,25 @@ const sourceOptions = computed(() => {
 })
 
 const sourceRule = (source: string) => rules.value.find((item) => item.source === source)
+const resetFieldOptions = [
+  { label: '处理消息', value: 'process_enabled' },
+  { label: '内置 AI', value: 'llm_enabled' },
+  { label: 'TTS', value: 'tts_enabled' },
+  { label: '聊天模型', value: 'chat_model' },
+  { label: 'STT 模型', value: 'stt_model' },
+  { label: 'TTS 模型', value: 'tts_model' },
+  { label: '配置文件跟随', value: 'follow_profile' },
+  { label: '配置文件', value: 'profile_id' },
+  { label: '人格', value: 'persona_id' },
+  { label: '停用插件记录', value: 'disabled_plugins' },
+  { label: '知识库', value: 'knowledge_bases' },
+  { label: '知识库 Top K', value: 'knowledge_top_k' },
+  { label: '知识库重排', value: 'knowledge_rerank' },
+  { label: '备注', value: 'note' },
+]
 
 function sourceLabel(item: SessionSource) {
-  return item.source_name?.trim() || item.source
+  return item.source_name?.trim() || item.auto_name?.trim() || item.source
 }
 
 function sourceStatusLabel(status: string) {
@@ -86,12 +105,13 @@ async function load() {
   loading.value = true
   try {
     await store.loadAll()
-    const [ruleItems, groupItems, personaResult, sourceItems] = await Promise.all([readSessionRules(), readSessionRuleGroups(), readPersonas(), readSessionSources()])
+    const [ruleItems, groupItems, personaResult, sourceItems] = await Promise.all([readSessionRules(), readSessionRuleGroups(), readPersonas(), readSessionSources(sourceQuery.value)])
     rules.value = ruleItems
     groups.value = groupItems
     personas.value = personaResult.personas || []
     sources.value = sourceItems
-    selectedSources.value = selectedSources.value.filter((source) => rules.value.some((item) => item.source === source))
+    const known = new Set([...rules.value.map((item) => item.source), ...sources.value.map((item) => item.source)])
+    selectedSources.value = selectedSources.value.filter((source) => known.has(source))
   } catch (error) {
     message.error(error instanceof Error ? error.message : '读取会话规则失败')
   } finally {
@@ -116,6 +136,7 @@ function resetForm(item?: SessionRule) {
   form.knowledge_bases = (item?.knowledge_bases || []).join(', ')
   form.knowledge_top_k = item?.knowledge_top_k || 5
   form.knowledge_rerank = item?.knowledge_rerank ?? false
+  resetFieldKey.value = ''
 }
 
 function openCreate(source = '') {
@@ -165,6 +186,27 @@ async function save() {
     message.error(error instanceof Error ? error.message : '保存会话规则失败')
   } finally {
     saving.value = false
+  }
+}
+
+// 按项清除会话覆盖，恢复继承全局配置；这和删除整条规则是两个不同操作。
+async function resetOverride() {
+  if (!editingSource.value || !resetFieldKey.value) {
+    message.warning('请先选择要清除的规则项')
+    return
+  }
+  try {
+    await resetSessionRuleField(editingSource.value, resetFieldKey.value)
+    await load()
+    const updated = sourceRule(editingSource.value)
+    if (updated) {
+      resetForm(updated)
+    } else {
+      showEditor.value = false
+    }
+    message.success('该规则项已恢复继承全局配置')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '清除规则项失败')
   }
 }
 
@@ -266,13 +308,13 @@ async function removeGroup(item: SessionRuleGroup) {
     </div>
 
     <NCard class="detail-card" :bordered="false">
-      <div class="section-heading-row"><div><h3>可配置会话</h3><p>以下来源来自已经收到过平台消息的会话；选择一个会话即可创建或编辑对应的 UMO 规则。</p></div><NButton secondary :loading="loading" @click="load">刷新会话</NButton></div>
-      <div v-if="sources.length" class="data-table-wrap"><table class="data-table"><thead><tr><th>会话来源</th><th>平台 / 类型</th><th>Session ID</th><th>状态</th><th>规则</th><th>最近活动</th><th>操作</th></tr></thead><tbody><tr v-for="item in sources" :key="item.source"><td><strong>{{ sourceLabel(item) }}</strong><code>{{ item.source }}</code></td><td><span>{{ item.platform || '—' }}</span><code>{{ item.message_type || '—' }}</code></td><td><code>{{ item.session_id || '—' }}</code></td><td><NTag size="small" :bordered="false" :type="sourceStatusType(item.status)">{{ sourceStatusLabel(item.status) }}</NTag></td><td><NTag v-if="sourceRule(item.source)" size="small" :bordered="false" type="info">已配置</NTag><span v-else class="muted">未配置</span></td><td>{{ formatSourceTime(item.updated_at) }}</td><td><NButton size="small" secondary @click="openSource(item)">{{ sourceRule(item.source) ? '编辑规则' : '配置规则' }}</NButton></td></tr></tbody></table></div>
+      <div class="section-heading-row"><div><h3>可配置会话</h3><p>来源目录记录所有收到过消息的 UMO，即使消息没有唤醒 AI 或只执行了内置指令，也可以直接配置。</p></div><NSpace><NInput v-model:value="sourceQuery" clearable placeholder="搜索名称、平台、Session ID" style="width: 250px" @keyup.enter="load" /><NButton secondary :loading="loading" @click="load">刷新会话</NButton></NSpace></div>
+      <div v-if="sources.length" class="data-table-wrap"><table class="data-table"><thead><tr><th class="check-column">选</th><th>会话来源</th><th>平台 / 类型</th><th>Session ID</th><th>状态</th><th>规则</th><th>最近活动</th><th>操作</th></tr></thead><tbody><tr v-for="item in sources" :key="item.source"><td class="check-column"><input v-model="selectedSources" type="checkbox" :value="item.source"></td><td><strong>{{ sourceLabel(item) }}</strong><code>{{ item.source }}</code><code v-if="item.source_name && item.auto_name">自动名称：{{ item.auto_name }}</code></td><td><span>{{ item.platform || '—' }}</span><code>{{ item.message_type || '—' }}</code></td><td><code>{{ item.session_id || '—' }}</code></td><td><NTag size="small" :bordered="false" :type="sourceStatusType(item.status)">{{ sourceStatusLabel(item.status) }}</NTag></td><td><NTag v-if="sourceRule(item.source) || item.has_rule" size="small" :bordered="false" type="info">已配置</NTag><span v-else class="muted">未配置</span></td><td>{{ formatSourceTime(item.last_seen_at || item.updated_at) }}</td><td><NButton size="small" secondary @click="openSource(item)">{{ sourceRule(item.source) ? '编辑规则' : '配置规则' }}</NButton></td></tr></tbody></table></div>
       <NEmpty v-else description="还没有可配置的会话；请先让机器人收到一条平台消息，再点击刷新" />
     </NCard>
 
     <NCard class="detail-card" :bordered="false">
-      <div class="section-heading-row"><div><h3>会话来源规则</h3><p>已选 {{ selectedCount }} 条；可用来源 {{ sources.length }} 个，来源和 UMO 与 AstrBot 保持一致。</p></div><NButton secondary @click="openGroupCreate">管理分组</NButton></div>
+      <div class="section-heading-row"><div><h3>会话来源规则</h3><p>已选 {{ selectedCount }} 条；可用来源 {{ sources.length }} 个。批量修改会作用于所有已知 UMO，没有旧规则的来源会自动创建默认规则。</p></div><NButton secondary @click="openGroupCreate">管理分组</NButton></div>
       <div class="batch-toolbar">
         <NSelect v-model:value="batchScope" :options="[{ label: '选中会话', value: 'selected' }, { label: '全部会话', value: 'all' }, { label: '群聊来源', value: 'groups' }, { label: '私聊来源', value: 'private' }, { label: '指定分组', value: 'group' }]" style="width: 140px" />
         <NSelect v-if="batchScope === 'group'" v-model:value="batchGroupID" :options="groups.map((item) => ({ label: item.name, value: item.id }))" placeholder="选择分组" style="width: 180px" />
@@ -301,6 +343,7 @@ async function removeGroup(item: SessionRuleGroup) {
         <div class="form-grid-2"><NFormItem label="知识库（逗号分隔）"><NInput v-model:value="form.knowledge_bases" placeholder="可选知识库 ID" /></NFormItem><NFormItem label="知识库 Top K"><NInputNumber v-model:value="form.knowledge_top_k" :min="1" :max="100" style="width: 100%" /></NFormItem></div>
         <NFormItem label="停用插件（逗号分隔）"><NInput v-model:value="form.disabled_plugins" placeholder="仅记录规则，实际插件由内置工具目录决定" /></NFormItem>
         <NFormItem label="备注"><NInput v-model:value="form.note" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }" /></NFormItem>
+        <NFormItem v-if="editingSource" label="按项清除覆盖"><NSpace><NSelect v-model:value="resetFieldKey" :options="resetFieldOptions" clearable placeholder="选择后恢复继承全局配置" style="width: 230px" /><NButton secondary type="warning" @click="resetOverride">清除此项</NButton></NSpace><p class="muted">只清除所选字段，不影响同一来源的其他规则；全部清除后规则行会移除，但会话来源仍保留。</p></NFormItem>
       </NForm>
       <template #footer><div class="modal-footer"><NButton @click="showEditor = false">取消</NButton><NButton type="primary" :loading="saving" @click="save">保存</NButton></div></template>
     </NModal>

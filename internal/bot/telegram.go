@@ -64,8 +64,10 @@ type telegramMessage struct {
 }
 
 type telegramUser struct {
-	ID       int64  `json:"id"`
-	Username string `json:"username"`
+	ID        int64  `json:"id"`
+	Username  string `json:"username"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
 }
 
 type telegramEntity struct {
@@ -82,8 +84,10 @@ type telegramCallbackQuery struct {
 }
 
 type telegramChat struct {
-	ID   int64  `json:"id"`
-	Type string `json:"type"`
+	ID       int64  `json:"id"`
+	Type     string `json:"type"`
+	Title    string `json:"title"`
+	Username string `json:"username"`
 }
 
 type telegramPhoto struct {
@@ -288,6 +292,7 @@ func (p *telegramPlatform) messageFromUpdate(ctx context.Context, update telegra
 		UserID:    userID,
 		ChatID:    strconv.FormatInt(item.Chat.ID, 10),
 		ChatType:  item.Chat.Type,
+		AutoName:  telegramMessageAutoName(item, userID),
 		Text:      strings.TrimSpace(item.Text),
 		Mentioned: p.telegramMessageMentioned(item),
 	}
@@ -362,8 +367,61 @@ func (p *telegramPlatform) messageFromCallback(callback *telegramCallbackQuery) 
 	return Message{
 		ID: "callback:" + callback.ID, Platform: TypeTelegram, UserID: userID,
 		ChatID: strconv.FormatInt(callback.Message.Chat.ID, 10), ChatType: callback.Message.Chat.Type,
+		AutoName:  telegramCallbackAutoName(callback, userID),
 		Mentioned: true, Control: &MessageControl{Kind: "approval", ApprovalID: parts[2], ChoiceID: choiceID, Decision: decision, CallbackID: callback.ID},
 	}, nil
+}
+
+// telegramMessageAutoName 提取 Telegram 的群标题、频道用户名或用户昵称；
+// 这些信息只作为来源目录的自动名称，来源键仍严格使用 UMO 三段式格式。
+func telegramMessageAutoName(item *telegramMessage, userID string) string {
+	if item == nil {
+		return ""
+	}
+	chatType := strings.ToLower(strings.TrimSpace(item.Chat.Type))
+	if chatType == "group" || chatType == "supergroup" || chatType == "channel" {
+		if title := strings.TrimSpace(item.Chat.Title); title != "" {
+			return title
+		}
+		if username := strings.TrimSpace(item.Chat.Username); username != "" {
+			return "@" + username
+		}
+		return "群聊 " + strings.TrimSpace(strconv.FormatInt(item.Chat.ID, 10))
+	}
+	if item.From != nil {
+		name := strings.TrimSpace(strings.Join([]string{item.From.FirstName, item.From.LastName}, " "))
+		if name != "" {
+			return name
+		}
+		if username := strings.TrimSpace(item.From.Username); username != "" {
+			return "@" + username
+		}
+	}
+	if userID != "" {
+		return "用户 " + userID
+	}
+	return ""
+}
+
+// telegramCallbackAutoName 使用回调发送者优先补齐审批按钮产生的消息来源名。
+func telegramCallbackAutoName(callback *telegramCallbackQuery, userID string) string {
+	if callback == nil || callback.Message == nil {
+		return ""
+	}
+	item := callback.Message
+	if item.Chat.Title != "" || item.Chat.Username != "" {
+		return telegramMessageAutoName(item, userID)
+	}
+	if callback.From != nil {
+		name := strings.TrimSpace(strings.Join([]string{callback.From.FirstName, callback.From.LastName}, " "))
+		if name != "" {
+			return name
+		}
+		if username := strings.TrimSpace(callback.From.Username); username != "" {
+			return "@" + username
+		}
+	}
+	return telegramMessageAutoName(item, userID)
 }
 
 func (p *telegramPlatform) telegramMessageMentioned(item *telegramMessage) bool {
