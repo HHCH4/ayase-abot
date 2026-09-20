@@ -159,12 +159,12 @@ func TestBotCommandsGroupTriggerAndApproval(t *testing.T) {
 	runtime.setInvocation(agentruntime.Invocation{ID: "invocation-1", UserID: bindingUserID(private), ConversationID: conversationID, SessionID: conversationID, Status: agentruntime.InvocationWaitingApproval})
 	runtime.setApproval(agentruntime.Approval{ID: "approval-1", InvocationID: "invocation-1", ConversationID: conversationID, ToolName: "write_file", Status: agentruntime.ApprovalPending})
 	manager.deliverApproval(context.Background(), private, agentruntime.AgentEvent{InvocationID: "invocation-1", Type: agentruntime.EventApprovalRequested, Data: map[string]any{"approval_id": "approval-1", "tool_name": "write_file", "hint": "将修改工作区"}})
-	if last := platform.lastSent(); !containsAny(last, "/approve 1", "/reject 1") {
-		t.Fatalf("文本审批提示缺少序号命令: %q", last)
+	if last := platform.lastSent(); !containsAny(last, "1. 允许一次", "2. 拒绝") {
+		t.Fatalf("文本审批提示缺少结构化选项: %q", last)
 	}
-	private.Text = "/approve 1"
+	private.Text = "1"
 	if err := manager.handleMessage(context.Background(), private); err != nil {
-		t.Fatalf("/approve 1 失败: %v", err)
+		t.Fatalf("选择审批选项失败: %v", err)
 	}
 	if runtime.resolvedApproval() != "approval-1" {
 		t.Fatalf("审批没有进入 Runtime ResolveApproval: %q", runtime.resolvedApproval())

@@ -213,6 +213,7 @@ type approvalRow struct {
 	ConfirmationCallID  string `gorm:"uniqueIndex;size:200;not null"`
 	ArgsJSON            string `gorm:"type:text"`
 	Hint                string `gorm:"type:text"`
+	ChoicesJSON         string `gorm:"type:text"`
 	Status              string `gorm:"index;size:32;not null"`
 	DecisionReason      string `gorm:"type:text"`
 	CreatedAt           time.Time
@@ -613,7 +614,7 @@ func (r *runtimeRepository) CommitInvocationResume(ctx context.Context, commit a
 	if invocationID == "" || strings.TrimSpace(commit.Resume.InvocationID) != invocationID || strings.TrimSpace(commit.Outbox.InvocationID) != invocationID {
 		return agentruntime.Invocation{}, agentruntime.AgentEvent{}, agentruntime.ErrInvalidResume
 	}
-	if commit.FromStatus != agentruntime.InvocationWaitingTool || commit.ToStatus != agentruntime.InvocationQueued || !validRuntimeInvocationTransition(commit.FromStatus, commit.ToStatus) {
+	if (commit.FromStatus != agentruntime.InvocationWaitingTool && commit.FromStatus != agentruntime.InvocationWaitingUser) || commit.ToStatus != agentruntime.InvocationQueued || !validRuntimeInvocationTransition(commit.FromStatus, commit.ToStatus) {
 		return agentruntime.Invocation{}, agentruntime.AgentEvent{}, agentruntime.ErrConflict
 	}
 	resume := commit.Resume
@@ -2585,10 +2586,14 @@ func (r *runtimeRepository) CreateApproval(ctx context.Context, item agentruntim
 	if err != nil {
 		return err
 	}
+	choices, err := json.Marshal(item.Choices)
+	if err != nil {
+		return err
+	}
 	return r.db.WithContext(ctx).Create(&approvalRow{
 		ID: item.ID, InvocationID: item.InvocationID, ConversationID: item.ConversationID,
 		ToolCallID: item.ToolCallID, TaskContractVersion: item.TaskContractVersion, ToolName: item.ToolName, OperationID: item.OperationID, OriginalCallID: item.OriginalCallID, ConfirmationCallID: item.ConfirmationCallID,
-		ArgsJSON: string(data), Hint: item.Hint, Status: string(item.Status), DecisionReason: item.DecisionReason,
+		ArgsJSON: string(data), Hint: item.Hint, ChoicesJSON: string(choices), Status: string(item.Status), DecisionReason: item.DecisionReason,
 		CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt, ExpiresAt: item.ExpiresAt, ResolvedAt: item.ResolvedAt,
 	}).Error
 }
@@ -3514,7 +3519,14 @@ func approvalFromRow(row approvalRow) agentruntime.Approval {
 	if strings.TrimSpace(row.ArgsJSON) != "" {
 		_ = json.Unmarshal([]byte(row.ArgsJSON), &args)
 	}
-	return agentruntime.Approval{ID: row.ID, InvocationID: row.InvocationID, ConversationID: row.ConversationID, ToolCallID: row.ToolCallID, TaskContractVersion: row.TaskContractVersion, ToolName: row.ToolName, OperationID: row.OperationID, OriginalCallID: row.OriginalCallID, ConfirmationCallID: row.ConfirmationCallID, Args: args, Hint: row.Hint, Status: agentruntime.ApprovalStatus(row.Status), DecisionReason: row.DecisionReason, ExpiresAt: row.ExpiresAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, ResolvedAt: row.ResolvedAt}
+	var choices []agentruntime.ApprovalChoice
+	if strings.TrimSpace(row.ChoicesJSON) != "" {
+		_ = json.Unmarshal([]byte(row.ChoicesJSON), &choices)
+	}
+	if len(choices) == 0 {
+		choices = agentruntime.DefaultApprovalChoices()
+	}
+	return agentruntime.Approval{ID: row.ID, InvocationID: row.InvocationID, ConversationID: row.ConversationID, ToolCallID: row.ToolCallID, TaskContractVersion: row.TaskContractVersion, ToolName: row.ToolName, OperationID: row.OperationID, OriginalCallID: row.OriginalCallID, ConfirmationCallID: row.ConfirmationCallID, Args: args, Hint: row.Hint, Choices: choices, Status: agentruntime.ApprovalStatus(row.Status), DecisionReason: row.DecisionReason, ExpiresAt: row.ExpiresAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, ResolvedAt: row.ResolvedAt}
 }
 
 func toolCallFromRow(row toolCallRow) agentruntime.ToolCall {

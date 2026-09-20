@@ -58,13 +58,22 @@ const reasoningEffortOptions = [
   { label: '思考：高', value: 'high' },
 ]
 type RuntimeTimelineItem = { type: string; text: string; timestamp: string; data?: Record<string, unknown> }
-type PendingApproval = { id: string; toolName: string; hint: string; args: Record<string, unknown> }
+type PendingApprovalChoice = { id: string; label: string; approved: boolean }
+type PendingApproval = { id: string; toolName: string; hint: string; args: Record<string, unknown>; choices: PendingApprovalChoice[] }
+type PendingUserInputOption = { id: string; label: string; description?: string; recommended?: boolean }
+type PendingUserInput = {
+  id: string; invocationID: string; title: string; question: string; kind: string; options: PendingUserInputOption[]
+  allowMultiple: boolean; allowFreeform: boolean; allowSkip: boolean; minSelections: number; maxSelections: number
+  step: number; totalSteps: number; placeholder: string; selectedIDs: string[]; freeform: string
+}
 type InstructionSnapshotMeta = { path?: string; scope_path?: string; source?: string; priority?: number; content_digest?: string }
 type InstructionConflict = { previous?: InstructionSnapshotMeta[]; current?: InstructionSnapshotMeta[]; reason?: string }
 const runtimeTimeline = ref<RuntimeTimelineItem[]>([])
 const pendingApproval = ref<PendingApproval | null>(null)
+const pendingUserInput = ref<PendingUserInput | null>(null)
 const instructionConflict = ref<InstructionConflict | null>(null)
 const resolvingApproval = ref(false)
+const resolvingUserInput = ref(false)
 const reconfirmingInstructions = ref(false)
 const currentInvocationID = ref('')
 const runtimeDetails = ref<{
@@ -123,6 +132,7 @@ const currentModelLabel = computed(() => {
 })
 const displayStatus = computed(() => {
   if (pendingApproval.value) return '等待审批'
+  if (pendingUserInput.value) return '等待回答'
   if (sending.value) return statusText.value || '运行中'
   if (statusText.value) return statusText.value
   if (!selectedConversation.value) return '选择一个对话'
@@ -130,6 +140,7 @@ const displayStatus = computed(() => {
 })
 const statusTagType = computed<'default' | 'success' | 'warning' | 'error' | 'info'>(() => {
   if (pendingApproval.value) return 'warning'
+  if (pendingUserInput.value) return 'info'
   if (statusText.value === '运行失败') return 'error'
   if (statusText.value === '完成' || (!sending.value && selectedConversation.value?.status === 'active')) return 'success'
   if (sending.value) return 'info'
@@ -215,6 +226,7 @@ async function selectConversation(id: string, updateRoute = true) {
     statusText.value = ''
     runtimeTimeline.value = []
     pendingApproval.value = null
+    pendingUserInput.value = null
     instructionConflict.value = null
     currentInvocationID.value = ''
     runtimeDetails.value = null
@@ -455,22 +467,104 @@ function runtimeEventText(type: string, data: Record<string, unknown>) {
   return type
 }
 
-async function resolvePendingApproval(approved: boolean) {
-  const approval = pendingApproval.value
-  if (!approval || resolvingApproval.value) return
-  resolvingApproval.value = true
-  try {
-    await request(`/api/v1/approvals/${encodeURIComponent(approval.id)}/resolve`, {
-      method: 'POST', body: JSON.stringify({ approved, reason: approved ? 'WebUI 批准' : 'WebUI 拒绝' }),
-    })
-    appendRuntimeEvent('approval.resolved', approved ? '已批准，Agent 正在恢复' : '已拒绝，Agent 正在处理拒绝结果')
-    pendingApproval.value = null
-    statusText.value = approved ? 'Agent 恢复运行中…' : '已拒绝，Agent 处理中…'
+async function resolvePendingApproval(choice: PendingApprovalChoice) {
+	const approval = pendingApproval.value
+	if (!approval || resolvingApproval.value) return
+	resolvingApproval.value = true
+	try {
+		await request(`/api/v1/approvals/${encodeURIComponent(approval.id)}/resolve`, {
+			method: 'POST', body: JSON.stringify({ choice_id: choice.id, reason: `WebUI 选择：${choice.label}` }),
+		})
+		appendRuntimeEvent('approval.resolved', choice.approved ? `已选择“${choice.label}”，Agent 正在恢复` : `已选择“${choice.label}”，Agent 正在处理拒绝结果`)
+		pendingApproval.value = null
+		statusText.value = choice.approved ? 'Agent 恢复运行中…' : '已拒绝，Agent 处理中…'
     if (currentInvocationID.value) void loadRuntimeDetails(currentInvocationID.value)
   } catch (error) {
     message.error(error instanceof Error ? error.message : '审批处理失败')
   } finally {
     resolvingApproval.value = false
+  }
+}
+
+// togglePendingUserInputOption 只修改当前问题卡片的本地选择，不把选项文案
+// 直接当作恢复值；提交时会同时发送稳定 ID 和展示标签。
+function togglePendingUserInputOption(optionID: string) {
+  const input = pendingUserInput.value
+  if (!input || input.kind === 'text') return
+  if (!input.allowMultiple) {
+    input.selectedIDs = [optionID]
+    return
+  }
+  const index = input.selectedIDs.indexOf(optionID)
+  if (index >= 0) {
+    input.selectedIDs.splice(index, 1)
+    return
+  }
+  if (input.maxSelections > 0 && input.selectedIDs.length >= input.maxSelections) {
+    message.warning(`本题最多选择 ${input.maxSelections} 项`)
+    return
+  }
+  input.selectedIDs.push(optionID)
+}
+
+// resolvePendingUserInput 将 UI 选择转换为 ADK RequestInput 的结构化
+// FunctionResponse。审批按钮不经过这里，二者保持完全独立的恢复协议。
+async function resolvePendingUserInput(skip = false) {
+  const input = pendingUserInput.value
+  if (!input || resolvingUserInput.value) return
+  let response: Record<string, unknown>
+  if (skip) {
+    response = { skipped: true }
+  } else if (input.kind === 'text') {
+    const text = input.freeform.trim()
+    if (!text) {
+      message.warning('请先输入答案')
+      return
+    }
+    response = { text }
+  } else {
+    const selected = input.options.filter((option) => input.selectedIDs.includes(option.id))
+    const customText = input.freeform.trim()
+    if (customText && input.allowFreeform && selected.length === 0) {
+      response = { text: customText }
+    } else {
+      if (!selected.length) {
+        message.warning('请至少选择一项')
+        return
+      }
+      if (!input.allowMultiple && selected.length !== 1) {
+        message.warning('本题只能选择一个选项')
+        return
+      }
+      if (input.minSelections > 0 && selected.length < input.minSelections) {
+        message.warning(`本题至少选择 ${input.minSelections} 项`)
+        return
+      }
+      if (input.maxSelections > 0 && selected.length > input.maxSelections) {
+        message.warning(`本题最多选择 ${input.maxSelections} 项`)
+        return
+      }
+      response = {
+        selected_ids: selected.map((option) => option.id),
+        selected_labels: selected.map((option) => option.label),
+      }
+      if (customText && input.allowFreeform) response.text = customText
+    }
+  }
+  resolvingUserInput.value = true
+  try {
+    await request(`/api/v1/invocations/${encodeURIComponent(input.invocationID)}/resume`, {
+      method: 'POST',
+      body: JSON.stringify({ wait_id: input.id, name: 'adk_request_input', response }),
+    })
+    appendRuntimeEvent('user_input.resolved', skip ? '已跳过当前问题' : '已提交当前问题答案')
+    pendingUserInput.value = null
+    statusText.value = input.step > 0 && input.totalSteps > input.step ? '进入下一题…' : 'Agent 恢复运行中…'
+    if (currentInvocationID.value) void loadRuntimeDetails(currentInvocationID.value)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '提交回答失败')
+  } finally {
+    resolvingUserInput.value = false
   }
 }
 
@@ -493,6 +587,7 @@ async function send() {
   statusText.value = 'Agent 运行中…'
   runtimeTimeline.value = []
   pendingApproval.value = null
+  pendingUserInput.value = null
   await scrollToBottom()
   try {
     await streamChat({ user_id: userID.value, conversation_id: item.id, provider_id: providerID.value, model_id: model, message: text, attachments: outgoing, stream: true, reasoning_effort: reasoningEffort.value || undefined }, (type, data) => {
@@ -502,12 +597,37 @@ async function send() {
       if (type === 'done' && data.invocation_id) currentInvocationID.value = String(data.invocation_id)
       if (type === 'approval') {
         if (data.invocation_id) currentInvocationID.value = String(data.invocation_id)
+        pendingUserInput.value = null
+        const rawChoices = (Array.isArray(data.choices) ? data.choices : [])
+          .map((item: any) => ({ id: String(item?.id || ''), label: String(item?.label || ''), approved: Boolean(item?.approved) }))
+          .filter((item: PendingApprovalChoice) => (item.id === 'approve' || item.id === 'reject') && item.label)
+        const approvalDefaults = [{ id: 'approve', label: '允许一次', approved: true }, { id: 'reject', label: '拒绝', approved: false }]
+        // 审批永远是二元权限决策；普通多选题由 input 事件单独渲染。
+        const choices = approvalDefaults.map((fallback) => rawChoices.find((item: PendingApprovalChoice) => item.id === fallback.id) || fallback)
         pendingApproval.value = {
           id: String(data.approval_id || ''), toolName: String(data.tool_name || '工作区操作'),
-          hint: String(data.hint || '该操作需要批准'), args: (data.args || {}) as Record<string, unknown>,
+          hint: String(data.hint || '该操作需要确认'), args: (data.args || {}) as Record<string, unknown>, choices,
         }
         appendRuntimeEvent('approval.requested', pendingApproval.value.hint)
         statusText.value = '等待用户批准…'
+      }
+      if (type === 'input') {
+        if (data.invocation_id) currentInvocationID.value = String(data.invocation_id)
+        pendingApproval.value = null
+        const options = (Array.isArray(data.options) ? data.options : [])
+          .map((item: any) => ({ id: String(item?.id || ''), label: String(item?.label || ''), description: String(item?.description || ''), recommended: Boolean(item?.recommended) }))
+          .filter((item: PendingUserInputOption) => item.id && item.label)
+        pendingUserInput.value = {
+          id: String(data.request_id || data.wait_id || ''), invocationID: String(data.invocation_id || currentInvocationID.value || ''),
+          title: String(data.title || ''), question: String(data.question || data.message || '请提供输入'),
+          kind: String(data.kind || 'text'), options, allowMultiple: Boolean(data.allow_multiple),
+          allowFreeform: Boolean(data.allow_freeform), allowSkip: Boolean(data.allow_skip),
+          minSelections: Number(data.min_selections || 0), maxSelections: Number(data.max_selections || 0),
+          step: Number(data.step || 0), totalSteps: Number(data.total_steps || 0), placeholder: String(data.placeholder || '输入你的答案'),
+          selectedIDs: [], freeform: '',
+        }
+        appendRuntimeEvent('user_input.requested', pendingUserInput.value.question, data)
+        statusText.value = '等待你的回答…'
       }
       if (type === 'runtime') {
         const eventName = String(data.event || 'runtime')
@@ -674,10 +794,11 @@ onMounted(async () => {
         </div>
       </div>
 
-      <section v-if="runtimeTimeline.length || pendingApproval" class="chat-activity">
+      <section v-if="runtimeTimeline.length || pendingApproval || pendingUserInput" class="chat-activity">
         <div class="chat-activity-heading">
           <span><i class="activity-pulse" :class="{ active: sending }" />运行活动</span>
           <NTag v-if="pendingApproval" size="small" type="warning" round>需要你的确认</NTag>
+          <NTag v-else-if="pendingUserInput" size="small" type="info" round>等待回答</NTag>
           <span v-else class="chat-activity-count">{{ runtimeTimeline.length }} 条记录</span>
         </div>
         <div v-if="pendingApproval" class="chat-approval-card">
@@ -688,9 +809,29 @@ onMounted(async () => {
             <code v-if="Object.keys(pendingApproval.args).length">{{ JSON.stringify(pendingApproval.args) }}</code>
           </div>
           <NSpace class="approval-actions">
-            <NButton size="small" type="primary" :loading="resolvingApproval" @click="resolvePendingApproval(true)">批准</NButton>
-            <NButton size="small" secondary :loading="resolvingApproval" @click="resolvePendingApproval(false)">拒绝</NButton>
+            <NButton v-for="(choice, index) in pendingApproval.choices" :key="choice.id" size="small" :type="index === 0 && choice.approved ? 'primary' : 'default'" :secondary="index !== 0 || !choice.approved" :loading="resolvingApproval" @click="resolvePendingApproval(choice)">{{ choice.label }}</NButton>
           </NSpace>
+        </div>
+        <div v-if="pendingUserInput" class="chat-user-input-card">
+          <div class="user-input-heading">
+            <div>
+              <span v-if="pendingUserInput.title" class="user-input-title">{{ pendingUserInput.title }}</span>
+              <strong>{{ pendingUserInput.question }}</strong>
+            </div>
+            <span v-if="pendingUserInput.step && pendingUserInput.totalSteps" class="user-input-step">{{ pendingUserInput.step }}/{{ pendingUserInput.totalSteps }}</span>
+          </div>
+          <div v-if="pendingUserInput.options.length" class="user-input-options">
+            <button v-for="(option, index) in pendingUserInput.options" :key="option.id" type="button" class="user-input-option" :class="{ selected: pendingUserInput.selectedIDs.includes(option.id) }" @click="togglePendingUserInputOption(option.id)">
+              <span class="user-input-option-index">{{ pendingUserInput.allowMultiple ? (pendingUserInput.selectedIDs.includes(option.id) ? '✓' : '') : index + 1 }}</span>
+              <span class="user-input-option-copy"><strong>{{ option.label }}</strong><small v-if="option.description">{{ option.description }}</small></span>
+              <NTag v-if="option.recommended" size="small" type="info" :bordered="false">推荐</NTag>
+            </button>
+          </div>
+          <NInput v-if="pendingUserInput.kind === 'text' || pendingUserInput.allowFreeform" v-model:value="pendingUserInput.freeform" type="textarea" :autosize="{ minRows: 1, maxRows: 4 }" :placeholder="pendingUserInput.placeholder" class="user-input-freeform" />
+          <div class="user-input-actions">
+            <NButton v-if="pendingUserInput.allowSkip" secondary :loading="resolvingUserInput" @click="resolvePendingUserInput(true)">跳过本题</NButton>
+            <NButton type="primary" :loading="resolvingUserInput" @click="resolvePendingUserInput()">{{ pendingUserInput.step && pendingUserInput.totalSteps && pendingUserInput.step < pendingUserInput.totalSteps ? '下一题' : '提交' }}</NButton>
+          </div>
         </div>
         <div v-if="instructionConflict" class="chat-conflict-card">
           <div class="conflict-icon">↻</div>

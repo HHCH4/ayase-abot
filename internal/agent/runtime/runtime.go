@@ -25,6 +25,7 @@ import (
 	"Abot/internal/workspace"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool/toolconfirmation"
+	"google.golang.org/adk/v2/workflow"
 	"google.golang.org/genai"
 )
 
@@ -198,6 +199,8 @@ const (
 	EventApprovalRequested             = "approval.requested"
 	EventApprovalResolved              = "approval.resolved"
 	EventApprovalExpired               = "approval.expired"
+	EventUserInputRequested            = "user_input.requested"
+	EventUserInputResolved             = "user_input.resolved"
 	EventContextCompacted              = "context.compacted"
 	EventContextCompactionFailed       = "context.compaction_failed"
 	EventContextManifest               = "context.manifest"
@@ -283,23 +286,81 @@ type ToolCall struct {
 // Approval stores both ADK call IDs. The confirmation call ID is the only ID
 // accepted by the resume protocol; the original call ID is retained for audit.
 type Approval struct {
-	ID                  string         `json:"id"`
-	InvocationID        string         `json:"invocation_id"`
-	ConversationID      string         `json:"conversation_id,omitempty"`
-	ToolCallID          string         `json:"tool_call_id,omitempty"`
-	TaskContractVersion int64          `json:"task_contract_version,omitempty"`
-	ToolName            string         `json:"tool_name"`
-	OperationID         string         `json:"operation_id,omitempty"`
-	OriginalCallID      string         `json:"original_call_id"`
-	ConfirmationCallID  string         `json:"confirmation_call_id"`
-	Args                map[string]any `json:"args,omitempty"`
-	Hint                string         `json:"hint,omitempty"`
-	Status              ApprovalStatus `json:"status"`
-	DecisionReason      string         `json:"decision_reason,omitempty"`
-	ExpiresAt           *time.Time     `json:"expires_at,omitempty"`
-	CreatedAt           time.Time      `json:"created_at"`
-	UpdatedAt           time.Time      `json:"updated_at"`
-	ResolvedAt          *time.Time     `json:"resolved_at,omitempty"`
+	ID                  string           `json:"id"`
+	InvocationID        string           `json:"invocation_id"`
+	ConversationID      string           `json:"conversation_id,omitempty"`
+	ToolCallID          string           `json:"tool_call_id,omitempty"`
+	TaskContractVersion int64            `json:"task_contract_version,omitempty"`
+	ToolName            string           `json:"tool_name"`
+	OperationID         string           `json:"operation_id,omitempty"`
+	OriginalCallID      string           `json:"original_call_id"`
+	ConfirmationCallID  string           `json:"confirmation_call_id"`
+	Args                map[string]any   `json:"args,omitempty"`
+	Hint                string           `json:"hint,omitempty"`
+	Choices             []ApprovalChoice `json:"choices,omitempty"`
+	Status              ApprovalStatus   `json:"status"`
+	DecisionReason      string           `json:"decision_reason,omitempty"`
+	ExpiresAt           *time.Time       `json:"expires_at,omitempty"`
+	CreatedAt           time.Time        `json:"created_at"`
+	UpdatedAt           time.Time        `json:"updated_at"`
+	ResolvedAt          *time.Time       `json:"resolved_at,omitempty"`
+}
+
+// ApprovalChoice 是一次人机交互中可被明确选择的选项。
+// Approved 只描述该选项是否允许当前工具继续执行；ChoiceID 会随恢复请求
+// 一并进入审计数据，避免把按钮选择重新压成自然语言关键词或丢失为单一 bool。
+type ApprovalChoice struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Approved bool   `json:"approved"`
+}
+
+// DefaultApprovalChoices 是当前内置 Workspace 工具的最小交互集合。返回副本
+// 的意图是避免调用方修改全局默认选项，造成不同审批请求之间相互污染。
+func DefaultApprovalChoices() []ApprovalChoice {
+	return []ApprovalChoice{
+		{ID: "approve", Label: "允许一次", Approved: true},
+		{ID: "reject", Label: "拒绝", Approved: false},
+	}
+}
+
+// UserInputKind 描述一次需要用户回答的普通交互问题。它和 Approval
+// 明确分离：Approval 只处理工具授权，UserInput 才负责单选、多选和文本回答。
+type UserInputKind string
+
+const (
+	UserInputText         UserInputKind = "text"
+	UserInputSingleSelect UserInputKind = "single_select"
+	UserInputMultiSelect  UserInputKind = "multi_select"
+)
+
+// UserInputOption 是用户问题中的一个可选答案。ID 会进入恢复 payload，
+// Label/Description 只用于展示，避免下游根据自然语言重新猜测用户选择。
+type UserInputOption struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+	Recommended bool   `json:"recommended,omitempty"`
+}
+
+// UserInputRequest 是 ADK RequestInput 的产品层投影。Payload 采用受限的
+// JSON 形状，既可以由工作流直接提供，也可以由其他内置 Agent 能力生成。
+type UserInputRequest struct {
+	ID            string            `json:"id"`
+	InvocationID  string            `json:"invocation_id"`
+	Title         string            `json:"title,omitempty"`
+	Question      string            `json:"question"`
+	Kind          UserInputKind     `json:"kind"`
+	Options       []UserInputOption `json:"options,omitempty"`
+	AllowMultiple bool              `json:"allow_multiple,omitempty"`
+	AllowFreeform bool              `json:"allow_freeform,omitempty"`
+	AllowSkip     bool              `json:"allow_skip,omitempty"`
+	MinSelections int               `json:"min_selections,omitempty"`
+	MaxSelections int               `json:"max_selections,omitempty"`
+	Step          int               `json:"step,omitempty"`
+	TotalSteps    int               `json:"total_steps,omitempty"`
+	Placeholder   string            `json:"placeholder,omitempty"`
+	Payload       map[string]any    `json:"payload,omitempty"`
 }
 
 // InvocationResumeItem is one bounded response for an ADK long-running tool
@@ -5883,15 +5944,40 @@ func (c *Coordinator) expireApprovalLocked(ctx context.Context, item Approval, n
 // ResolveApproval performs an atomic decision and schedules the original task
 // for ADK resume using the confirmation call ID, never the original tool ID.
 func (c *Coordinator) ResolveApproval(ctx context.Context, approvalID string, approved bool, reason string) (Approval, error) {
+	choiceID := "reject"
+	if approved {
+		choiceID = "approve"
+	}
+	return c.ResolveApprovalChoice(ctx, approvalID, choiceID, reason)
+}
+
+// ResolveApprovalChoice resolves the exact option displayed to the user. The
+// choice is validated against the durable approval record before any state
+// transition, so a client cannot invent a permissive option by sending a
+// boolean or arbitrary text.
+func (c *Coordinator) ResolveApprovalChoice(ctx context.Context, approvalID, choiceID, reason string) (Approval, error) {
 	c.approvalMu.Lock()
 	defer c.approvalMu.Unlock()
-	status := ApprovalRejected
-	if approved {
-		status = ApprovalApproved
-	}
 	approval, err := c.repo.GetApproval(ctx, strings.TrimSpace(approvalID))
 	if err != nil {
 		return Approval{}, err
+	}
+	choices := normalizeApprovalChoices(approval.Choices)
+	choiceID = strings.TrimSpace(choiceID)
+	var choice ApprovalChoice
+	for _, candidate := range choices {
+		if candidate.ID == choiceID {
+			choice = candidate
+			break
+		}
+	}
+	if choice.ID == "" {
+		return Approval{}, fmt.Errorf("%w: 选项 %q 不属于该审批", ErrConflict, choiceID)
+	}
+	approved := choice.Approved
+	status := ApprovalRejected
+	if approved {
+		status = ApprovalApproved
 	}
 	if approval.Status != ApprovalPending {
 		if approval.Status == status {
@@ -5942,10 +6028,13 @@ func (c *Coordinator) ResolveApproval(ctx context.Context, approvalID string, ap
 	// so a crash after the CAS cannot turn an accepted decision into a replay
 	// of the original user message. Custom repositories keep the existing
 	// in-process launch path for compatibility.
-	resumeResponse := map[string]any{"confirmed": approved}
+	resumePayload := map[string]any{"choice_id": choice.ID}
 	if approval.OperationID != "" {
-		resumeResponse["payload"] = map[string]any{"operation_id": approval.OperationID, "invocation_id": invocation.ID, "tool_call_id": approval.OriginalCallID}
+		resumePayload["operation_id"] = approval.OperationID
+		resumePayload["invocation_id"] = invocation.ID
+		resumePayload["tool_call_id"] = approval.OriginalCallID
 	}
+	resumeResponse := map[string]any{"confirmed": approved, "payload": resumePayload}
 	resumeFingerprint, encodedResume, fingerprintErr := invocationResumeFingerprint(InvocationResumeRequest{
 		WaitID: approval.ConfirmationCallID, Name: toolconfirmation.FunctionCallName, Response: resumeResponse,
 	})
@@ -5988,8 +6077,8 @@ func (c *Coordinator) ResolveApproval(ctx context.Context, approvalID string, ap
 		ToolCallID: approval.ToolCallID, ToolCallStatus: toolStatus, Reason: reason,
 		Resume: resumeHandoff, Outbox: resumeOutbox, RejectionDelivery: rejectionDelivery,
 		Events: []AgentEvent{
-			{ID: newID("event"), InvocationID: invocation.ID, Type: EventApprovalResolved, Timestamp: time.Now().UTC(), Data: map[string]any{"approval_id": approval.ID, "confirmed": approved, "reason": reason}},
-			{ID: newID("event"), InvocationID: invocation.ID, Type: EventInvocationResumed, Timestamp: time.Now().UTC(), Data: map[string]any{"approval_id": approval.ID, "confirmed": approved, "request_digest": resumeFingerprint}},
+			{ID: newID("event"), InvocationID: invocation.ID, Type: EventApprovalResolved, Timestamp: time.Now().UTC(), Data: map[string]any{"approval_id": approval.ID, "confirmed": approved, "choice_id": choice.ID, "reason": reason}},
+			{ID: newID("event"), InvocationID: invocation.ID, Type: EventInvocationResumed, Timestamp: time.Now().UTC(), Data: map[string]any{"approval_id": approval.ID, "confirmed": approved, "choice_id": choice.ID, "request_digest": resumeFingerprint}},
 		},
 	}
 	atomicCommitted := false
@@ -6265,8 +6354,44 @@ func resumeEventData(items []InvocationResumeItem, fingerprint string, boundaryI
 	return data
 }
 
+// resumeUserInputEventData 保留用户回答的边界类型和请求 ID，避免把普通
+// 问题的回答误记成工具恢复或审批决定。
+func resumeUserInputEventData(items []InvocationResumeItem, fingerprint string, boundaryIDs ...string) map[string]any {
+	data := map[string]any{"reason": "user", "wait_id": items[0].WaitID, "name": items[0].Name, "request_digest": fingerprint}
+	if len(boundaryIDs) > 0 && strings.TrimSpace(boundaryIDs[0]) != "" {
+		data["boundary_id"] = strings.TrimSpace(boundaryIDs[0])
+	}
+	if len(items) > 1 {
+		waitIDs := make([]string, 0, len(items))
+		for _, item := range items {
+			waitIDs = append(waitIDs, item.WaitID)
+		}
+		data["wait_ids"] = waitIDs
+	}
+	return data
+}
+
 func resumeEventDataWithStatusProof(items []InvocationResumeItem, fingerprint string, request InvocationResumeRequest, boundaryIDs ...string) map[string]any {
 	data := resumeEventData(items, fingerprint, boundaryIDs...)
+	if len(request.statusQueryIDs) == 0 && len(request.statusResultDigest) == 0 {
+		return data
+	}
+	data["resume_source"] = "external_tool_status"
+	if len(request.statusQueryIDs) == 1 {
+		data["status_query_id"] = request.statusQueryIDs[0]
+	} else if len(request.statusQueryIDs) > 1 {
+		data["status_query_ids"] = append([]string(nil), request.statusQueryIDs...)
+	}
+	if len(request.statusResultDigest) == 1 {
+		data["result_digest"] = request.statusResultDigest[0]
+	} else if len(request.statusResultDigest) > 1 {
+		data["result_digests"] = append([]string(nil), request.statusResultDigest...)
+	}
+	return data
+}
+
+func resumeUserInputEventDataWithStatusProof(items []InvocationResumeItem, fingerprint string, request InvocationResumeRequest, boundaryIDs ...string) map[string]any {
+	data := resumeUserInputEventData(items, fingerprint, boundaryIDs...)
 	if len(request.statusQueryIDs) == 0 && len(request.statusResultDigest) == 0 {
 		return data
 	}
@@ -6421,7 +6546,7 @@ func (c *Coordinator) ResumeInvocation(ctx context.Context, invocationID string,
 	if err != nil {
 		return Invocation{}, err
 	}
-	if invocation.Status != InvocationWaitingTool {
+	if invocation.Status != InvocationWaitingTool && invocation.Status != InvocationWaitingUser {
 		matched, matchErr := c.hasResumeFingerprint(ctx, invocationID, fingerprint)
 		if matchErr != nil {
 			return Invocation{}, matchErr
@@ -6438,12 +6563,21 @@ func (c *Coordinator) ResumeInvocation(ctx context.Context, invocationID string,
 		return Invocation{}, err
 	}
 
-	toolNames, resolvedBoundaryID, err := c.resolveWorkflowToolBoundary(ctx, invocation, request.BoundaryID)
+	waitingStatus := invocation.Status
+	boundaryKind := WorkflowBoundaryTool
+	var toolNames map[string]string
+	var resolvedBoundaryID string
+	if waitingStatus == InvocationWaitingUser {
+		boundaryKind = WorkflowBoundaryUser
+		toolNames, resolvedBoundaryID, err = c.resolveWorkflowUserBoundary(ctx, invocation, request.BoundaryID)
+	} else {
+		toolNames, resolvedBoundaryID, err = c.resolveWorkflowToolBoundary(ctx, invocation, request.BoundaryID)
+	}
 	if err != nil {
 		return Invocation{}, err
 	}
 	if len(resumeItems) != len(toolNames) {
-		return Invocation{}, fmt.Errorf("%w: 当前等待边界有 %d 个待恢复工具，必须在同一请求中提交全部 responses", ErrResumeMismatch, len(toolNames))
+		return Invocation{}, fmt.Errorf("%w: 当前等待边界有 %d 个待恢复项，必须在同一请求中提交全部 responses", ErrResumeMismatch, len(toolNames))
 	}
 	resolvedItems := make([]InvocationResumeItem, 0, len(resumeItems))
 	seenWaitIDs := make(map[string]struct{}, len(resumeItems))
@@ -6494,11 +6628,16 @@ func (c *Coordinator) ResumeInvocation(ctx context.Context, invocationID string,
 	atomicCommitted := false
 	if atomicRepo, ok := c.repo.(InvocationResumeCommitRepository); ok {
 		committed, storedEvent, commitErr := atomicRepo.CommitInvocationResume(ctx, InvocationResumeCommit{
-			InvocationID: invocationID, FromStatus: InvocationWaitingTool, ToStatus: InvocationQueued,
+			InvocationID: invocationID, FromStatus: waitingStatus, ToStatus: InvocationQueued,
 			Resume: resumeHandoff, Outbox: resumeOutbox,
 			Event: AgentEvent{
 				ID: newID("event"), InvocationID: invocationID, Type: EventInvocationResumed, Timestamp: time.Now().UTC(),
-				Data: resumeEventDataWithStatusProof(resolvedItems, fingerprint, request, resolvedBoundaryID),
+				Data: func() map[string]any {
+					if boundaryKind == WorkflowBoundaryUser {
+						return resumeUserInputEventDataWithStatusProof(resolvedItems, fingerprint, request, resolvedBoundaryID)
+					}
+					return resumeEventDataWithStatusProof(resolvedItems, fingerprint, request, resolvedBoundaryID)
+				}(),
 			},
 		})
 		if commitErr != nil {
@@ -6509,7 +6648,11 @@ func (c *Coordinator) ResumeInvocation(ctx context.Context, invocationID string,
 			if getErr != nil {
 				return Invocation{}, getErr
 			}
-			if matched, matchErr := c.hasResumeFingerprint(ctx, invocationID, fingerprint); matchErr != nil {
+			matched, matchErr := c.hasResumeFingerprint(ctx, invocationID, fingerprint)
+			if boundaryKind == WorkflowBoundaryUser {
+				matched, matchErr = c.hasResumeFingerprintForReason(ctx, invocationID, fingerprint, "user")
+			}
+			if matchErr != nil {
 				return Invocation{}, matchErr
 			} else if matched {
 				return current, nil
@@ -6519,7 +6662,7 @@ func (c *Coordinator) ResumeInvocation(ctx context.Context, invocationID string,
 			} else if matched {
 				return current, nil
 			}
-			if current.Status == InvocationWaitingTool {
+			if current.Status == InvocationWaitingTool || current.Status == InvocationWaitingUser {
 				return Invocation{}, fmt.Errorf("%w: invocation 已有不同的恢复请求", ErrResumeMismatch)
 			}
 			if current.Status.Terminal() {
@@ -6541,7 +6684,7 @@ func (c *Coordinator) ResumeInvocation(ctx context.Context, invocationID string,
 			return Invocation{}, err
 		}
 
-		transitioned, err := c.repo.TransitionInvocation(ctx, invocationID, InvocationWaitingTool, InvocationQueued, "")
+		transitioned, err := c.repo.TransitionInvocation(ctx, invocationID, waitingStatus, InvocationQueued, "")
 		if err != nil {
 			return Invocation{}, err
 		}
@@ -6550,7 +6693,11 @@ func (c *Coordinator) ResumeInvocation(ctx context.Context, invocationID string,
 			if getErr != nil {
 				return Invocation{}, getErr
 			}
-			if matched, matchErr := c.hasResumeFingerprint(ctx, invocationID, fingerprint); matchErr != nil {
+			matched, matchErr := c.hasResumeFingerprint(ctx, invocationID, fingerprint)
+			if boundaryKind == WorkflowBoundaryUser {
+				matched, matchErr = c.hasResumeFingerprintForReason(ctx, invocationID, fingerprint, "user")
+			}
+			if matchErr != nil {
 				return Invocation{}, matchErr
 			} else if matched {
 				return current, nil
@@ -6588,7 +6735,12 @@ func (c *Coordinator) ResumeInvocation(ctx context.Context, invocationID string,
 		}
 		if _, err := c.appendAndPublish(ctx, AgentEvent{
 			ID: newID("event"), InvocationID: invocationID, Type: EventInvocationResumed, Timestamp: time.Now().UTC(),
-			Data: resumeEventDataWithStatusProof(resolvedItems, fingerprint, request, resolvedBoundaryID),
+			Data: func() map[string]any {
+				if boundaryKind == WorkflowBoundaryUser {
+					return resumeUserInputEventDataWithStatusProof(resolvedItems, fingerprint, request, resolvedBoundaryID)
+				}
+				return resumeEventDataWithStatusProof(resolvedItems, fingerprint, request, resolvedBoundaryID)
+			}(),
 		}); err != nil {
 			message := "恢复事件持久化失败: " + err.Error()
 			_, _ = c.repo.TransitionInvocation(context.WithoutCancel(ctx), invocationID, InvocationQueued, InvocationFailed, message)
@@ -6664,6 +6816,10 @@ func invocationResumeFingerprint(request InvocationResumeRequest) (string, []byt
 }
 
 func (c *Coordinator) hasResumeFingerprint(ctx context.Context, invocationID, fingerprint string) (bool, error) {
+	return c.hasResumeFingerprintForReason(ctx, invocationID, fingerprint, "tool")
+}
+
+func (c *Coordinator) hasResumeFingerprintForReason(ctx context.Context, invocationID, fingerprint, reason string) (bool, error) {
 	events, err := c.listAllInvocationEvents(ctx, invocationID, maxRuntimeEventReplay)
 	if err != nil {
 		return false, err
@@ -6673,7 +6829,7 @@ func (c *Coordinator) hasResumeFingerprint(ctx context.Context, invocationID, fi
 		if event.Type != EventInvocationResumed || event.Data == nil {
 			continue
 		}
-		if reason, _ := event.Data["reason"].(string); reason != "tool" {
+		if eventReason, _ := event.Data["reason"].(string); strings.ToLower(strings.TrimSpace(eventReason)) != strings.ToLower(strings.TrimSpace(reason)) {
 			continue
 		}
 		if digest, _ := event.Data["request_digest"].(string); digest == fingerprint {
@@ -6692,6 +6848,64 @@ func (c *Coordinator) waitingToolBoundary(ctx context.Context, invocationID stri
 		return nil, err
 	}
 	return waitingToolBoundaryFromEvents(events)
+}
+
+// waitingUserBoundary 从同一条 durable event stream 恢复当前用户问题，进程
+// 重启后不依赖内存中的 UI 卡片。请求 ID 来自 ADK InterruptID，不能由调用方
+// 在恢复请求中临时伪造。
+func (c *Coordinator) waitingUserBoundary(ctx context.Context, invocationID string) (map[string]string, error) {
+	events, err := c.listAllInvocationEvents(ctx, invocationID, maxRuntimeEventReplay)
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]string)
+	pending := make(map[string]struct{})
+	for _, event := range events {
+		if event.Data == nil {
+			continue
+		}
+		switch event.Type {
+		case EventUserInputRequested:
+			requestID := eventString(event.Data, "request_id", "wait_id", "id")
+			if requestID != "" {
+				names[requestID] = workflow.WorkflowInputFunctionCallName
+			}
+		case EventInvocationWaiting:
+			if strings.ToLower(strings.TrimSpace(eventString(event.Data, "reason"))) != "user" {
+				continue
+			}
+			pending = make(map[string]struct{})
+			for _, id := range resumeStringList(event.Data["wait_ids"]) {
+				pending[id] = struct{}{}
+			}
+			if id := eventString(event.Data, "wait_id", "request_id"); id != "" {
+				pending[id] = struct{}{}
+			}
+		case EventUserInputResolved, EventInvocationResumed:
+			reason := strings.ToLower(strings.TrimSpace(eventString(event.Data, "reason")))
+			if event.Type == EventInvocationResumed && reason != "user" {
+				continue
+			}
+			if id := eventString(event.Data, "wait_id", "request_id"); id != "" {
+				delete(pending, id)
+			}
+			for _, id := range resumeStringList(event.Data["wait_ids"]) {
+				delete(pending, id)
+			}
+		}
+	}
+	result := make(map[string]string, len(pending))
+	for id := range pending {
+		name := names[id]
+		if name == "" {
+			name = workflow.WorkflowInputFunctionCallName
+		}
+		result[id] = name
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("%w: 当前没有待回答的问题", ErrResumeMismatch)
+	}
+	return result, nil
 }
 
 func waitingToolBoundaryFromEvents(events []AgentEvent) (map[string]string, error) {
@@ -6797,6 +7011,39 @@ func (c *Coordinator) resolveWorkflowToolBoundary(ctx context.Context, invocatio
 			continue
 		}
 		if workflowWaitSetEqual(workflowBoundaryWaitSet(boundary), mapKeys(names)) {
+			return names, boundary.ID, nil
+		}
+	}
+	return names, "", nil
+}
+
+// resolveWorkflowUserBoundary 将用户问题绑定到当前 workflow user boundary，
+// 与工具恢复使用同样的 boundary CAS 约束，防止回答旧问题或其他分支。
+func (c *Coordinator) resolveWorkflowUserBoundary(ctx context.Context, invocation Invocation, boundaryID string) (map[string]string, string, error) {
+	names, err := c.waitingUserBoundary(ctx, invocation.ID)
+	if err != nil {
+		return nil, "", err
+	}
+	events, err := c.listAllInvocationEvents(ctx, invocation.ID, maxRuntimeEventReplay)
+	if err != nil {
+		return nil, "", err
+	}
+	checkpoint := deriveWorkflowCheckpoint(invocation, nil, events)
+	if boundaryID != "" {
+		for _, boundary := range checkpoint.Boundaries {
+			if boundary.ID != boundaryID {
+				continue
+			}
+			if boundary.Kind != WorkflowBoundaryUser || boundary.Status != WorkflowBoundaryWaiting || !workflowWaitSetEqual(workflowBoundaryWaitSet(boundary), mapKeys(names)) {
+				return nil, "", fmt.Errorf("%w: boundary_id=%s 不属于当前用户问题边界", ErrResumeMismatch, boundaryID)
+			}
+			return names, boundary.ID, nil
+		}
+		return nil, "", fmt.Errorf("%w: boundary_id=%s 不存在", ErrResumeMismatch, boundaryID)
+	}
+	for index := len(checkpoint.Boundaries) - 1; index >= 0; index-- {
+		boundary := checkpoint.Boundaries[index]
+		if boundary.Kind == WorkflowBoundaryUser && boundary.Status == WorkflowBoundaryWaiting && workflowWaitSetEqual(workflowBoundaryWaitSet(boundary), mapKeys(names)) {
 			return names, boundary.ID, nil
 		}
 	}
@@ -6971,6 +7218,7 @@ func (c *Coordinator) run(ctx context.Context, id string, request agent.ChatRequ
 
 	waitingApproval := false
 	waitingTool := false
+	waitingUser := false
 	capabilityEvidenceSeen := make(map[string]struct{})
 	kernelCtx := workspace.WithInvocationID(ctx, id)
 	kernelCtx = workspace.WithUserID(kernelCtx, request.UserID)
@@ -7050,7 +7298,11 @@ func (c *Coordinator) run(ctx context.Context, id string, request agent.ChatRequ
 					return
 				}
 				if item.Type == EventInvocationWaiting {
-					waitingTool = true
+					if eventString(item.Data, "reason") == "user" {
+						waitingUser = true
+					} else {
+						waitingTool = true
+					}
 				}
 				if _, err := c.appendAndPublish(ctx, *item); err != nil {
 					c.finish(ctx, id, InvocationFailed, err.Error())
@@ -7072,6 +7324,17 @@ func (c *Coordinator) run(ctx context.Context, id string, request agent.ChatRequ
 	}
 	if waitingTool {
 		if ok, err := c.repo.TransitionInvocation(ctx, id, InvocationRunning, InvocationWaitingTool, ""); err != nil || !ok {
+			if err != nil {
+				c.finish(ctx, id, InvocationFailed, err.Error())
+			}
+		} else {
+			c.refreshRuntimeSnapshot(ctx, id)
+		}
+		releaseLease()
+		return
+	}
+	if waitingUser {
+		if ok, err := c.repo.TransitionInvocation(ctx, id, InvocationRunning, InvocationWaitingUser, ""); err != nil || !ok {
 			if err != nil {
 				c.finish(ctx, id, InvocationFailed, err.Error())
 			}
@@ -7115,7 +7378,7 @@ func (c *Coordinator) persistApprovalBoundary(ctx context.Context, id string, ma
 		approval := Approval{
 			ID: newID("approval"), InvocationID: id, OperationID: data.OperationID, ToolName: data.ToolName,
 			OriginalCallID: data.OriginalCallID, ConfirmationCallID: data.ConfirmationCallID,
-			Args: data.Args, Hint: data.Hint, Status: ApprovalPending, ExpiresAt: expiresAt,
+			Args: data.Args, Hint: data.Hint, Choices: normalizeApprovalChoices(data.Choices), Status: ApprovalPending, ExpiresAt: expiresAt,
 			CreatedAt: createdAt, UpdatedAt: createdAt,
 		}
 		if contractRepo, ok := c.repo.(TaskContractRepository); ok {
@@ -7212,8 +7475,11 @@ func (c *Coordinator) persistApprovalBoundary(ctx context.Context, id string, ma
 					if toolCallID := toolCallIDs[callID]; toolCallID != "" {
 						data["tool_call_id"] = toolCallID
 					}
-					if approval, approvalErr := c.repo.GetApproval(ctx, approvalID); approvalErr == nil && approval.ExpiresAt != nil {
-						data["expires_at"] = approval.ExpiresAt
+					if approval, approvalErr := c.repo.GetApproval(ctx, approvalID); approvalErr == nil {
+						if approval.ExpiresAt != nil {
+							data["expires_at"] = approval.ExpiresAt
+						}
+						data["choices"] = approval.Choices
 					}
 					item.Data = data
 				}
@@ -7832,6 +8098,209 @@ type approvalData struct {
 	ConfirmationCallID string
 	Args               map[string]any
 	Hint               string
+	Choices            []ApprovalChoice
+}
+
+var approvalChoiceIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
+
+// normalizeApprovalChoices 固定审批为“允许一次/拒绝”两个互斥选项。
+// 普通业务选项必须走 UserInputRequest，否则用户可能把多选答案误当成
+// 工具授权，造成审批语义和实际副作用不一致。
+func normalizeApprovalChoices(_ []ApprovalChoice) []ApprovalChoice {
+	return DefaultApprovalChoices()
+}
+
+// approvalChoicesFromValue 从确认 payload 读取结构化选项。缺少 approved 字段
+// 的外部数据会被忽略，因为 Runtime 不能根据文案猜测该选项是否允许副作用。
+func approvalChoicesFromValue(value any) []ApprovalChoice {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var wire []struct {
+		ID       string `json:"id"`
+		Label    string `json:"label"`
+		Approved *bool  `json:"approved"`
+	}
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		return nil
+	}
+	items := make([]ApprovalChoice, 0, len(wire))
+	for _, item := range wire {
+		if item.Approved == nil {
+			continue
+		}
+		items = append(items, ApprovalChoice{ID: item.ID, Label: item.Label, Approved: *item.Approved})
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	return normalizeApprovalChoices(items)
+}
+
+// approvalChoicesFromConfirmation 允许工具在 confirmation payload 中声明多选
+// 交互，同时为旧工具补上默认的允许/拒绝选项。
+func approvalChoicesFromConfirmation(call *genai.FunctionCall) []ApprovalChoice {
+	// 工具授权固定为二元审批。多选、单选和自由文本属于 RequestInput
+	// 的普通用户问题，不能把任意 payload 中的 choices 混进授权卡片，
+	// 否则用户会误以为选择某个业务选项就等同于批准副作用。
+	return DefaultApprovalChoices()
+}
+
+// userInputRequestFromADK 将 ADK 的 RequestInput 转成稳定的产品协议。
+// Payload 里的字段只负责描述交互，不会被当作自然语言指令执行；选项 ID
+// 和回答值会在恢复时再次按当前请求校验。
+func userInputRequestFromADK(invocationID string, input *session.RequestInput) UserInputRequest {
+	request := UserInputRequest{
+		ID:            strings.TrimSpace(input.InterruptID),
+		InvocationID:  strings.TrimSpace(invocationID),
+		Question:      strings.TrimSpace(input.Message),
+		Kind:          UserInputText,
+		AllowFreeform: true,
+	}
+	payload := make(map[string]any)
+	if input.Payload != nil {
+		if encoded, err := json.Marshal(input.Payload); err == nil {
+			_ = json.Unmarshal(encoded, &payload)
+		}
+	}
+	request.Payload = payload
+	stringValue := func(keys ...string) string {
+		for _, key := range keys {
+			if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		}
+		return ""
+	}
+	boolValue := func(keys ...string) (bool, bool) {
+		for _, key := range keys {
+			if value, ok := payload[key].(bool); ok {
+				return value, true
+			}
+		}
+		return false, false
+	}
+	intValue := func(keys ...string) int {
+		for _, key := range keys {
+			switch value := payload[key].(type) {
+			case int:
+				return value
+			case float64:
+				return int(value)
+			}
+		}
+		return 0
+	}
+	if value := stringValue("title", "step_title", "section"); value != "" {
+		request.Title = value
+	}
+	if value := stringValue("question", "prompt", "message"); value != "" {
+		request.Question = value
+	}
+	if value := stringValue("placeholder"); value != "" {
+		request.Placeholder = value
+	}
+	kind := strings.ToLower(strings.TrimSpace(stringValue("kind", "type", "selection_type")))
+	switch kind {
+	case "multi", "multiple", "multiselect", "multi_select", "checkbox", "checkboxes":
+		request.Kind = UserInputMultiSelect
+	case "single", "single_select", "radio", "choice", "select":
+		request.Kind = UserInputSingleSelect
+	case "text", "input", "freeform":
+		request.Kind = UserInputText
+	}
+	if rawOptions, exists := payload["options"]; exists {
+		encoded, err := json.Marshal(rawOptions)
+		if err == nil {
+			var wire []struct {
+				ID          string `json:"id"`
+				Label       string `json:"label"`
+				Description string `json:"description"`
+				Recommended bool   `json:"recommended"`
+			}
+			if json.Unmarshal(encoded, &wire) == nil {
+				for index, item := range wire {
+					label := strings.TrimSpace(item.Label)
+					if label == "" || len(request.Options) >= 16 {
+						continue
+					}
+					optionID := strings.TrimSpace(item.ID)
+					if !approvalChoiceIDPattern.MatchString(optionID) {
+						optionID = fmt.Sprintf("option-%d", index+1)
+					}
+					duplicate := false
+					for _, existing := range request.Options {
+						if existing.ID == optionID {
+							duplicate = true
+							break
+						}
+					}
+					if duplicate {
+						continue
+					}
+					request.Options = append(request.Options, UserInputOption{ID: optionID, Label: label, Description: strings.TrimSpace(item.Description), Recommended: item.Recommended})
+				}
+			}
+		}
+	}
+	if len(request.Options) > 0 && request.Kind == UserInputText {
+		request.Kind = UserInputSingleSelect
+	}
+	if request.Kind == UserInputMultiSelect {
+		request.AllowMultiple = true
+	}
+	if value, exists := boolValue("allow_multiple", "multiple"); exists {
+		request.AllowMultiple = value
+		if value {
+			request.Kind = UserInputMultiSelect
+		}
+	}
+	if value, exists := boolValue("allow_freeform", "allow_other", "custom_answer"); exists {
+		request.AllowFreeform = value
+	}
+	if value, exists := boolValue("allow_skip", "skippable"); exists {
+		request.AllowSkip = value
+	}
+	request.MinSelections = intValue("min_selections", "min_choices")
+	request.MaxSelections = intValue("max_selections", "max_choices")
+	if request.MinSelections < 0 {
+		request.MinSelections = 0
+	}
+	if request.MaxSelections < 0 {
+		request.MaxSelections = 0
+	}
+	if request.MaxSelections > 16 {
+		request.MaxSelections = 16
+	}
+	request.Step = intValue("step", "step_number")
+	request.TotalSteps = intValue("total_steps", "steps")
+	if request.Step < 0 {
+		request.Step = 0
+	}
+	if request.TotalSteps < 0 {
+		request.TotalSteps = 0
+	}
+	if request.Question == "" {
+		request.Question = "请提供输入"
+	}
+	return request
+}
+
+// userInputRequestData 生成 SSE、Bot 和审计事件共用的 JSON 数据。
+func userInputRequestData(request UserInputRequest) map[string]any {
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return map[string]any{"request_id": request.ID, "question": request.Question, "kind": request.Kind}
+	}
+	data := make(map[string]any)
+	if err := json.Unmarshal(encoded, &data); err != nil {
+		return map[string]any{"request_id": request.ID, "question": request.Question, "kind": request.Kind}
+	}
+	data["request_id"] = request.ID
+	data["wait_id"] = request.ID
+	data["name"] = workflow.WorkflowInputFunctionCallName
+	return data
 }
 
 // MapSessionEvent translates one ADK event into one or more stable product
@@ -7864,6 +8333,17 @@ func MapSessionEvent(invocationID string, event *session.Event) ([]AgentEvent, [
 			merged[key] = value
 		}
 		result = append(result, AgentEvent{ID: newID("event"), InvocationID: invocationID, Type: eventType, Timestamp: event.Timestamp, Data: merged})
+	}
+	if event.RequestedInput != nil {
+		// RequestInput 是 ADK 工作流的正式暂停协议；它不能落入普通工具调用
+		// 分支，否则前端会把“请选择”误显示成外部工具等待。
+		request := userInputRequestFromADK(invocationID, event.RequestedInput)
+		add(EventUserInputRequested, userInputRequestData(request))
+		add(EventInvocationWaiting, map[string]any{
+			"reason": "user", "wait_id": request.ID, "name": workflow.WorkflowInputFunctionCallName,
+			"request_id": request.ID, "question": request.Question, "kind": request.Kind,
+		})
+		return result, approvals
 	}
 	if event.Actions.Compaction != nil {
 		add(EventContextCompacted, map[string]any{"compaction": event.Actions.Compaction})
@@ -7950,24 +8430,38 @@ func MapSessionEvent(invocationID string, event *session.Event) ([]AgentEvent, [
 					}
 				}
 				operationID := confirmationOperationID(call)
+				choices := approvalChoicesFromConfirmation(call)
 				approvalEventData := map[string]any{
 					"approval_call_id": call.ID, "original_call_id": original.ID,
-					"tool_name": original.Name, "args": sanitizeRuntimeValue(original.Args), "hint": hint,
+					"tool_name": original.Name, "args": sanitizeRuntimeValue(original.Args), "hint": hint, "choices": choices,
 				}
 				if operationID != "" {
 					approvalEventData["operation_id"] = operationID
 				}
 				add(EventApprovalRequested, approvalEventData)
-				approvals = append(approvals, approvalData{ToolName: original.Name, OperationID: operationID, OriginalCallID: original.ID, ConfirmationCallID: call.ID, Args: sanitizeRuntimeMap(original.Args), Hint: hint})
+				approvals = append(approvals, approvalData{ToolName: original.Name, OperationID: operationID, OriginalCallID: original.ID, ConfirmationCallID: call.ID, Args: sanitizeRuntimeMap(original.Args), Hint: hint, Choices: choices})
 			} else {
 				add(EventToolRequested, map[string]any{"call_id": call.ID, "name": call.Name, "args": sanitizeRuntimeValue(call.Args)})
 				add(EventToolStarted, map[string]any{"call_id": call.ID, "name": call.Name})
 			}
 		}
 		if response := part.FunctionResponse; response != nil {
-			if response.Name == toolconfirmation.FunctionCallName {
+			if response.Name == workflow.WorkflowInputFunctionCallName {
+				// 普通问题的回答是 workflow 的正式恢复结果，不是工具完成
+				// 事件；单独记录 request_id 便于 UI 恢复未完成的问题卡片。
+				add(EventUserInputResolved, map[string]any{
+					"request_id": response.ID, "wait_id": response.ID,
+					"response": sanitizeRuntimeValue(response.Response),
+				})
+			} else if response.Name == toolconfirmation.FunctionCallName {
 				confirmed, _ := response.Response["confirmed"].(bool)
-				add(EventApprovalResolved, map[string]any{"confirmation_call_id": response.ID, "confirmed": confirmed})
+				resolvedData := map[string]any{"confirmation_call_id": response.ID, "confirmed": confirmed}
+				if payload, ok := response.Response["payload"].(map[string]any); ok {
+					if choiceID, ok := payload["choice_id"].(string); ok && strings.TrimSpace(choiceID) != "" {
+						resolvedData["choice_id"] = strings.TrimSpace(choiceID)
+					}
+				}
+				add(EventApprovalResolved, resolvedData)
 			} else {
 				if response.Response != nil {
 					if toolError, exists := response.Response["error"]; exists && toolError != nil {

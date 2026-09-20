@@ -307,8 +307,6 @@ func builtinCommandDescriptors() []CommandDescriptor {
 		{ID: "admin add", Name: "admin add", Category: CategoryAdmin, Description: "添加群管理员", DefaultPermission: PermissionGlobalAdmin, Scope: ScopeChat, DefaultEnabled: true},
 		{ID: "admin remove", Name: "admin remove", Category: CategoryAdmin, Description: "移除群管理员", DefaultPermission: PermissionGlobalAdmin, Scope: ScopeChat, DefaultEnabled: true},
 		{ID: "admin leave", Name: "admin leave", Category: CategoryAdmin, Description: "退出本群管理员", DefaultPermission: PermissionGroupAdmin, Scope: ScopeChat, DefaultEnabled: true},
-		{ID: "approve", Name: "approve", Category: CategoryTask, Description: "兼容入口：批准待审批操作（正常流程可直接回复批准）", DefaultPermission: PermissionGroupAdmin, Scope: ScopeChat, DefaultEnabled: true},
-		{ID: "reject", Name: "reject", Category: CategoryTask, Description: "兼容入口：拒绝待审批操作（正常流程可直接回复拒绝）", DefaultPermission: PermissionGroupAdmin, Scope: ScopeChat, DefaultEnabled: true},
 	}
 }
 

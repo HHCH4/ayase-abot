@@ -17,6 +17,7 @@ import (
 	"unicode/utf16"
 
 	"Abot/internal/agent"
+	agentruntime "Abot/internal/agent/runtime"
 )
 
 const (
@@ -216,20 +217,24 @@ func (p *telegramPlatform) SendApproval(ctx context.Context, message Message, pr
 	if hint == "" {
 		hint = "需要确认后才能继续。"
 	}
+	choices := prompt.Choices
+	if len(choices) == 0 {
+		choices = agentruntime.DefaultApprovalChoices()
+	}
 	callbackPrefix := "abot:approval:" + strings.TrimSpace(prompt.ApprovalID) + ":"
-	text := fmt.Sprintf("需要审批：%s\n%s", toolName, hint)
+	text := fmt.Sprintf("需要确认：%s\n%s", toolName, hint)
 	if prompt.ExpiresAt != nil {
 		text += "\n有效期至：" + prompt.ExpiresAt.UTC().Format(time.RFC3339)
 	}
-	// Telegram 提供按钮，同时允许用户直接发送确认词，保证与 OneBot 文本交互一致。
-	text += "\n也可以直接回复“批准”或“拒绝”。"
+	text += "\n请选择一个选项："
+	keyboard := make([]map[string]string, 0, len(choices))
+	for _, choice := range choices {
+		keyboard = append(keyboard, map[string]string{"text": choice.Label, "callback_data": callbackPrefix + choice.ID})
+	}
 	payload := map[string]any{
-		"chat_id": chatID,
-		"text":    text,
-		"reply_markup": map[string]any{"inline_keyboard": [][]map[string]string{{
-			{"text": "批准", "callback_data": callbackPrefix + "approve"},
-			{"text": "拒绝", "callback_data": callbackPrefix + "reject"},
-		}}},
+		"chat_id":      chatID,
+		"text":         text,
+		"reply_markup": map[string]any{"inline_keyboard": [][]map[string]string{keyboard}},
 	}
 	var result telegramEnvelope[telegramMessage]
 	if err := p.call(ctx, "sendMessage", payload, &result); err != nil {
@@ -239,6 +244,12 @@ func (p *telegramPlatform) SendApproval(ctx context.Context, message Message, pr
 		return fmt.Errorf("Telegram 发送审批消息失败: %s", result.Description)
 	}
 	return nil
+}
+
+// SendUserInput 展示普通问题的结构化选项。Telegram 审批使用一次性回调按钮，
+// 普通问题则保留序号文本协议，因而可以自然表达“1,3”这类多选答案。
+func (p *telegramPlatform) SendUserInput(ctx context.Context, message Message, input agentruntime.UserInputRequest) error {
+	return p.Send(ctx, message, userInputOptionsText(input))
 }
 
 // Close 通过取消 Run 的 context 结束请求；这里无需持有额外长连接。
@@ -339,14 +350,11 @@ func (p *telegramPlatform) messageFromCallback(callback *telegramCallbackQuery) 
 	if len(parts) != 4 || parts[0] != "abot" || parts[1] != "approval" || strings.TrimSpace(parts[2]) == "" {
 		return Message{}, errors.New("Telegram 审批回调格式无效")
 	}
-	decision := false
-	switch parts[3] {
-	case "approve":
-		decision = true
-	case "reject":
-	default:
+	choiceID := strings.TrimSpace(parts[3])
+	if choiceID == "" {
 		return Message{}, errors.New("Telegram 审批决定无效")
 	}
+	decision := choiceID != "reject"
 	userID := strconv.FormatInt(callback.Message.Chat.ID, 10)
 	if callback.From != nil && callback.From.ID != 0 {
 		userID = strconv.FormatInt(callback.From.ID, 10)
@@ -354,7 +362,7 @@ func (p *telegramPlatform) messageFromCallback(callback *telegramCallbackQuery) 
 	return Message{
 		ID: "callback:" + callback.ID, Platform: TypeTelegram, UserID: userID,
 		ChatID: strconv.FormatInt(callback.Message.Chat.ID, 10), ChatType: callback.Message.Chat.Type,
-		Mentioned: true, Control: &MessageControl{Kind: "approval", ApprovalID: parts[2], Decision: decision, CallbackID: callback.ID},
+		Mentioned: true, Control: &MessageControl{Kind: "approval", ApprovalID: parts[2], ChoiceID: choiceID, Decision: decision, CallbackID: callback.ID},
 	}, nil
 }
 

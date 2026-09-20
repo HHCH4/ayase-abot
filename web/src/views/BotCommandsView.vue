@@ -137,7 +137,7 @@ onMounted(async () => {
           <div>
             <p class="eyebrow">COMMAND CENTER</p>
             <h2>指令</h2>
-            <p>聊天指令的权限与启停按机器人分别配置；每次改动都会写入审计。审批会在当前会话直接询问，通常回复“批准/拒绝”即可；/approve 与 /reject 仅作为兼容入口。</p>
+            <p>聊天指令的权限与启停按机器人分别配置；每次改动都会写入审计。审批不属于聊天指令，会在当前会话展示结构化选项并通过按钮或选项序号处理。</p>
           </div>
           <NSpace align="center">
             <NSelect v-model:value="selectedID" :options="botOptions" placeholder="选择机器人" style="width: 220px" />

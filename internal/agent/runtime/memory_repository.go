@@ -984,7 +984,7 @@ func (r *MemoryRepository) CommitInvocationResume(_ context.Context, commit Invo
 	if invocationID == "" || strings.TrimSpace(commit.Resume.InvocationID) != invocationID || strings.TrimSpace(commit.Outbox.InvocationID) != invocationID {
 		return Invocation{}, AgentEvent{}, ErrInvalidResume
 	}
-	if commit.FromStatus != InvocationWaitingTool || commit.ToStatus != InvocationQueued || !validInvocationTransition(commit.FromStatus, commit.ToStatus) {
+	if (commit.FromStatus != InvocationWaitingTool && commit.FromStatus != InvocationWaitingUser) || commit.ToStatus != InvocationQueued || !validInvocationTransition(commit.FromStatus, commit.ToStatus) {
 		return Invocation{}, AgentEvent{}, ErrConflict
 	}
 	if strings.TrimSpace(commit.Resume.WaitID) == "" || strings.TrimSpace(commit.Resume.Name) == "" || strings.TrimSpace(commit.Resume.RequestDigest) == "" || len(commit.Resume.ResponseJSON) > maxInvocationResumeResponseBytes {

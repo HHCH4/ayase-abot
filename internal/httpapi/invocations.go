@@ -819,9 +819,9 @@ func (s *Server) listApprovals(writer http.ResponseWriter, request *http.Request
 }
 
 type approvalResolvePayload struct {
-	// Approved is kept for the first API shape. Decision is the canonical
-	// wire value used by the runtime design and lets clients express an
-	// explicit reject without relying on a missing boolean field.
+	// ChoiceID 是结构化审批交互的首选字段，Runtime 会按该审批已持久化的
+	// 选项校验它；Approved/Decision 仅保留给旧客户端兼容。
+	ChoiceID string `json:"choice_id"`
 	Approved *bool  `json:"approved"`
 	Decision string `json:"decision"`
 	Reason   string `json:"reason"`
@@ -836,6 +836,15 @@ func (s *Server) resolveApproval(writer http.ResponseWriter, request *http.Reque
 	var payload approvalResolvePayload
 	if err := decodeJSON(writer, request, &payload); err != nil {
 		writeError(writer, fmt.Errorf("请求体无效: %w", err))
+		return
+	}
+	if choiceID := strings.TrimSpace(payload.ChoiceID); choiceID != "" {
+		item, err := runtime.ResolveApprovalChoice(request.Context(), request.PathValue("id"), choiceID, strings.TrimSpace(payload.Reason))
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeJSON(writer, http.StatusAccepted, item)
 		return
 	}
 	approved, err := parseApprovalDecision(payload)
@@ -976,6 +985,15 @@ func (s *Server) streamRuntimeChat(writer http.ResponseWriter, request *http.Req
 			data["type"] = "approval"
 			data["invocation_id"] = invocation.ID
 			if err := writeSSE(writer, "approval", data, streamLog); err != nil {
+				streamStatus = "write_failed"
+				return false
+			}
+			flusher.Flush()
+		case agentruntime.EventUserInputRequested:
+			data := cloneRuntimeEventData(event.Data)
+			data["type"] = "input"
+			data["invocation_id"] = invocation.ID
+			if err := writeSSE(writer, "input", data, streamLog); err != nil {
 				streamStatus = "write_failed"
 				return false
 			}

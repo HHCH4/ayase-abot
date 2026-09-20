@@ -95,7 +95,12 @@ func deriveWorkflowPhase(invocation Invocation, plan *TaskPlan, pendingApprovals
 			if strings.EqualFold(strings.TrimSpace(reason), "approval") {
 				return WorkflowPhaseWaitingApproval
 			}
+			if strings.EqualFold(strings.TrimSpace(reason), "user") || strings.EqualFold(strings.TrimSpace(reason), "input") {
+				return WorkflowPhaseWaitingUser
+			}
 			return WorkflowPhaseWaitingTool
+		case EventUserInputRequested:
+			return WorkflowPhaseWaitingUser
 		case EventVerificationUpdated:
 			return WorkflowPhaseVerifying
 		case EventToolRequested, EventToolStarted, EventToolOutput, EventToolCompleted, EventToolFailed, EventCommandOutput:

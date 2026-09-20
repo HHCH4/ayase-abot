@@ -134,6 +134,11 @@ type Message struct {
 type MessageControl struct {
 	Kind       string
 	ApprovalID string
+	// ChoiceID 是平台控件回传的结构化选项；它比 Decision 更完整，能够
+	// 保留“允许本次”“会话内允许”等未来策略的语义。
+	ChoiceID string
+	// Decision 保留给旧适配器读取，Runtime 会再次根据 Approval.Choices
+	// 校验 ChoiceID，不能仅凭这个布尔值越权。
 	Decision   bool
 	CallbackID string
 }
@@ -142,11 +147,18 @@ type ApprovalPrompt struct {
 	ApprovalID string
 	ToolName   string
 	Hint       string
+	Choices    []agentruntime.ApprovalChoice
 	ExpiresAt  *time.Time
 }
 
 type ApprovalSender interface {
 	SendApproval(context.Context, Message, ApprovalPrompt) error
+}
+
+// UserInputSender 用于向平台展示普通用户问题。它与审批发送器分开，避免
+// 平台适配器把“工具授权”和“用户选择题”渲染成同一种按钮。
+type UserInputSender interface {
+	SendUserInput(context.Context, Message, agentruntime.UserInputRequest) error
 }
 
 // Handler 是平台适配器发布消息时调用的统一回调。
@@ -301,6 +313,7 @@ type Manager struct {
 	activeInvocations   map[string]string
 	observedInvocations map[string]struct{}
 	pendingApprovals    map[string][]approvalTicket
+	pendingUserInputs   map[string][]userInputTicket
 	progressInterval    time.Duration
 	// commands is the chat command catalog. It is replaced only during
 	// construction or plugin registration, never while dispatching.
@@ -349,7 +362,7 @@ func NewManager(ctx context.Context, repository Repository, kernel *agent.Kernel
 		repository: repository, kernel: kernel, conversations: conversations,
 		bus: eventbus.New(), bots: make(map[string]Bot), runtimes: make(map[string]runtimeEntry),
 		locks: make(map[string]*sync.Mutex), baseCtx: ctx,
-		activeConversations: make(map[string]string), activeInvocations: make(map[string]string), observedInvocations: make(map[string]struct{}), pendingApprovals: make(map[string][]approvalTicket),
+		activeConversations: make(map[string]string), activeInvocations: make(map[string]string), observedInvocations: make(map[string]struct{}), pendingApprovals: make(map[string][]approvalTicket), pendingUserInputs: make(map[string][]userInputTicket),
 		progressInterval: 30 * time.Second,
 		commands:         commands,
 		sourceNames:      make(map[string]string),

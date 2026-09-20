@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,13 +25,83 @@ const (
 	commandNew          = "new"
 	commandCancel       = "cancel"
 	commandStatus       = "status"
-	commandApprove      = "approve"
-	commandReject       = "reject"
 )
 
 type approvalTicket struct {
 	ID           string
 	InvocationID string
+	Choices      []agentruntime.ApprovalChoice
+}
+
+type userInputTicket struct {
+	InvocationID string
+	Request      agentruntime.UserInputRequest
+}
+
+// approvalChoices 统一返回审批交互的两个安全选项；旧 Runtime 或旧事件中
+// 即使携带了业务 choices，也不能把它们混进工具授权流程。
+func approvalChoices(_ []agentruntime.ApprovalChoice) []agentruntime.ApprovalChoice {
+	// 普通问题的单选、多选和文本答案由 UserInputRequest 负责，审批本身
+	// 固定为“允许一次/拒绝”两个互斥选项，避免授权卡片承载业务选择。
+	return agentruntime.DefaultApprovalChoices()
+}
+
+// approvalChoicesFromEvent 将 SSE/Runtime 事件中的 JSON 选项恢复为强类型，
+// 保证纯文本平台和按钮平台使用同一份选项顺序。
+func approvalChoicesFromEvent(data map[string]any) []agentruntime.ApprovalChoice {
+	if data != nil {
+		if items, ok := data["choices"].([]agentruntime.ApprovalChoice); ok {
+			return approvalChoices(items)
+		}
+		if raw, ok := data["choices"]; ok {
+			encoded, err := json.Marshal(raw)
+			if err == nil {
+				var items []agentruntime.ApprovalChoice
+				if json.Unmarshal(encoded, &items) == nil {
+					return approvalChoices(items)
+				}
+			}
+		}
+	}
+	return agentruntime.DefaultApprovalChoices()
+}
+
+func choiceResultText(choice agentruntime.ApprovalChoice) string {
+	if choice.Approved {
+		return "已选择“" + safeProgressText(choice.Label) + "”，操作将继续执行。"
+	}
+	return "已选择“" + safeProgressText(choice.Label) + "”，操作不会执行。"
+}
+
+// userInputOptionsText 给没有原生按钮的聊天平台提供稳定的序号协议；多选
+// 使用“1,3”形式，单选使用一个序号，文本题则直接接收正文。
+func userInputOptionsText(request agentruntime.UserInputRequest) string {
+	var builder strings.Builder
+	if request.Title != "" {
+		builder.WriteString(request.Title)
+		builder.WriteString("\n")
+	}
+	builder.WriteString(request.Question)
+	if request.Step > 0 && request.TotalSteps > 0 {
+		builder.WriteString(fmt.Sprintf("（第 %d/%d 题）", request.Step, request.TotalSteps))
+	}
+	for index, option := range request.Options {
+		builder.WriteString(fmt.Sprintf("\n%d. %s", index+1, safeProgressText(option.Label)))
+		if option.Description != "" {
+			builder.WriteString("：")
+			builder.WriteString(safeProgressText(option.Description))
+		}
+	}
+	if request.AllowFreeform {
+		builder.WriteString("\n也可以直接输入自定义答案")
+	}
+	if request.AllowSkip {
+		builder.WriteString("\n回复“跳过”可跳过本题")
+	}
+	if request.Kind == agentruntime.UserInputMultiSelect {
+		builder.WriteString("\n多选请回复序号，例如：1,3")
+	}
+	return builder.String()
 }
 
 type botCommand struct {
@@ -67,9 +139,15 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 		slog.Info("机器人请求已忽略", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "reason", "empty")
 		return nil
 	}
-	// 审批回复是对当前待办任务的直接控制，不应被群聊 @ 规则或私聊唤醒词拦截。
-	if handled, approvalErr := m.handleDirectApprovalReply(ctx, message); handled {
+	// 结构化选项回复是对当前待办任务的直接控制，不应被群聊 @ 规则或
+	// 私聊唤醒词拦截；普通“批准/拒绝”等自然语言仍按普通消息处理。
+	if handled, approvalErr := m.handlePendingApprovalReply(ctx, message); handled {
 		return approvalErr
+	}
+	// 普通用户问题的回答可以是单选、多选或自由文本；只有当前聊天确实
+	// 有待回答请求时才拦截，普通数字/文字消息不会被误当成控制指令。
+	if handled, inputErr := m.handlePendingUserInputReply(ctx, message); handled {
+		return inputErr
 	}
 	allowed, admissionErr := m.messageAllowed(ctx, &message)
 	if admissionErr != nil {
@@ -346,6 +424,7 @@ func (m *Manager) startNewConversation(ctx context.Context, message Message) err
 	m.activeConversations[key] = created.ID
 	delete(m.activeInvocations, key)
 	delete(m.pendingApprovals, key)
+	delete(m.pendingUserInputs, key)
 	m.mu.Unlock()
 	return m.send(ctx, message, "已新建会话，之前的会话仍可在 WebUI 中查看。")
 }
@@ -634,12 +713,15 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 				}
 			case agentruntime.EventApprovalRequested:
 				m.deliverApproval(baseCtx, message, event)
+			case agentruntime.EventUserInputRequested:
+				m.deliverUserInput(baseCtx, message, event)
 			case agentruntime.EventApprovalExpired:
 				_ = m.send(baseCtx, message, "审批已过期，任务不会继续执行。")
 			case agentruntime.EventApprovalResolved:
 				_ = m.send(baseCtx, message, "审批决定已记录。")
 			case agentruntime.EventInvocationWaiting:
-				if eventString(event.Data, "reason") != "approval" {
+				reason := eventString(event.Data, "reason")
+				if reason != "approval" && reason != "user" {
 					_ = m.send(baseCtx, message, "任务正在等待外部操作完成。")
 				}
 			case agentruntime.EventToolStarted, agentruntime.EventCommandStarted:
@@ -714,13 +796,14 @@ func (m *Manager) deliverApproval(ctx context.Context, message Message, event ag
 			return
 		}
 	}
-	tickets = append(tickets, approvalTicket{ID: approvalID, InvocationID: event.InvocationID})
+	choices := approvalChoicesFromEvent(event.Data)
+	tickets = append(tickets, approvalTicket{ID: approvalID, InvocationID: event.InvocationID, Choices: choices})
 	if len(tickets) > 20 {
 		tickets = tickets[len(tickets)-20:]
 	}
 	m.pendingApprovals[chatKey] = tickets
 	m.mu.Unlock()
-	prompt := ApprovalPrompt{ApprovalID: approvalID, ToolName: eventString(event.Data, "tool_name"), Hint: eventString(event.Data, "hint")}
+	prompt := ApprovalPrompt{ApprovalID: approvalID, ToolName: eventString(event.Data, "tool_name"), Hint: eventString(event.Data, "hint"), Choices: choices}
 	prompt.ExpiresAt = eventTime(event.Data, "expires_at")
 	// 审批请求可能由平台专用交互组件发送，先在 Manager 层记录完整提示内容。
 	slog.Info("机器人发送审批请求", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "invocation_id", event.InvocationID, "approval_id", approvalID, "prompt", prompt)
@@ -739,21 +822,84 @@ func (m *Manager) deliverApproval(ctx context.Context, message Message, event ag
 		}
 	}
 	position := len(tickets)
-	text := fmt.Sprintf("需要审批（%d）：工具 %s\n%s", position, safeProgressText(prompt.ToolName), safeProgressText(prompt.Hint))
+	text := fmt.Sprintf("需要确认（请求 %d）：工具 %s\n%s", position, safeProgressText(prompt.ToolName), safeProgressText(prompt.Hint))
 	if prompt.ExpiresAt != nil {
 		text += "\n有效期至：" + prompt.ExpiresAt.Format(time.RFC3339)
 	}
-	text += "\n请直接回复“批准”或“拒绝”，机器人会继续处理当前任务。"
-	text += fmt.Sprintf("\n兼容方式：/approve %d 或 /reject %d。", position, position)
+	text += "\n请选择："
+	for index, choice := range prompt.Choices {
+		text += fmt.Sprintf("\n%d. %s", index+1, safeProgressText(choice.Label))
+	}
+	text += "\n请只回复选项序号；当前聊天没有待确认请求时，数字不会被当作审批。"
+	if len(tickets) > 1 {
+		text += "\n若同时有多个请求，请回复：审批 <请求序号> <选项序号>。"
+	}
 	_ = m.send(ctx, message, text)
+}
+
+// deliverUserInput 将 ADK 的 RequestInput 投影为平台问题卡片。回答题目时
+// 只保存 request ID 和 Invocation ID，恢复仍由 Runtime 重新校验边界。
+func (m *Manager) deliverUserInput(ctx context.Context, message Message, event agentruntime.AgentEvent) {
+	encoded, err := json.Marshal(event.Data)
+	if err != nil {
+		return
+	}
+	var request agentruntime.UserInputRequest
+	if err := json.Unmarshal(encoded, &request); err != nil || strings.TrimSpace(request.ID) == "" {
+		return
+	}
+	request.InvocationID = event.InvocationID
+	chatKey := chatBindingKey(message)
+	m.mu.Lock()
+	// 兼容测试桩和旧嵌入方直接构造 Manager 的情况，首次收到问题时再补齐
+	// 内存票据表，避免普通用户问题因为 nil map 触发 panic。
+	if m.pendingUserInputs == nil {
+		m.pendingUserInputs = make(map[string][]userInputTicket)
+	}
+	tickets := m.pendingUserInputs[chatKey]
+	for _, ticket := range tickets {
+		if ticket.Request.ID == request.ID && ticket.InvocationID == event.InvocationID {
+			m.mu.Unlock()
+			return
+		}
+	}
+	tickets = append(tickets, userInputTicket{InvocationID: event.InvocationID, Request: request})
+	if len(tickets) > 8 {
+		tickets = tickets[len(tickets)-8:]
+	}
+	m.pendingUserInputs[chatKey] = tickets
+	m.mu.Unlock()
+	slog.Info("机器人发送用户问题", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "invocation_id", event.InvocationID, "request", request)
+	m.mu.RLock()
+	entry, running := m.runtimes[message.AdapterID]
+	m.mu.RUnlock()
+	if running {
+		if sender, ok := entry.platform.(UserInputSender); ok {
+			if err := sender.SendUserInput(ctx, message, request); err == nil {
+				return
+			} else {
+				slog.Error("机器人用户问题发送失败", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "request", request, "error", err)
+			}
+		}
+	}
+	_ = m.send(ctx, message, userInputOptionsText(request))
 }
 
 func (m *Manager) handleApprovalControl(ctx context.Context, message Message) error {
 	if message.Control == nil || message.Control.Kind != "approval" {
 		return nil
 	}
-	approved := message.Control.Decision
-	allowed, authErr := m.approvalReplyAllowed(ctx, message, approved)
+	choiceID := strings.TrimSpace(message.Control.ChoiceID)
+	if choiceID == "" {
+		// 旧平台只回传布尔值时仍允许兼容，但真实 Approval 会再次把
+		// 布尔值映射到已持久化选项，避免控件直接绕过选项校验。
+		if message.Control.Decision {
+			choiceID = "approve"
+		} else {
+			choiceID = "reject"
+		}
+	}
+	allowed, authErr := m.approvalReplyAllowed(ctx, message)
 	if authErr != nil {
 		_ = m.send(ctx, message, "审批权限校验失败："+trimError(authErr))
 		return authErr
@@ -761,20 +907,18 @@ func (m *Manager) handleApprovalControl(ctx context.Context, message Message) er
 	if !allowed {
 		return nil
 	}
-	if _, err := m.resolveApproval(ctx, message, message.Control.ApprovalID, approved); err != nil {
+	if _, err := m.resolveApprovalChoiceID(ctx, message, message.Control.ApprovalID, choiceID); err != nil {
 		_ = m.send(ctx, message, "审批处理失败："+trimError(err))
 		return err
 	}
 	return nil
 }
 
-// handleDirectApprovalReply 把“批准/拒绝”等普通聊天文本转换成当前会话的审批决定。
-// 只有存在属于当前聊天的待审批请求时才会拦截文本，普通对话不会被误判为审批。
-func (m *Manager) handleDirectApprovalReply(ctx context.Context, message Message) (bool, error) {
-	text := strings.TrimSpace(message.Text)
-	approved, isDecision := parseApprovalDecision(text)
-	isNumber := isDecimalApprovalChoice(text)
-	if !isDecision && !isNumber {
+// handlePendingApprovalReply 只解析“当前审批卡片”里的结构化数字选择。
+// 它不会把批准、拒绝、可以等自然语言当作控制信号，避免普通聊天被拦截。
+func (m *Manager) handlePendingApprovalReply(ctx context.Context, message Message) (bool, error) {
+	selection, ok := parseApprovalSelection(message.Text)
+	if !ok {
 		return false, nil
 	}
 	tickets, err := m.pendingApprovalTickets(ctx, message)
@@ -782,10 +926,24 @@ func (m *Manager) handleDirectApprovalReply(ctx context.Context, message Message
 		return true, err
 	}
 	if len(tickets) == 0 {
-		// 没有待审批任务时，保留原消息给普通对话和唤醒词逻辑处理。
 		return false, nil
 	}
-	allowed, authErr := m.approvalReplyAllowed(ctx, message, approved)
+	ticketIndex := selection.TicketIndex
+	if ticketIndex == 0 {
+		if len(tickets) != 1 {
+			return true, m.send(ctx, message, "当前有多个待确认请求，请回复：审批 <请求序号> <选项序号>。")
+		}
+		ticketIndex = 1
+	}
+	if ticketIndex < 1 || ticketIndex > len(tickets) {
+		return true, m.send(ctx, message, "请求序号无效，请按审批提示中的序号选择。")
+	}
+	ticket := tickets[ticketIndex-1]
+	if selection.ChoiceIndex < 1 || selection.ChoiceIndex > len(ticket.Choices) {
+		return true, m.send(ctx, message, "选项序号无效，请按审批提示中的选项选择。")
+	}
+	choice := ticket.Choices[selection.ChoiceIndex-1]
+	allowed, authErr := m.approvalReplyAllowed(ctx, message)
 	if authErr != nil {
 		_ = m.send(ctx, message, "审批权限校验失败："+trimError(authErr))
 		return true, authErr
@@ -793,77 +951,299 @@ func (m *Manager) handleDirectApprovalReply(ctx context.Context, message Message
 	if !allowed {
 		return true, nil
 	}
-	if isNumber {
-		if handled, resolveErr := m.resolveApprovalChoice(ctx, message, text, true); handled {
-			return true, resolveErr
-		}
-		return true, m.send(ctx, message, "审批序号无效，请回复审批提示中的序号，或直接回复“批准/拒绝”。")
-	}
-	if len(tickets) != 1 {
-		return true, m.send(ctx, message, "当前有多个待审批请求，请回复对应序号；也可使用 /approve 序号 或 /reject 序号。")
-	}
-	_, err = m.resolveApproval(ctx, message, tickets[0].ID, approved)
+	_, err = m.resolveApprovalChoiceID(ctx, message, ticket.ID, choice.ID)
 	return true, err
 }
 
-// approvalReplyAllowed 让按钮、自然语言和兼容命令共用同一套权限策略，避免直接回复绕过管理员限制。
-func (m *Manager) approvalReplyAllowed(ctx context.Context, message Message, approved bool) (bool, error) {
-	registry := m.commandRegistry()
-	if registry == nil {
-		return false, errors.New("指令系统未初始化")
-	}
-	bot, err := m.Get(strings.TrimSpace(message.AdapterID))
+// handlePendingUserInputReply 只在当前聊天存在待回答问题时接管消息。数字、
+// 逗号分隔的数字和自定义文本都会先转换成结构化 payload，再交给 ADK。
+func (m *Manager) handlePendingUserInputReply(ctx context.Context, message Message) (bool, error) {
+	tickets, err := m.pendingUserInputTickets(ctx, message)
 	if err != nil {
-		return false, fmt.Errorf("读取机器人配置失败: %w", err)
-	}
-	commandID := commandReject
-	if approved {
-		commandID = commandApprove
-	}
-	descriptor, ok := registry.Lookup(commandID)
-	if !ok {
-		return false, fmt.Errorf("审批指令 %q 未注册", commandID)
-	}
-	authorization, err := m.authorizeCommand(ctx, bot, message, descriptor, "")
-	if err != nil {
-		return false, err
-	}
-	if !authorization.Command.Enabled {
-		return false, m.send(ctx, message, "该审批入口当前已停用。")
-	}
-	if authorization.allows() {
-		return true, nil
-	}
-	m.recordAudit(ctx, CommandAudit{
-		AdapterID: bot.ID, ChatID: message.ChatID, UserID: message.UserID,
-		Command: descriptor.ID, Action: AuditCommandDenied, Result: "denied",
-	})
-	return false, m.send(ctx, message, authorization.denyReason())
-}
-
-func (m *Manager) resolveApprovalChoice(ctx context.Context, message Message, choice string, approved bool) (bool, error) {
-	choice = strings.TrimSpace(choice)
-	tickets, err := m.pendingApprovalTickets(ctx, message)
-	if err != nil {
-		return false, err
+		return true, err
 	}
 	if len(tickets) == 0 {
 		return false, nil
 	}
-	approvalID := choice
-	if choice == "" && len(tickets) == 1 {
-		// 单个待审批请求时，/approve 和 /reject 允许省略序号，行为与直接回复一致。
-		approvalID = tickets[0].ID
-	} else if number, parseErr := parsePositiveInt(choice); parseErr == nil && number <= len(tickets) {
-		approvalID = tickets[number-1].ID
+	if len(tickets) > 1 {
+		return true, m.send(ctx, message, "当前有多个待回答问题，请先完成最早的一题。")
 	}
-	for _, ticket := range tickets {
-		if ticket.ID == approvalID {
-			_, err := m.resolveApproval(ctx, message, approvalID, approved)
-			return true, err
+	ticket := tickets[0]
+	response, summary, ok, parseErr := parseUserInputReply(message.Text, ticket.Request)
+	if parseErr != nil {
+		return true, m.send(ctx, message, parseErr.Error())
+	}
+	if !ok {
+		return true, m.send(ctx, message, userInputOptionsText(ticket.Request))
+	}
+	if err := m.resolveUserInput(ctx, message, ticket, response); err != nil {
+		_ = m.send(ctx, message, "提交回答失败："+trimError(err))
+		return true, err
+	}
+	if summary == "" {
+		summary = "已提交回答"
+	}
+	return true, m.send(ctx, message, summary+"，任务继续执行。")
+}
+
+func parseUserInputReply(value string, request agentruntime.UserInputRequest) (map[string]any, string, bool, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, "", false, nil
+	}
+	if request.AllowSkip && (value == "跳过" || strings.EqualFold(value, "skip")) {
+		return map[string]any{"skipped": true}, "已跳过本题", true, nil
+	}
+	if request.Kind == agentruntime.UserInputText {
+		return map[string]any{"text": value}, "已填写答案", true, nil
+	}
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '，' || r == '、' || r == ' ' || r == '\t'
+	})
+	if len(parts) == 0 {
+		return nil, "", false, nil
+	}
+	selected := make([]agentruntime.UserInputOption, 0, len(parts))
+	seen := make(map[string]struct{})
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "选择" || part == "选" {
+			continue
+		}
+		index, indexErr := strconv.Atoi(part)
+		var option agentruntime.UserInputOption
+		if indexErr == nil && index >= 1 && index <= len(request.Options) {
+			option = request.Options[index-1]
+		} else {
+			for _, candidate := range request.Options {
+				if candidate.ID == part {
+					option = candidate
+					break
+				}
+			}
+		}
+		if option.ID == "" {
+			if request.AllowFreeform {
+				return map[string]any{"text": value}, "已填写自定义答案", true, nil
+			}
+			return nil, "", false, fmt.Errorf("选项“%s”无效，请按题目中的序号选择。", part)
+		}
+		if _, exists := seen[option.ID]; exists {
+			continue
+		}
+		seen[option.ID] = struct{}{}
+		selected = append(selected, option)
+	}
+	if len(selected) == 0 {
+		return nil, "", false, nil
+	}
+	if request.Kind == agentruntime.UserInputSingleSelect && len(selected) != 1 {
+		return nil, "", false, errors.New("本题只能选择一个选项。")
+	}
+	if request.Kind == agentruntime.UserInputMultiSelect {
+		if request.MinSelections > 0 && len(selected) < request.MinSelections {
+			return nil, "", false, fmt.Errorf("本题至少选择 %d 项。", request.MinSelections)
+		}
+		if request.MaxSelections > 0 && len(selected) > request.MaxSelections {
+			return nil, "", false, fmt.Errorf("本题最多选择 %d 项。", request.MaxSelections)
 		}
 	}
-	return false, nil
+	ids := make([]string, 0, len(selected))
+	labels := make([]string, 0, len(selected))
+	for _, option := range selected {
+		ids = append(ids, option.ID)
+		labels = append(labels, option.Label)
+	}
+	if request.Kind == agentruntime.UserInputMultiSelect {
+		return map[string]any{"selected_ids": ids, "selected_labels": labels}, "已选择：" + strings.Join(labels, "、"), true, nil
+	}
+	return map[string]any{"selected_id": ids[0], "selected_label": labels[0]}, "已选择：" + labels[0], true, nil
+}
+
+type userInputResumeCoordinator interface {
+	ResumeInvocation(context.Context, string, agentruntime.InvocationResumeRequest) (agentruntime.Invocation, error)
+}
+
+type runtimeEventReader interface {
+	ListEvents(context.Context, string, int64, int) ([]agentruntime.AgentEvent, error)
+}
+
+func (m *Manager) pendingUserInputTickets(ctx context.Context, message Message) ([]userInputTicket, error) {
+	key := chatBindingKey(message)
+	m.mu.RLock()
+	tickets := append([]userInputTicket(nil), m.pendingUserInputs[key]...)
+	m.mu.RUnlock()
+	if len(tickets) > 0 {
+		return tickets, nil
+	}
+	_, conversationID, err := m.conversationForMessage(ctx, message)
+	if err != nil {
+		return nil, err
+	}
+	item, found, err := m.findActiveInvocation(ctx, message, conversationID)
+	if err != nil || !found || item.Status != agentruntime.InvocationWaitingUser {
+		return nil, err
+	}
+	m.mu.RLock()
+	coordinator := m.runtimeCoordinator
+	m.mu.RUnlock()
+	reader, ok := coordinator.(runtimeEventReader)
+	if !ok {
+		return nil, nil
+	}
+	events, err := reader.ListEvents(ctx, item.ID, 0, 5000)
+	if err != nil {
+		return nil, err
+	}
+	resolved := make(map[string]struct{})
+	var recovered []userInputTicket
+	for _, event := range events {
+		if event.Type == agentruntime.EventUserInputResolved || event.Type == agentruntime.EventInvocationResumed && eventString(event.Data, "reason") == "user" {
+			id := eventString(event.Data, "request_id")
+			if id == "" {
+				id = eventString(event.Data, "wait_id")
+			}
+			if id != "" {
+				resolved[id] = struct{}{}
+			}
+			continue
+		}
+		if event.Type != agentruntime.EventUserInputRequested {
+			continue
+		}
+		var request agentruntime.UserInputRequest
+		encoded, marshalErr := json.Marshal(event.Data)
+		if marshalErr != nil || json.Unmarshal(encoded, &request) != nil || request.ID == "" {
+			continue
+		}
+		request.InvocationID = event.InvocationID
+		if _, done := resolved[request.ID]; !done {
+			recovered = append(recovered, userInputTicket{InvocationID: event.InvocationID, Request: request})
+		}
+	}
+	if len(recovered) > 0 {
+		m.mu.Lock()
+		if m.pendingUserInputs == nil {
+			m.pendingUserInputs = make(map[string][]userInputTicket)
+		}
+		m.pendingUserInputs[key] = append([]userInputTicket(nil), recovered...)
+		m.mu.Unlock()
+	}
+	return recovered, nil
+}
+
+func (m *Manager) resolveUserInput(ctx context.Context, message Message, ticket userInputTicket, response map[string]any) error {
+	m.mu.RLock()
+	coordinator := m.runtimeCoordinator
+	m.mu.RUnlock()
+	resumeCoordinator, ok := coordinator.(userInputResumeCoordinator)
+	if !ok {
+		return errors.New("Runtime 尚未支持用户问题恢复")
+	}
+	invocation, err := coordinator.GetInvocation(ctx, ticket.InvocationID)
+	if err != nil {
+		return err
+	}
+	_, conversationID, conversationErr := m.conversationForMessage(ctx, message)
+	if conversationErr != nil {
+		return conversationErr
+	}
+	if invocation.ConversationID != conversationID || invocation.UserID != bindingUserID(message) {
+		return errors.New("该问题不属于当前聊天")
+	}
+	if _, err := resumeCoordinator.ResumeInvocation(ctx, ticket.InvocationID, agentruntime.InvocationResumeRequest{
+		WaitID: ticket.Request.ID, Name: "adk_request_input", Response: response,
+	}); err != nil {
+		return err
+	}
+	m.removePendingUserInput(message, ticket.Request.ID)
+	return nil
+}
+
+func (m *Manager) removePendingUserInput(message Message, requestID string) {
+	key := chatBindingKey(message)
+	m.mu.Lock()
+	tickets := m.pendingUserInputs[key]
+	filtered := tickets[:0]
+	for _, ticket := range tickets {
+		if ticket.Request.ID != requestID {
+			filtered = append(filtered, ticket)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(m.pendingUserInputs, key)
+	} else {
+		m.pendingUserInputs[key] = filtered
+	}
+	m.mu.Unlock()
+}
+
+// approvalReplyAllowed 让按钮和结构化选项共用审批权限策略，避免新增的
+// 交互入口绕过原有的群管理员/全局管理员边界。
+func (m *Manager) approvalReplyAllowed(ctx context.Context, message Message) (bool, error) {
+	bot, err := m.Get(strings.TrimSpace(message.AdapterID))
+	if err != nil {
+		return false, fmt.Errorf("读取机器人配置失败: %w", err)
+	}
+	globalAdmin := m.globalAdminForMessage(ctx, bot, message)
+	groupAdmin := false
+	if isGroupChatType(message.ChatType) {
+		admins, adminErr := m.groupAdmins(ctx, bot.ID, message.ChatID)
+		if adminErr != nil {
+			return false, adminErr
+		}
+		for _, admin := range admins {
+			if strings.TrimSpace(admin) == strings.TrimSpace(message.UserID) {
+				groupAdmin = true
+				break
+			}
+		}
+	}
+	if globalAdmin || (isGroupChatType(message.ChatType) && groupAdmin) {
+		return true, nil
+	}
+	m.recordAudit(ctx, CommandAudit{
+		AdapterID: bot.ID, ChatID: message.ChatID, UserID: message.UserID, Command: "approval",
+		Action: AuditCommandDenied, Result: "denied",
+	})
+	if isGroupChatType(message.ChatType) {
+		return false, m.send(ctx, message, "审批需要本群管理员权限。")
+	}
+	return false, m.send(ctx, message, "审批在私聊中需要全局管理员权限。")
+}
+
+// parseApprovalSelection 解析文本平台的选项选择。单个待办时允许回复“1”；
+// 多个待办时必须显式写成“审批 请求序号 选项序号”，避免数字含义歧义。
+type approvalSelection struct {
+	TicketIndex int
+	ChoiceIndex int
+}
+
+func parseApprovalSelection(value string) (approvalSelection, bool) {
+	fields := strings.Fields(strings.TrimSpace(value))
+	if len(fields) == 1 {
+		choice, err := parsePositiveInt(fields[0])
+		if err != nil {
+			return approvalSelection{}, false
+		}
+		return approvalSelection{ChoiceIndex: choice}, true
+	}
+	if len(fields) == 2 && (fields[0] == "选" || fields[0] == "选择") {
+		choice, err := parsePositiveInt(fields[1])
+		if err != nil {
+			return approvalSelection{}, false
+		}
+		return approvalSelection{ChoiceIndex: choice}, true
+	}
+	if len(fields) == 3 && fields[0] == "审批" {
+		ticket, ticketErr := parsePositiveInt(fields[1])
+		choice, choiceErr := parsePositiveInt(fields[2])
+		if ticketErr != nil || choiceErr != nil {
+			return approvalSelection{}, false
+		}
+		return approvalSelection{TicketIndex: ticket, ChoiceIndex: choice}, true
+	}
+	return approvalSelection{}, false
 }
 
 // pendingApprovalTickets 优先读取内存票据，进程重启后再从 Durable Runtime 恢复当前聊天的审批。
@@ -902,7 +1282,7 @@ func (m *Manager) hydratePendingApprovals(ctx context.Context, message Message) 
 		if approval.ConversationID != "" && approval.ConversationID != conversationID {
 			continue
 		}
-		tickets = append(tickets, approvalTicket{ID: approval.ID, InvocationID: item.ID})
+		tickets = append(tickets, approvalTicket{ID: approval.ID, InvocationID: item.ID, Choices: approvalChoices(approval.Choices)})
 	}
 	m.mu.Lock()
 	if len(tickets) > 20 {
@@ -915,7 +1295,21 @@ func (m *Manager) hydratePendingApprovals(ctx context.Context, message Message) 
 	return tickets, nil
 }
 
+type approvalChoiceCoordinator interface {
+	ResolveApprovalChoice(context.Context, string, string, string) (agentruntime.Approval, error)
+}
+
+// resolveApproval 保留旧的内部调用形态，真正的交互入口使用
+// resolveApprovalChoiceID，以确保选项语义不会在 Bot 边界丢失。
 func (m *Manager) resolveApproval(ctx context.Context, message Message, approvalID string, approved bool) (agentruntime.Approval, error) {
+	choiceID := "reject"
+	if approved {
+		choiceID = "approve"
+	}
+	return m.resolveApprovalChoiceID(ctx, message, approvalID, choiceID)
+}
+
+func (m *Manager) resolveApprovalChoiceID(ctx context.Context, message Message, approvalID, choiceID string) (agentruntime.Approval, error) {
 	approvalID = strings.TrimSpace(approvalID)
 	if approvalID == "" {
 		return agentruntime.Approval{}, errors.New("审批 ID 不能为空")
@@ -948,13 +1342,32 @@ func (m *Manager) resolveApproval(ctx context.Context, message Message, approval
 	if approval.ConversationID != "" && approval.ConversationID != invocation.ConversationID {
 		return agentruntime.Approval{}, errors.New("审批与 Runtime 会话不一致")
 	}
-	resolved, err := coordinator.ResolveApproval(ctx, approvalID, approved, "机器人聊天决策")
+	choiceID = strings.TrimSpace(choiceID)
+	choices := approvalChoices(approval.Choices)
+	var choice agentruntime.ApprovalChoice
+	for _, candidate := range choices {
+		if candidate.ID == choiceID {
+			choice = candidate
+			break
+		}
+	}
+	if choice.ID == "" {
+		return agentruntime.Approval{}, fmt.Errorf("审批选项 %q 无效", choiceID)
+	}
+	var resolved agentruntime.Approval
+	if choiceResolver, ok := coordinator.(approvalChoiceCoordinator); ok {
+		resolved, err = choiceResolver.ResolveApprovalChoice(ctx, approvalID, choice.ID, "机器人聊天选择")
+	} else {
+		// 兼容尚未升级的嵌入 Runtime；真实 Coordinator 始终走上面的
+		// ChoiceID 路径，旧实现只能安全地接收允许/拒绝布尔值。
+		resolved, err = coordinator.ResolveApproval(ctx, approvalID, choice.Approved, "机器人聊天选择")
+	}
 	if err != nil {
 		return agentruntime.Approval{}, err
 	}
 	// 决定已经持久化后立刻删除本地票据，避免用户重复回复造成二次决议错误。
 	m.removePendingApproval(message, approvalID)
-	_ = m.send(ctx, message, map[bool]string{true: "已批准该操作。", false: "已拒绝该操作。"}[approved])
+	_ = m.send(ctx, message, choiceResultText(choice))
 	return resolved, nil
 }
 
@@ -994,6 +1407,19 @@ func (m *Manager) clearActiveInvocation(message Message, invocationID string) {
 			delete(m.pendingApprovals, key)
 		} else {
 			m.pendingApprovals[key] = filtered
+		}
+	}
+	if tickets := m.pendingUserInputs[key]; len(tickets) > 0 {
+		filtered := tickets[:0]
+		for _, ticket := range tickets {
+			if ticket.InvocationID != invocationID {
+				filtered = append(filtered, ticket)
+			}
+		}
+		if len(filtered) == 0 {
+			delete(m.pendingUserInputs, key)
+		} else {
+			m.pendingUserInputs[key] = filtered
 		}
 	}
 	m.mu.Unlock()
@@ -1132,25 +1558,6 @@ func safeProgressText(value string) string {
 		return string([]rune(value)[:160]) + "…"
 	}
 	return value
-}
-
-func isDecimalApprovalChoice(value string) bool {
-	_, err := parsePositiveInt(value)
-	return err == nil
-}
-
-// parseApprovalDecision 只接受完整的确认词，避免把包含“可以/不可以”的普通问题误当成审批。
-func parseApprovalDecision(value string) (bool, bool) {
-	value = strings.TrimSpace(strings.ToLower(value))
-	value = strings.Trim(value, " \t\r\n\"'“”‘’.,，。!！?？:：;；")
-	switch value {
-	case "批准", "同意", "允许", "确认", "继续", "继续执行", "确认执行", "是", "好", "可以", "approve", "approved", "yes", "y":
-		return true, true
-	case "拒绝", "不同意", "不允许", "否决", "拒绝执行", "否", "不要", "不用", "取消", "reject", "rejected", "deny", "no", "n":
-		return false, true
-	default:
-		return false, false
-	}
 }
 
 func parsePositiveInt(value string) (int, error) {

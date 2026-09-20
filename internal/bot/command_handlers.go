@@ -194,16 +194,6 @@ func (m *Manager) dispatchBotCommand(ctx context.Context, bot Bot, message Messa
 		return m.commandAdminRemove(ctx, bot, message, authorization)
 	case "admin leave":
 		return m.commandAdminLeave(ctx, bot, message)
-	case "approve", "reject":
-		approved := authorization.Command.ID == "approve"
-		ticket := strings.TrimSpace(authorization.Arg)
-		if handled, err := m.resolveApprovalChoice(ctx, message, ticket, approved); handled {
-			return err
-		}
-		if ticket == "" {
-			return m.send(ctx, message, "当前没有唯一的待审批请求；收到审批提示后可直接回复“批准/拒绝”，多个请求请使用 /approve 序号 或 /reject 序号。")
-		}
-		return m.send(ctx, message, "找不到属于当前聊天的待审批请求，请发送 /status 查看任务状态。")
 	default:
 		return m.send(ctx, message, "该指令尚未接入。")
 	}
