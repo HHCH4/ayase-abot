@@ -10,8 +10,8 @@ import (
 
 // MessageSource 是一个已经从平台消息入口观察到的 UMO。
 //
-// 它和 Conversation 有意分开：AstrBot 的来源下拉框展示的是“收到过消息的
-// 来源”，而不是“已经进入 AI 并创建了会话的来源”。这样未唤醒、被权限规则
+// 它和 Conversation 有意分开：来源下拉框展示的是“收到过消息的来源”，
+// 而不是“已经进入 AI 并创建了会话的来源”。这样未唤醒、被权限规则
 // 拦截或仅发送内置指令的消息，也能进入自定义规则的可选目录。
 type MessageSource struct {
 	Source      string    `json:"source"`

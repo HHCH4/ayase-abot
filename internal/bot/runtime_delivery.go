@@ -120,7 +120,7 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// 先登记来源，再做任何消息过滤；这样 AstrBot 风格的“所有已知 UMO”
+	// 先登记来源，再做任何消息过滤；这样“所有已知 UMO”
 	// 目录不会因为未 @、未配置唤醒词或只执行内置指令而漏项。
 	m.recordMessageSource(ctx, message)
 	// 先记录平台送入的完整消息，再做规范化和权限判断，确保被忽略的请求也能追踪。
@@ -541,7 +541,7 @@ func (m *Manager) cancelChatInvocation(ctx context.Context, message Message) err
 	return m.controlChatInvocation(ctx, message, "取消", "可取消")
 }
 
-// stopChatInvocation 是对 AstrBot /stop 语义的直接实现，只停止任务而不改变会话历史。
+// stopChatInvocation 只停止任务而不改变会话历史。
 func (m *Manager) stopChatInvocation(ctx context.Context, message Message) error {
 	return m.controlChatInvocation(ctx, message, "停止", "可停止")
 }
@@ -1597,7 +1597,7 @@ func messageSessionID(message Message) string {
 	return chatID
 }
 
-// messageUMOMessageType 将平台适配器的聊天类型映射为 AstrBot 兼容的 MessageType。
+// messageUMOMessageType 将平台适配器的聊天类型映射为统一的 MessageType。
 // UMO 只允许 FriendMessage、GroupMessage、OtherMessage 三类，避免把 Telegram/OneBot 的原始枚举直接写进规则键。
 func messageUMOMessageType(message Message) string {
 	switch strings.ToLower(strings.TrimSpace(message.ChatType)) {
@@ -1610,8 +1610,8 @@ func messageUMOMessageType(message Message) string {
 	}
 }
 
-// messageSource 生成 AstrBot 兼容的稳定 UMO：platform_id:message_type:session_id。
-// AdapterID 对应 AstrBot 的 platform_id；适配器尚未注入 ID 时才回退到平台类型，避免产生空的来源键。
+// messageSource 生成稳定的 UMO：platform_id:message_type:session_id。
+// AdapterID 作为 platform_id；适配器尚未注入 ID 时才回退到平台类型，避免产生空的来源键。
 func messageSource(message Message) string {
 	platformID := strings.TrimSpace(message.AdapterID)
 	if platformID == "" {

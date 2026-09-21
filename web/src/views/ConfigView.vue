@@ -52,7 +52,7 @@ const currentFields = computed(() => (store.configSchema.fields || []).filter((f
   return text.includes(search.value.trim().toLocaleLowerCase())
 }))
 
-// 平台字段按 AstrBot 的基本、白名单、限速和安全分区展示；搜索结果仍保持扁平。
+// 平台字段按基本、白名单、限速和安全分区展示；搜索结果仍保持扁平。
 function platformSectionStart(key: string) {
   if (group.value !== 'platform' || search.value.trim()) return ''
   const sections: Record<string, string> = {

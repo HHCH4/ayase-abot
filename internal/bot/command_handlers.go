@@ -220,7 +220,7 @@ func (m *Manager) commandIdentity(ctx context.Context, message Message) error {
 	return m.send(ctx, message, strings.Join(lines, "\n"))
 }
 
-// commandSessionIdentity 展示 AstrBot /sid 约定的来源信息，供规则和权限配置直接复制使用。
+// commandSessionIdentity 展示会话来源信息，供规则和权限配置直接复制使用。
 func (m *Manager) commandSessionIdentity(ctx context.Context, message Message) error {
 	source := messageSource(message)
 	lines := []string{

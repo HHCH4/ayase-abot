@@ -213,7 +213,7 @@ func (r *botRepository) UpsertMessageSource(ctx context.Context, item bot.Messag
 }
 
 // ListMessageSources 返回已观察到的 UMO，查询覆盖来源键、自动名称、平台、
-// 消息类型、会话 ID 和用户 ID，满足 AstrBot 来源选择器的检索习惯。
+// 消息类型、会话 ID 和用户 ID，满足来源选择器的检索习惯。
 func (r *botRepository) ListMessageSources(ctx context.Context, query string) ([]bot.MessageSource, error) {
 	db := r.db.WithContext(ctx)
 	query = strings.TrimSpace(query)

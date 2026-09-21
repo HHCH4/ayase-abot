@@ -196,7 +196,7 @@ func (s *Service) Save(ctx context.Context, item Rule) (Rule, error) {
 }
 
 // ResetField 清除一个独立覆盖项；最后一个覆盖项被清除后删除规则行，
-// 这样列表中只保留真正有会话偏好的来源，行为与 AstrBot 删除对应偏好键一致。
+// 这样列表中只保留真正有会话偏好的来源，行为与删除对应偏好键一致。
 func (s *Service) ResetField(ctx context.Context, source, key string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -243,7 +243,7 @@ func (s *Service) Delete(ctx context.Context, source string) error {
 
 // ApplyBatch 按选中会话、所有会话、所有群聊或所有私聊更新规则。
 // 批量范围以完整 UMO 来源目录为准；没有旧规则的来源会在这里创建默认规则，
-// 这与 AstrBot 的“批量覆盖偏好”行为一致。
+// 这与“批量覆盖偏好”行为一致。
 func (s *Service) ApplyBatch(ctx context.Context, update BatchUpdate) ([]Rule, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

@@ -51,7 +51,7 @@ const modelOptions = computed(() => {
 const selectedCount = computed(() => selectedSources.value.length)
 const sourceOptions = computed(() => {
   const options = new Map<string, { label: string; value: string }>()
-  // 优先展示来源目录中的全部 UMO，让用户像 AstrBot 一样直接从已知会话选择。
+  // 优先展示来源目录中的全部 UMO，让用户直接从已知会话选择。
   for (const item of sources.value) {
     const detail = [item.platform, item.message_type, item.session_id].filter(Boolean).join(' · ')
     const name = item.source_name?.trim() || item.auto_name?.trim()

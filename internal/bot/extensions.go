@@ -108,7 +108,7 @@ func splitReply(text string, settings ExtensionConfig) []string {
 	return result
 }
 
-// splitByWords 从左到右选择最长分隔词，片段本身不携带分隔词，与 AstrBot 词表模式一致。
+// splitByWords 从左到右选择最长分隔词，片段本身不携带分隔词，与词表模式一致。
 func splitByWords(text string, words []string) []string {
 	if len(words) == 0 {
 		return []string{text}

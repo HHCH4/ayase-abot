@@ -215,7 +215,7 @@ type PlatformSettings struct {
 	TelegramPreAckEmoji    string
 }
 
-// ExtensionSettings 汇总 AstrBot 扩展页的三组内置行为，所有上限都在 Schema 校验。
+// ExtensionSettings 汇总扩展页的三组内置行为，所有上限都在 Schema 校验。
 type ExtensionSettings struct {
 	SegmentedReplyEnabled     bool
 	SegmentOnlyLLM            bool
@@ -837,7 +837,7 @@ func buildSchema() Schema {
 		{Key: "platform.private_requires_wakeup", Group: "platform", Label: "私聊需要唤醒词", Type: "boolean", Default: false, Help: "平台适配器可据此过滤未唤醒消息。"},
 		{Key: "platform.reply_prefix", Group: "platform", Label: "回复文本前缀", Type: "string", Default: "", Help: "平台输出前追加的前缀。"},
 		{Key: "platform.reply_mention", Group: "platform", Label: "回复时 @ 发送人", Type: "boolean", Default: false, Help: "OneBot 使用 @ 消息段；Telegram 使用用户提及链接。"},
-		// 仅列出当前适配器具备实际执行路径的 AstrBot 平台选项。
+		// 仅列出当前适配器具备实际执行路径的平台选项。
 		{Key: "platform.unique_session", Group: "platform", Label: "隔离群成员会话", Type: "boolean", Default: false, Help: "开启后同群不同成员使用独立的对话与任务队列。"},
 		{Key: "platform.reply_quote", Group: "platform", Label: "回复时引用发送人消息", Type: "boolean", Default: false, Help: "平台支持引用时关联原消息。"},
 		{Key: "platform.empty_mention_waiting", Group: "platform", Label: "仅 @ 时等待下一条消息", Type: "boolean", Default: true, Help: "群成员只 @ 机器人而没有正文时，在一分钟内接收其下一条消息。"},
