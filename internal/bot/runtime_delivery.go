@@ -754,6 +754,7 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 		sentResponse := false
 		var streamedText strings.Builder
 		streamedDeltaCount := 0
+		lastStreamedFinalText := ""
 		flushStreamLog := func(status, finalText string) {
 			if streamedDeltaCount == 0 {
 				return
@@ -772,6 +773,7 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 			slog.Info("机器人 Runtime 流式响应", attributes...)
 			streamedText.Reset()
 			streamedDeltaCount = 0
+			lastStreamedFinalText = ""
 		}
 		defer func() {
 			// 订阅被取消或 Runtime 异常关闭时也要落下已经收到的部分正文。
@@ -788,12 +790,19 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 					return false
 				}
 			}
+			// 以工具、审批或终态事件作为模型轮次边界：同一轮的思考和回答
+			// 增量先合并成一条日志，避免每个流式分片单独刷屏。
+			if event.Type != agentruntime.EventAssistantMessage {
+				flushStreamLog("completed", lastStreamedFinalText)
+			}
 			suppressResponseEventLog := false
 			if event.Type == agentruntime.EventAssistantMessage {
 				if text := eventString(event.Data, "text"); text != "" {
-					if scope, _ := event.Data["scope"].(string); scope != "modal_fallback" && streamedDeltaCount > 0 {
-						// 主模型已经发过增量时，用最终正文结束这次聚合日志，避免再次按事件拆开。
-						flushStreamLog("completed", text)
+					scope, _ := event.Data["scope"].(string)
+					if scope != "modal_fallback" && streamedDeltaCount > 0 {
+						// 主模型最终事件只作为聚合日志的正文参考，不在这里提前刷日志，
+						// 这样思考流和回答流仍会落在同一条日志中。
+						lastStreamedFinalText = text
 						suppressResponseEventLog = true
 					}
 				}

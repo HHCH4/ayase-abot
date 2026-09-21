@@ -8,10 +8,14 @@ package document
 import (
 	"archive/zip"
 	"bytes"
+	"compress/zlib"
 	"context"
 	"encoding/csv"
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"path/filepath"
 	"sort"
@@ -45,6 +49,12 @@ const (
 	maxCSVCellBytes          = 4096
 	maxWordTableCellBytes    = 8192
 	maxDocumentWarningLength = 512
+	// 内嵌图片也要有独立边界，避免一个文档中的大量图片把主进程内存吃满。
+	maxEmbeddedImages          = 12
+	maxEmbeddedImageBytes      = 8 << 20
+	maxEmbeddedImageTotalBytes = 24 << 20
+	maxPDFImageDimension       = 8192
+	maxPDFDecodedImageBytes    = 16 << 20
 )
 
 // Block 是一个带有稳定来源定位信息的文本块。
@@ -54,7 +64,17 @@ type Block struct {
 	Text    string
 }
 
-// Result 是一次本地解析的结果。它不包含原始二进制，只包含可安全送入模型的派生文本。
+// Image 是文档内嵌的图片。图片只在当前请求的解析管线中暂存，调用方应在
+// 完成视觉分析后丢弃 Data，不要把它写入会话历史。
+type Image struct {
+	Locator  string
+	Name     string
+	MIMEType string
+	Data     []byte
+}
+
+// Result 是一次本地解析的结果。Blocks 是正文，Images 是待交给视觉子 Agent
+// 分析的内嵌图片；两者都不改变 Artifact 中的原始文件。
 type Result struct {
 	Name      string
 	MIMEType  string
@@ -62,9 +82,11 @@ type Result struct {
 	Parsed    bool
 	Truncated bool
 	Blocks    []Block
+	Images    []Image
 	Warnings  []string
 
 	parsedBytes int
+	imageBytes  int
 }
 
 // IsDocumentAttachment 判断一个附件是否应该进入文档解析路径。
@@ -277,6 +299,9 @@ func (r Result) Render(query string, maxBytes int) (string, bool) {
 	if len(r.Blocks) == 0 {
 		complete = complete && write("[正文] 未提取到可用文本。\n")
 	}
+	if len(r.Images) > 0 && complete {
+		complete = write(fmt.Sprintf("[图片] 已提取 %d 个内嵌图片，等待视觉子 Agent 分析。\n", len(r.Images)))
+	}
 	for _, warning := range r.Warnings {
 		if !complete {
 			break
@@ -411,6 +436,40 @@ func (r *Result) addBlock(locator, text string) {
 	}
 }
 
+func (r *Result) addImage(locator, name, mimeType string, data []byte) {
+	if r == nil || len(data) == 0 {
+		return
+	}
+	if len(r.Images) >= maxEmbeddedImages {
+		r.Truncated = true
+		r.addWarning(fmt.Sprintf("内嵌图片超过 %d 个，仅保留前面的图片", maxEmbeddedImages))
+		return
+	}
+	if len(data) > maxEmbeddedImageBytes {
+		r.Truncated = true
+		r.addWarning(fmt.Sprintf("内嵌图片 %s 超过 %d MB，已跳过", displayName(name), maxEmbeddedImageBytes>>20))
+		return
+	}
+	if r.imageBytes+len(data) > maxEmbeddedImageTotalBytes {
+		r.Truncated = true
+		r.addWarning(fmt.Sprintf("内嵌图片总大小超过 %d MB，仅保留前面的图片", maxEmbeddedImageTotalBytes>>20))
+		return
+	}
+	mimeType = normalizeMIME(mimeType)
+	if !strings.HasPrefix(mimeType, "image/") {
+		r.addWarning(fmt.Sprintf("内嵌图片 %s 类型无法识别，已跳过", displayName(name)))
+		return
+	}
+	copyData := append([]byte(nil), data...)
+	r.Images = append(r.Images, Image{
+		Locator:  displayName(locator),
+		Name:     displayName(name),
+		MIMEType: mimeType,
+		Data:     copyData,
+	})
+	r.imageBytes += len(copyData)
+}
+
 func cleanExtractedText(value string) string {
 	value = strings.ReplaceAll(value, "\r\n", "\n")
 	value = strings.ReplaceAll(value, "\r", "\n")
@@ -479,6 +538,7 @@ func parsePDF(ctx context.Context, data []byte, result *Result) {
 	pageCount := reader.NumPage()
 	if pageCount <= 0 {
 		result.addWarning("PDF 没有可读取的页面")
+		extractPDFImages(ctx, data, result)
 		return
 	}
 	if pageCount > maxPDFPages {
@@ -506,9 +566,406 @@ func parsePDF(ctx context.Context, data []byte, result *Result) {
 		}
 		result.addBlock(fmt.Sprintf("PDF 第 %d 页", pageNumber), text)
 	}
+	extractPDFImages(ctx, data, result)
 	if len(result.Blocks) == 0 {
 		result.addWarning("PDF 没有提取到文本，可能是扫描件；当前解析层尚未执行 OCR")
 	}
+}
+
+// extractPDFImages 读取常见 PDF Image XObject。它不依赖外部命令，也不执行 PDF
+// 中的脚本；JPEG/JPEG2000 保留原始编码，Flate 图像转成 PNG 后再交给视觉模型。
+func extractPDFImages(ctx context.Context, data []byte, result *Result) {
+	if result == nil {
+		return
+	}
+	offset := 0
+	imageNumber := 0
+	for offset < len(data) {
+		if err := ctx.Err(); err != nil {
+			result.addWarning("PDF 内嵌图片解析被取消")
+			return
+		}
+		relative := bytes.Index(data[offset:], []byte("/Subtype"))
+		if relative < 0 {
+			break
+		}
+		subtypePosition := offset + relative
+		dictionaryStart := bytes.LastIndex(data[:subtypePosition], []byte("<<"))
+		if dictionaryStart < 0 {
+			offset = subtypePosition + len("/Subtype")
+			continue
+		}
+		dictionaryRelativeEnd := bytes.Index(data[subtypePosition:], []byte(">>"))
+		if dictionaryRelativeEnd < 0 {
+			break
+		}
+		dictionaryEnd := subtypePosition + dictionaryRelativeEnd + 2
+		dictionary := data[dictionaryStart:dictionaryEnd]
+		if !pdfDictionaryHasName(dictionary, "/Subtype", "Image") || pdfDictionaryInt(dictionary, "/Width") <= 0 || pdfDictionaryInt(dictionary, "/Height") <= 0 {
+			offset = subtypePosition + len("/Subtype")
+			continue
+		}
+		streamPosition := pdfKeywordPosition(data, dictionaryEnd, "stream")
+		if streamPosition < 0 {
+			offset = dictionaryEnd
+			continue
+		}
+		payloadStart := skipPDFWhitespace(data, streamPosition+len("stream"))
+		payloadEnd := -1
+		if length := pdfDictionaryInt(dictionary, "/Length"); length >= 0 && length <= len(data)-payloadStart {
+			payloadEnd = payloadStart + length
+		} else if endRelative := bytes.Index(data[payloadStart:], []byte("endstream")); endRelative >= 0 {
+			payloadEnd = payloadStart + endRelative
+		}
+		if payloadEnd < payloadStart || payloadEnd > len(data) {
+			result.addWarning("PDF 内嵌图片数据边界无法确认，已跳过")
+			offset = streamPosition + len("stream")
+			continue
+		}
+		imageNumber++
+		imageData, mimeType, decodeErr := decodePDFImage(dictionary, data[payloadStart:payloadEnd])
+		if decodeErr != nil {
+			result.addWarning(fmt.Sprintf("PDF 图片 %d 解析失败：%s", imageNumber, decodeErr.Error()))
+		} else {
+			result.addImage(fmt.Sprintf("PDF 图片 %d", imageNumber), pdfImageName(imageNumber, mimeType), mimeType, imageData)
+		}
+		offset = payloadEnd
+	}
+}
+
+func pdfImageName(number int, mimeType string) string {
+	extension := ".bin"
+	switch normalizeMIME(mimeType) {
+	case "image/jpeg":
+		extension = ".jpg"
+	case "image/jp2":
+		extension = ".jp2"
+	case "image/png":
+		extension = ".png"
+	}
+	return fmt.Sprintf("pdf-image-%d%s", number, extension)
+}
+
+func pdfKeywordPosition(data []byte, start int, keyword string) int {
+	if start < 0 {
+		start = 0
+	}
+	for start < len(data) {
+		relative := bytes.Index(data[start:], []byte(keyword))
+		if relative < 0 {
+			return -1
+		}
+		position := start + relative
+		if pdfTokenBoundary(data, position, len(keyword)) {
+			return position
+		}
+		start = position + len(keyword)
+	}
+	return -1
+}
+
+func pdfTokenBoundary(data []byte, position, length int) bool {
+	if position < 0 || position+length > len(data) {
+		return false
+	}
+	isToken := func(value byte) bool {
+		return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
+	}
+	if position > 0 && isToken(data[position-1]) {
+		return false
+	}
+	return position+length == len(data) || !isToken(data[position+length])
+}
+
+func skipPDFWhitespace(data []byte, position int) int {
+	for position < len(data) {
+		switch data[position] {
+		case 0, '\t', '\n', '\f', '\r', ' ':
+			position++
+		default:
+			return position
+		}
+	}
+	return position
+}
+
+func pdfDictionaryHasName(dictionary []byte, key, expected string) bool {
+	return pdfDictionaryName(dictionary, key) == "/"+expected
+}
+
+func pdfDictionaryName(dictionary []byte, key string) string {
+	position := bytes.Index(dictionary, []byte(key))
+	for position >= 0 {
+		if (position == 0 || !isPDFNameByte(dictionary[position-1])) && pdfTokenBoundary(dictionary, position, len(key)) {
+			cursor := skipPDFWhitespace(dictionary, position+len(key))
+			if cursor < len(dictionary) && dictionary[cursor] == '/' {
+				end := cursor + 1
+				for end < len(dictionary) && isPDFNameByte(dictionary[end]) {
+					end++
+				}
+				return string(dictionary[cursor:end])
+			}
+		}
+		next := position + len(key)
+		if next >= len(dictionary) {
+			return ""
+		}
+		relative := bytes.Index(dictionary[next:], []byte(key))
+		if relative < 0 {
+			return ""
+		}
+		position = next + relative
+	}
+	return ""
+}
+
+func pdfDictionaryInt(dictionary []byte, key string) int {
+	position := bytes.Index(dictionary, []byte(key))
+	for position >= 0 {
+		if (position == 0 || !isPDFNameByte(dictionary[position-1])) && pdfTokenBoundary(dictionary, position, len(key)) {
+			cursor := skipPDFWhitespace(dictionary, position+len(key))
+			sign := 1
+			if cursor < len(dictionary) && dictionary[cursor] == '-' {
+				sign = -1
+				cursor++
+			}
+			start := cursor
+			value := 0
+			for cursor < len(dictionary) && dictionary[cursor] >= '0' && dictionary[cursor] <= '9' {
+				value = value*10 + int(dictionary[cursor]-'0')
+				cursor++
+			}
+			if cursor > start {
+				return sign * value
+			}
+		}
+		next := position + len(key)
+		if next >= len(dictionary) {
+			return -1
+		}
+		relative := bytes.Index(dictionary[next:], []byte(key))
+		if relative < 0 {
+			return -1
+		}
+		position = next + relative
+	}
+	return -1
+}
+
+func isPDFNameByte(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || value == '#' || value == '_'
+}
+
+func pdfDictionaryFilter(dictionary []byte) string {
+	position := bytes.Index(dictionary, []byte("/Filter"))
+	if position < 0 {
+		return ""
+	}
+	cursor := skipPDFWhitespace(dictionary, position+len("/Filter"))
+	if cursor >= len(dictionary) {
+		return ""
+	}
+	if dictionary[cursor] == '[' {
+		cursor++
+		cursor = skipPDFWhitespace(dictionary, cursor)
+	}
+	if cursor >= len(dictionary) || dictionary[cursor] != '/' {
+		return ""
+	}
+	end := cursor + 1
+	for end < len(dictionary) && isPDFNameByte(dictionary[end]) {
+		end++
+	}
+	return string(dictionary[cursor:end])
+}
+
+func decodePDFImage(dictionary, payload []byte) ([]byte, string, error) {
+	filter := pdfDictionaryFilter(dictionary)
+	switch filter {
+	case "/DCTDecode", "/DCT":
+		return append([]byte(nil), payload...), "image/jpeg", nil
+	case "/JPXDecode":
+		return append([]byte(nil), payload...), "image/jp2", nil
+	case "", "/FlateDecode", "/Fl":
+		decoded := payload
+		if filter != "" {
+			reader, err := zlib.NewReader(bytes.NewReader(payload))
+			if err != nil {
+				return nil, "", fmt.Errorf("Flate 解压失败：%w", err)
+			}
+			decoded, err = io.ReadAll(io.LimitReader(reader, maxPDFDecodedImageBytes+1))
+			closeErr := reader.Close()
+			if err != nil {
+				return nil, "", fmt.Errorf("Flate 读取失败：%w", err)
+			}
+			if closeErr != nil {
+				return nil, "", fmt.Errorf("Flate 关闭失败：%w", closeErr)
+			}
+			if len(decoded) > maxPDFDecodedImageBytes {
+				return nil, "", fmt.Errorf("解压后超过 %d MB", maxPDFDecodedImageBytes>>20)
+			}
+		}
+		return encodePDFFlateImage(dictionary, decoded)
+	default:
+		return nil, "", fmt.Errorf("暂不支持过滤器 %s", filter)
+	}
+}
+
+func encodePDFFlateImage(dictionary, decoded []byte) ([]byte, string, error) {
+	width := pdfDictionaryInt(dictionary, "/Width")
+	height := pdfDictionaryInt(dictionary, "/Height")
+	if width <= 0 || height <= 0 || width > maxPDFImageDimension || height > maxPDFImageDimension {
+		return nil, "", errors.New("图片尺寸无效或超过限制")
+	}
+	bits := pdfDictionaryInt(dictionary, "/BitsPerComponent")
+	if bits <= 0 {
+		bits = 8
+	}
+	if bits != 8 {
+		return nil, "", fmt.Errorf("暂不支持 %d bit 图片", bits)
+	}
+	colors := 0
+	switch pdfDictionaryName(dictionary, "/ColorSpace") {
+	case "/DeviceGray":
+		colors = 1
+	case "/DeviceRGB":
+		colors = 3
+	default:
+		return nil, "", errors.New("暂不支持该颜色空间")
+	}
+	rowBytes64 := int64(width) * int64(colors)
+	totalBytes64 := rowBytes64 * int64(height)
+	if rowBytes64 <= 0 || totalBytes64 <= 0 || totalBytes64 > maxPDFDecodedImageBytes {
+		return nil, "", fmt.Errorf("解码后的图片超过 %d MB", maxPDFDecodedImageBytes>>20)
+	}
+	rowBytes := int(rowBytes64)
+	totalBytes := int(totalBytes64)
+	predictor := pdfDictionaryInt(dictionary, "/Predictor")
+	if predictor > 1 {
+		var err error
+		decoded, err = decodePDFPredictor(decoded, width, height, colors, predictor, rowBytes)
+		if err != nil {
+			return nil, "", err
+		}
+	} else if len(decoded) < totalBytes {
+		return nil, "", errors.New("解码后的像素数据不足")
+	} else {
+		decoded = decoded[:totalBytes]
+	}
+
+	var encoded bytes.Buffer
+	if colors == 1 {
+		picture := image.NewGray(image.Rect(0, 0, width, height))
+		for row := 0; row < height; row++ {
+			copy(picture.Pix[row*picture.Stride:row*picture.Stride+rowBytes], decoded[row*rowBytes:(row+1)*rowBytes])
+		}
+		if err := png.Encode(&encoded, picture); err != nil {
+			return nil, "", fmt.Errorf("PNG 编码失败：%w", err)
+		}
+	} else {
+		picture := image.NewRGBA(image.Rect(0, 0, width, height))
+		for row := 0; row < height; row++ {
+			for column := 0; column < width; column++ {
+				source := row*rowBytes + column*3
+				target := row*picture.Stride + column*4
+				picture.Pix[target] = decoded[source]
+				picture.Pix[target+1] = decoded[source+1]
+				picture.Pix[target+2] = decoded[source+2]
+				picture.Pix[target+3] = 0xff
+			}
+		}
+		if err := png.Encode(&encoded, picture); err != nil {
+			return nil, "", fmt.Errorf("PNG 编码失败：%w", err)
+		}
+	}
+	return encoded.Bytes(), "image/png", nil
+}
+
+func decodePDFPredictor(data []byte, width, height, colors, predictor, rowBytes int) ([]byte, error) {
+	if predictor == 2 {
+		needed := rowBytes * height
+		if len(data) < needed {
+			return nil, errors.New("TIFF 预测器数据不足")
+		}
+		output := append([]byte(nil), data[:needed]...)
+		for row := 0; row < height; row++ {
+			start := row * rowBytes
+			for index := colors; index < rowBytes; index++ {
+				output[start+index] += output[start+index-colors]
+			}
+		}
+		return output, nil
+	}
+	if predictor < 10 || predictor > 15 {
+		return nil, fmt.Errorf("暂不支持预测器 %d", predictor)
+	}
+	encodedRowBytes := rowBytes + 1
+	needed := encodedRowBytes * height
+	if len(data) < needed {
+		return nil, errors.New("PNG 预测器数据不足")
+	}
+	output := make([]byte, rowBytes*height)
+	for row := 0; row < height; row++ {
+		encodedStart := row * encodedRowBytes
+		filter := int(data[encodedStart])
+		if predictor != 15 {
+			filter = predictor - 10
+		}
+		if filter < 0 || filter > 4 {
+			return nil, fmt.Errorf("PNG 预测器行过滤器 %d 无效", filter)
+		}
+		for column := 0; column < rowBytes; column++ {
+			value := data[encodedStart+1+column]
+			left := byte(0)
+			if column >= colors {
+				left = output[row*rowBytes+column-colors]
+			}
+			up := byte(0)
+			if row > 0 {
+				up = output[(row-1)*rowBytes+column]
+			}
+			upLeft := byte(0)
+			if row > 0 && column >= colors {
+				upLeft = output[(row-1)*rowBytes+column-colors]
+			}
+			switch filter {
+			case 0:
+			case 1:
+				value += left
+			case 2:
+				value += up
+			case 3:
+				value += byte((int(left) + int(up)) / 2)
+			case 4:
+				value += pdfPaeth(left, up, upLeft)
+			}
+			output[row*rowBytes+column] = value
+		}
+	}
+	return output, nil
+}
+
+func pdfPaeth(left, up, upLeft byte) byte {
+	p := int(left) + int(up) - int(upLeft)
+	pa := p - int(left)
+	if pa < 0 {
+		pa = -pa
+	}
+	pb := p - int(up)
+	if pb < 0 {
+		pb = -pb
+	}
+	pc := p - int(upLeft)
+	if pc < 0 {
+		pc = -pc
+	}
+	if pa <= pb && pa <= pc {
+		return left
+	}
+	if pb <= pc {
+		return up
+	}
+	return upLeft
 }
 
 func suspiciousPDFText(value string) bool {
@@ -551,6 +1008,7 @@ func parseDOCX(ctx context.Context, data []byte, result *Result) {
 			members = append(members, member{file: file, source: "Word 页脚 " + filepath.Base(name)})
 		}
 	}
+	extractOOXMLImages(ctx, archive, "word/media/", "Word 图片", result)
 	sort.SliceStable(members, func(i, j int) bool { return members[i].file.Name < members[j].file.Name })
 	if len(members) == 0 {
 		result.addWarning("DOCX/ DOCM 中没有找到可读取的正文 XML")
@@ -607,6 +1065,78 @@ func readZipMember(file *zip.File) ([]byte, error) {
 		return nil, fmt.Errorf("ZIP 部件解压后超过 %d MB", maxOOXMLMemberBytes>>20)
 	}
 	return data, nil
+}
+
+func extractOOXMLImages(ctx context.Context, archive *zip.Reader, prefix, locatorPrefix string, result *Result) {
+	if archive == nil || result == nil {
+		return
+	}
+	files := make([]*zip.File, 0)
+	for _, file := range archive.File {
+		name := strings.ReplaceAll(file.Name, "\\", "/")
+		if strings.HasPrefix(name, prefix) && !strings.HasSuffix(name, "/") {
+			files = append(files, file)
+		}
+	}
+	sort.SliceStable(files, func(i, j int) bool { return files[i].Name < files[j].Name })
+	for index, file := range files {
+		if err := ctx.Err(); err != nil {
+			result.addWarning("文档内嵌图片解析被取消")
+			return
+		}
+		name := filepath.Base(strings.ReplaceAll(file.Name, "\\", "/"))
+		data, err := readZipMember(file)
+		if err != nil {
+			result.addWarning(fmt.Sprintf("内嵌图片 %s 读取失败：%s", displayName(name), err.Error()))
+			continue
+		}
+		mimeType := detectImageMIME(name, data)
+		if mimeType == "" {
+			result.addWarning(fmt.Sprintf("内嵌图片 %s 类型无法识别，已跳过", displayName(name)))
+			continue
+		}
+		result.addImage(fmt.Sprintf("%s %d", locatorPrefix, index+1), name, mimeType, data)
+	}
+}
+
+func detectImageMIME(name string, data []byte) string {
+	if len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
+		return "image/png"
+	}
+	if len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff {
+		return "image/jpeg"
+	}
+	if len(data) >= 6 && (bytes.Equal(data[:6], []byte("GIF87a")) || bytes.Equal(data[:6], []byte("GIF89a"))) {
+		return "image/gif"
+	}
+	if len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")) {
+		return "image/webp"
+	}
+	if len(data) >= 2 && bytes.Equal(data[:2], []byte("BM")) {
+		return "image/bmp"
+	}
+	if len(data) >= 4 && (bytes.Equal(data[:4], []byte{'I', 'I', '*', 0}) || bytes.Equal(data[:4], []byte{'M', 'M', 0, '*'})) {
+		return "image/tiff"
+	}
+
+	switch strings.ToLower(filepath.Ext(strings.TrimSpace(name))) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".bmp":
+		return "image/bmp"
+	case ".tif", ".tiff":
+		return "image/tiff"
+	case ".jp2", ".j2k", ".jpf", ".jpx":
+		return "image/jp2"
+	default:
+		return ""
+	}
 }
 
 func parseWordXML(ctx context.Context, data []byte, source string, result *Result) error {
@@ -736,6 +1266,11 @@ func parseWordXML(ctx context.Context, data []byte, source string, result *Resul
 }
 
 func parseXLSX(ctx context.Context, data []byte, result *Result) {
+	if archive, archiveErr := zip.NewReader(bytes.NewReader(data), int64(len(data))); archiveErr == nil {
+		extractOOXMLImages(ctx, archive, "xl/media/", "Excel 图片", result)
+	} else {
+		result.addWarning("Excel 内嵌图片目录读取失败：" + archiveErr.Error())
+	}
 	// Excelize 只读取工作表值，限制 ZIP 解压大小，并且不执行宏或公式。
 	workbook, err := excelize.OpenReader(bytes.NewReader(data), excelize.Options{
 		RawCellValue:      true,

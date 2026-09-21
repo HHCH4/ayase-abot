@@ -70,6 +70,19 @@ export async function readConversationMessages(userID: string, conversationID: s
   return result.messages || []
 }
 
+// 管理台对话操作仍复用正式会话接口，确保归档、恢复和物理删除与聊天页保持同一套生命周期规则。
+export async function archiveStoredConversation(userID: string, conversationID: string): Promise<Conversation> {
+  return request<Conversation>(`/api/v1/conversations/${encodeURIComponent(conversationID)}/archive?user_id=${encodeURIComponent(userID)}`, { method: 'POST', body: '{}' })
+}
+
+export async function unarchiveStoredConversation(userID: string, conversationID: string): Promise<Conversation> {
+  return request<Conversation>(`/api/v1/conversations/${encodeURIComponent(conversationID)}/unarchive?user_id=${encodeURIComponent(userID)}`, { method: 'POST', body: '{}' })
+}
+
+export async function deleteStoredConversation(userID: string, conversationID: string): Promise<void> {
+  await request<void>(`/api/v1/conversations/${encodeURIComponent(conversationID)}?user_id=${encodeURIComponent(userID)}`, { method: 'DELETE' })
+}
+
 export async function readConversationContext(userID: string, conversationID: string): Promise<ConversationContextStatus> {
   return request<ConversationContextStatus>(`/api/v1/conversations/${encodeURIComponent(conversationID)}/context?user_id=${encodeURIComponent(userID)}`)
 }

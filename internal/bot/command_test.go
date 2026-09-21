@@ -247,12 +247,12 @@ func TestCommandPermissionMatrixAndPrivateMapping(t *testing.T) {
 		t.Fatalf("权限拒绝必须写入审计: %+v", audits)
 	}
 
-	// 私聊映射：group_admin 级收紧为 global_admin，非管理员无法执行。
+	// 私聊映射：会话级指令允许普通私聊用户使用，但群聊仍保持群管理员边界。
 	if err := manager.handleMessage(ctx, privateMessage("member", "/new")); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(platform.lastSent(), "全局管理员") {
-		t.Fatalf("私聊中 group_admin 级必须收紧为全局管理员: %q", platform.lastSent())
+	if !strings.Contains(platform.lastSent(), "已新建会话") {
+		t.Fatalf("私聊普通用户应可执行 /new: %q", platform.lastSent())
 	}
 	// 全局管理员在私聊中放行。
 	if err := manager.handleMessage(ctx, privateMessage("global-user", "/status")); err != nil {

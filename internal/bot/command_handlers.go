@@ -731,6 +731,8 @@ func permissionLabel(permission Permission) string {
 	switch permission {
 	case PermissionEveryone:
 		return "所有人"
+	case PermissionPrivateUser:
+		return "私聊用户 / 群管理员"
 	case PermissionGroupAdmin:
 		return "群管理员"
 	case PermissionGlobalAdmin:

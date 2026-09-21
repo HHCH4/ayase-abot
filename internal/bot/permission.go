@@ -91,8 +91,16 @@ type EffectiveCommand struct {
 // A private chat has no group to administer, so the group level is tightened
 // rather than relaxed.
 func requiredPermissionInChat(required Permission, isGroup bool) Permission {
-	if !isGroup && required == PermissionGroupAdmin {
-		return PermissionGlobalAdmin
+	switch required {
+	case PermissionPrivateUser:
+		if isGroup {
+			return PermissionGroupAdmin
+		}
+		return PermissionEveryone
+	case PermissionGroupAdmin:
+		if !isGroup {
+			return PermissionGlobalAdmin
+		}
 	}
 	return required
 }

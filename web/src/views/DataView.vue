@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { NButton, NCard, NEmpty, NInput, NModal, NSelect, NSpace, NTabPane, NTag, NTabs, useMessage } from 'naive-ui'
-import { openDataLogStream, readConversationMessages, readDataConversations, readDataTraces, readDashboardStats, readInvocationTrace } from '@/api'
+import { archiveStoredConversation, deleteStoredConversation, openDataLogStream, readConversationMessages, readDataConversations, readDataTraces, readDashboardStats, readInvocationTrace, unarchiveStoredConversation } from '@/api'
 import type { Conversation, ConversationMessage, DashboardStats, DataLogEntry, InvocationTrace } from '@/types'
 
 const message = useMessage()
@@ -28,6 +28,11 @@ let closeLogStream: (() => void) | undefined
 let logStreamGeneration = 0
 const logLevels = ['DEBUG', 'INFO', 'WARN', 'ERROR', 'CRITICAL']
 const selectedLogLevels = ref([...logLevels])
+const displayTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '本地时区'
+const localDateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+})
 
 const visibleLogs = computed(() => logs.value.filter((item) => selectedLogLevels.value.includes(item.level.toUpperCase())))
 
@@ -67,6 +72,50 @@ async function openConversation(item: Conversation) {
     message.error(error instanceof Error ? error.message : '读取会话消息失败')
   } finally {
     conversationDetailLoading.value = false
+  }
+}
+
+// 归档只改变会话状态，保留对话、追踪和附件，便于后续恢复查看。
+async function archiveDataConversation(item: Conversation) {
+  if (item.status !== 'active') return
+  try {
+    const updated = await archiveStoredConversation(item.user_id, item.id)
+    if (selectedConversation.value?.id === item.id) selectedConversation.value = updated
+    await load()
+    message.success('对话已归档')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '归档对话失败')
+  }
+}
+
+// 恢复只允许归档会话执行，恢复后消息和关联追踪仍保持不变。
+async function unarchiveDataConversation(item: Conversation) {
+  if (item.status !== 'archived') return
+  try {
+    const updated = await unarchiveStoredConversation(item.user_id, item.id)
+    if (selectedConversation.value?.id === item.id) selectedConversation.value = updated
+    await load()
+    message.success('对话已恢复')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '恢复对话失败')
+  }
+}
+
+// 删除会物理清理消息、附件、Runtime 追踪、工作区记录和长期记忆，执行前明确提示不可恢复。
+async function deleteDataConversation(item: Conversation) {
+  if (item.status !== 'archived') return
+  if (!window.confirm(`彻底删除“${item.title || item.id}”及其全部关联数据？此操作不可恢复。`)) return
+  try {
+    await deleteStoredConversation(item.user_id, item.id)
+    if (selectedConversation.value?.id === item.id) {
+      selectedConversation.value = null
+      conversationMessages.value = []
+      conversationDetailVisible.value = false
+    }
+    await load()
+    message.success('对话及关联数据已删除')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '删除对话失败')
   }
 }
 
@@ -118,11 +167,17 @@ function toggleLogLevel(level: string) {
   void nextTick(scrollLogsToBottom)
 }
 
-function formatLogTimestamp(value?: string) {
+function formatLocalDateTime(value?: string, milliseconds = false) {
   if (!value) return '未知时间'
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
-  return date.toISOString().replace('T', ' ').replace('Z', '')
+  const text = localDateTimeFormatter.format(date).replaceAll('/', '-')
+  if (!milliseconds) return text
+  return `${text}.${String(date.getMilliseconds()).padStart(3, '0')}`
+}
+
+function formatLogTimestamp(value?: string) {
+  return formatLocalDateTime(value, true)
 }
 
 function formatLogLine(item: DataLogEntry) {
@@ -165,7 +220,38 @@ async function openTrace(item: Record<string, unknown>) {
 }
 
 function formatTime(value?: string) {
-  return value ? new Date(value).toLocaleString() : '未知时间'
+  return formatLocalDateTime(value)
+}
+
+function conversationContext(item: Conversation) {
+  const parts = (item.source || '').split(':')
+  const sourceType = parts[1] || ''
+  let chatType = item.chat_type || ''
+  if (!chatType) {
+    if (sourceType === 'FriendMessage') chatType = 'private'
+    else if (sourceType === 'GroupMessage') chatType = 'group'
+    else if (sourceType) chatType = 'other'
+  }
+  return {
+    platform: item.platform || parts[0] || 'WebUI',
+    chatType,
+    chatID: item.chat_id || parts.slice(2).join(':') || '',
+  }
+}
+
+function conversationChatTypeLabel(item: Conversation) {
+  const value = conversationContext(item).chatType
+  if (value === 'private') return '私聊'
+  if (value === 'group') return '群聊'
+  if (value === 'other') return '其他会话'
+  return 'WebUI 对话'
+}
+
+function conversationChatTypeTag(item: Conversation) {
+  const value = conversationContext(item).chatType
+  if (value === 'group') return 'info'
+  if (value === 'private') return 'success'
+  return 'default'
 }
 
 function formatNumber(value?: number) {
@@ -234,8 +320,8 @@ watch(autoScrollLogs, () => {
           </NCard>
         </div>
         <div v-if="stats" class="data-two-column">
-          <NCard class="detail-card" :bordered="false">
-            <div class="section-heading-row"><div><h3>消息趋势</h3><p>按 UTC 日期统计已创建的内置 Agent 调用。</p></div><NTag size="small" :bordered="false">{{ stats.range_days }} 天</NTag></div>
+            <NCard class="detail-card" :bordered="false">
+            <div class="section-heading-row"><div><h3>消息趋势</h3><p>统计按 UTC 日期归档，明细时间按浏览器本地时区展示。</p></div><NTag size="small" :bordered="false">{{ stats.range_days }} 天</NTag></div>
             <div class="trend-list">
               <div v-for="item in stats.message_trend" :key="item.date" class="trend-row">
                 <span>{{ item.date }}</span><div class="trend-track"><i :style="{ width: `${item.messages / trendMax * 100}%` }" /></div><strong>{{ item.messages }}</strong>
@@ -255,7 +341,7 @@ watch(autoScrollLogs, () => {
 
       <NTabPane name="conversations" tab="对话">
         <div class="data-toolbar"><NInput v-model:value="conversationQuery" clearable placeholder="搜索标题、来源或对话 ID" /><NSelect v-model:value="conversationStatus" :options="statusOptions" style="width: 140px" /></div>
-        <div v-if="conversations.length" class="data-table-wrap"><table class="data-table"><thead><tr><th>标题 / 来源</th><th>用户</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody><tr v-for="item in conversations" :key="item.id"><td><strong>{{ item.title || '未命名对话' }}</strong><code>{{ item.source_name || item.source || item.id }}</code></td><td>{{ item.user_id }}</td><td><NTag size="small" :bordered="false">{{ item.status === 'active' ? '进行中' : '已归档' }}</NTag></td><td>{{ formatTime(item.updated_at || item.created_at) }}</td><td><NButton size="small" secondary @click="openConversation(item)">查看对话</NButton></td></tr></tbody></table></div>
+        <div v-if="conversations.length" class="data-table-wrap"><table class="data-table"><thead><tr><th>标题 / 来源</th><th>平台 / 会话类型</th><th>用户</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody><tr v-for="item in conversations" :key="item.id"><td><strong>{{ item.title || '未命名对话' }}</strong><code>{{ item.source_name || item.source || item.id }}</code></td><td><NSpace size="small" align="center"><NTag size="small" :bordered="false" :type="conversationChatTypeTag(item)">{{ conversationChatTypeLabel(item) }}</NTag><span>{{ conversationContext(item).platform }}</span></NSpace><code v-if="conversationContext(item).chatID">会话：{{ conversationContext(item).chatID }}</code></td><td>{{ item.user_id }}</td><td><NTag size="small" :bordered="false">{{ item.status === 'active' ? '进行中' : '已归档' }}</NTag></td><td>{{ formatTime(item.updated_at || item.created_at) }}</td><td><NSpace size="small"><NButton size="small" secondary @click="openConversation(item)">查看对话</NButton><NButton v-if="item.status === 'active'" size="small" secondary @click="archiveDataConversation(item)">归档</NButton><NButton v-else size="small" secondary @click="unarchiveDataConversation(item)">恢复</NButton><NButton v-if="item.status === 'archived'" size="small" tertiary type="error" @click="deleteDataConversation(item)">删除</NButton></NSpace></td></tr></tbody></table></div>
         <NEmpty v-else description="暂无匹配对话" />
       </NTabPane>
 
@@ -293,7 +379,11 @@ watch(autoScrollLogs, () => {
     <NModal v-model:show="conversationDetailVisible" preset="card" :mask-closable="false" style="width: min(860px, calc(100vw - 32px))" :title="selectedConversation?.title || '对话详情'">
       <div class="conversation-detail-meta">
         <code>{{ selectedConversation?.source_name || selectedConversation?.source || selectedConversation?.id }}</code>
+        <NTag v-if="selectedConversation" size="small" :bordered="false" :type="conversationChatTypeTag(selectedConversation)">{{ conversationChatTypeLabel(selectedConversation) }}</NTag>
+        <span v-if="selectedConversation">平台：{{ conversationContext(selectedConversation).platform }}</span>
+        <span v-if="selectedConversation && conversationContext(selectedConversation).chatID">会话：{{ conversationContext(selectedConversation).chatID }}</span>
         <span>{{ selectedConversation?.user_id }}</span>
+        <span class="muted">时间：{{ displayTimeZone }}</span>
       </div>
       <div v-if="conversationDetailLoading" class="conversation-detail-loading">正在读取会话消息…</div>
       <div v-else-if="conversationMessages.length" class="message-panel conversation-detail-panel">
@@ -307,6 +397,11 @@ watch(autoScrollLogs, () => {
         </div>
       </div>
       <NEmpty v-else description="这个会话暂无可展示消息" />
+      <NSpace v-if="selectedConversation" justify="end" style="margin-top: 18px">
+        <NButton v-if="selectedConversation.status === 'active'" secondary @click="archiveDataConversation(selectedConversation)">归档</NButton>
+        <NButton v-else secondary @click="unarchiveDataConversation(selectedConversation)">恢复</NButton>
+        <NButton v-if="selectedConversation.status === 'archived'" tertiary type="error" @click="deleteDataConversation(selectedConversation)">删除对话及关联数据</NButton>
+      </NSpace>
     </NModal>
   </div>
 </template>

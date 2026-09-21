@@ -19,6 +19,7 @@ const search = ref('')
 
 const permissionOptions = [
   { label: '所有人', value: 'everyone' },
+  { label: '私聊用户 / 群管理员', value: 'private_user' },
   { label: '群管理员', value: 'group_admin' },
   { label: '全局管理员', value: 'global_admin' },
 ]

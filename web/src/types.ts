@@ -189,6 +189,9 @@ export interface Conversation {
   user_id: string
   source?: string
   source_name?: string
+  platform?: string
+  chat_type?: 'private' | 'group' | 'other' | string
+  chat_id?: string
   workspace_id?: string
   title: string
   status: 'active' | 'archived' | string

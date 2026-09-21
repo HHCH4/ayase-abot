@@ -152,7 +152,7 @@ func (s *Server) dataConversations(writer http.ResponseWriter, request *http.Req
 		if status != "" && string(item.Status) != status {
 			continue
 		}
-		searchable := strings.ToLower(strings.Join([]string{item.Title, item.ID, item.UserID, item.Source, item.SourceName}, " "))
+		searchable := strings.ToLower(strings.Join([]string{item.Title, item.ID, item.UserID, item.Source, item.SourceName, item.Platform, item.ChatType, item.ChatID}, " "))
 		if query != "" && !strings.Contains(searchable, query) {
 			continue
 		}

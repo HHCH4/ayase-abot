@@ -17,14 +17,16 @@ import (
 type Permission string
 
 const (
-	PermissionEveryone    Permission = "everyone"
+	PermissionEveryone Permission = "everyone"
+	// PermissionPrivateUser 表示私聊中的普通用户可用、群聊中仍需群管理员。
+	PermissionPrivateUser Permission = "private_user"
 	PermissionGroupAdmin  Permission = "group_admin"
 	PermissionGlobalAdmin Permission = "global_admin"
 )
 
 func validPermission(value Permission) bool {
 	switch value {
-	case PermissionEveryone, PermissionGroupAdmin, PermissionGlobalAdmin:
+	case PermissionEveryone, PermissionPrivateUser, PermissionGroupAdmin, PermissionGlobalAdmin:
 		return true
 	default:
 		return false
@@ -37,6 +39,9 @@ func PermissionRank(value Permission) int {
 	switch value {
 	case PermissionEveryone:
 		return 0
+	case PermissionPrivateUser:
+		// 该级别在群聊中等价于群管理员，排序时与其保持同级。
+		return 1
 	case PermissionGroupAdmin:
 		return 1
 	case PermissionGlobalAdmin:
@@ -293,15 +298,15 @@ func builtinCommandDescriptors() []CommandDescriptor {
 		{ID: "sid", Name: "sid", Category: CategoryInfo, Description: "显示当前消息来源与会话标识", DefaultPermission: PermissionEveryone, Scope: ScopeChat, DefaultEnabled: true},
 		{ID: "name", Name: "name", Category: CategoryInfo, Description: "设置当前消息来源的显示名称", DefaultPermission: PermissionGlobalAdmin, Scope: ScopeBot, DefaultEnabled: true},
 		{ID: "status", Name: "status", Category: CategoryInfo, Description: "查看当前会话与任务状态", DefaultPermission: PermissionEveryone, Scope: ScopeChat, DefaultEnabled: true},
-		{ID: "config", Name: "config", Category: CategoryInfo, Description: "查看当前生效配置", DefaultPermission: PermissionGroupAdmin, Scope: ScopeChat, DefaultEnabled: true},
-		{ID: "cancel", Name: "cancel", Category: CategoryTask, Description: "终止本会话进行中的任务", DefaultPermission: PermissionGroupAdmin, Scope: ScopeChat, DefaultEnabled: true},
+		{ID: "config", Name: "config", Category: CategoryInfo, Description: "查看当前生效配置", DefaultPermission: PermissionPrivateUser, Scope: ScopeChat, DefaultEnabled: true},
+		{ID: "cancel", Name: "cancel", Category: CategoryTask, Description: "终止本会话进行中的任务", DefaultPermission: PermissionPrivateUser, Scope: ScopeChat, DefaultEnabled: true},
 		{ID: "stop", Name: "stop", Category: CategoryTask, Description: "停止当前会话进行中的任务", DefaultPermission: PermissionEveryone, Scope: ScopeChat, DefaultEnabled: true},
-		{ID: "new", Name: "new", Category: CategorySession, Description: "归档当前会话并新建", DefaultPermission: PermissionGroupAdmin, Scope: ScopeChat, DefaultEnabled: true},
-		{ID: "reset", Name: "reset", Category: CategorySession, Description: "归档当前会话并新建", DefaultPermission: PermissionGroupAdmin, Scope: ScopeChat, DefaultEnabled: true},
+		{ID: "new", Name: "new", Category: CategorySession, Description: "归档当前会话并新建", DefaultPermission: PermissionPrivateUser, Scope: ScopeChat, DefaultEnabled: true},
+		{ID: "reset", Name: "reset", Category: CategorySession, Description: "归档当前会话并新建", DefaultPermission: PermissionPrivateUser, Scope: ScopeChat, DefaultEnabled: true},
 		{ID: "stats", Name: "stats", Category: CategoryInfo, Description: "查看当前会话 Token 用量", DefaultPermission: PermissionEveryone, Scope: ScopeSession, DefaultEnabled: true},
 		{ID: "dashboard_update", Name: "dashboard_update", Category: CategoryAdmin, Description: "检查并更新内嵌管理台资源", DefaultPermission: PermissionGlobalAdmin, Scope: ScopeBot, DefaultEnabled: true},
-		{ID: "model", Name: "model", Category: CategoryConfig, Description: "查看或切换当前会话模型", DefaultPermission: PermissionGroupAdmin, Scope: ScopeSession, DefaultEnabled: true},
-		{ID: "persona", Name: "persona", Category: CategoryConfig, Description: "查看或切换当前会话人格", DefaultPermission: PermissionGroupAdmin, Scope: ScopeSession, DefaultEnabled: true},
+		{ID: "model", Name: "model", Category: CategoryConfig, Description: "查看或切换当前会话模型", DefaultPermission: PermissionPrivateUser, Scope: ScopeSession, DefaultEnabled: true},
+		{ID: "persona", Name: "persona", Category: CategoryConfig, Description: "查看或切换当前会话人格", DefaultPermission: PermissionPrivateUser, Scope: ScopeSession, DefaultEnabled: true},
 		{ID: "workspace", Name: "workspace", Category: CategoryConfig, Description: "查看或绑定工作区", DefaultPermission: PermissionGlobalAdmin, Scope: ScopeBot, DefaultEnabled: true},
 		{ID: "admin list", Name: "admin list", Category: CategoryAdmin, Description: "列出本群管理员", DefaultPermission: PermissionGlobalAdmin, Scope: ScopeChat, DefaultEnabled: true},
 		{ID: "admin add", Name: "admin add", Category: CategoryAdmin, Description: "添加群管理员", DefaultPermission: PermissionGlobalAdmin, Scope: ScopeChat, DefaultEnabled: true},

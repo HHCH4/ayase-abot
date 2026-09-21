@@ -53,7 +53,7 @@ const sourceOptions = computed(() => {
   const options = new Map<string, { label: string; value: string }>()
   // 优先展示来源目录中的全部 UMO，让用户直接从已知会话选择。
   for (const item of sources.value) {
-    const detail = [item.platform, item.message_type, item.session_id].filter(Boolean).join(' · ')
+    const detail = [item.platform, messageTypeLabel(item.message_type), item.session_id].filter(Boolean).join(' · ')
     const name = item.source_name?.trim() || item.auto_name?.trim()
     options.set(item.source, { label: name ? `${name} · ${item.source}${detail ? `（${detail}）` : ''}` : `${item.source}${detail ? `（${detail}）` : ''}`, value: item.source })
   }
@@ -84,6 +84,13 @@ const resetFieldOptions = [
 
 function sourceLabel(item: SessionSource) {
   return item.source_name?.trim() || item.auto_name?.trim() || item.source
+}
+
+function messageTypeLabel(value?: string) {
+  if (value === 'FriendMessage') return '私聊'
+  if (value === 'GroupMessage') return '群聊'
+  if (value) return '其他会话'
+  return '未知类型'
 }
 
 function sourceStatusLabel(status: string) {
@@ -309,7 +316,7 @@ async function removeGroup(item: SessionRuleGroup) {
 
     <NCard class="detail-card" :bordered="false">
       <div class="section-heading-row"><div><h3>可配置会话</h3><p>来源目录记录所有收到过消息的 UMO，即使消息没有唤醒 AI 或只执行了内置指令，也可以直接配置。</p></div><NSpace><NInput v-model:value="sourceQuery" clearable placeholder="搜索名称、平台、Session ID" style="width: 250px" @keyup.enter="load" /><NButton secondary :loading="loading" @click="load">刷新会话</NButton></NSpace></div>
-      <div v-if="sources.length" class="data-table-wrap"><table class="data-table"><thead><tr><th class="check-column">选</th><th>会话来源</th><th>平台 / 类型</th><th>Session ID</th><th>状态</th><th>规则</th><th>最近活动</th><th>操作</th></tr></thead><tbody><tr v-for="item in sources" :key="item.source"><td class="check-column"><input v-model="selectedSources" type="checkbox" :value="item.source"></td><td><strong>{{ sourceLabel(item) }}</strong><code>{{ item.source }}</code><code v-if="item.source_name && item.auto_name">自动名称：{{ item.auto_name }}</code></td><td><span>{{ item.platform || '—' }}</span><code>{{ item.message_type || '—' }}</code></td><td><code>{{ item.session_id || '—' }}</code></td><td><NTag size="small" :bordered="false" :type="sourceStatusType(item.status)">{{ sourceStatusLabel(item.status) }}</NTag></td><td><NTag v-if="sourceRule(item.source) || item.has_rule" size="small" :bordered="false" type="info">已配置</NTag><span v-else class="muted">未配置</span></td><td>{{ formatSourceTime(item.last_seen_at || item.updated_at) }}</td><td><NButton size="small" secondary @click="openSource(item)">{{ sourceRule(item.source) ? '编辑规则' : '配置规则' }}</NButton></td></tr></tbody></table></div>
+      <div v-if="sources.length" class="data-table-wrap"><table class="data-table"><thead><tr><th class="check-column">选</th><th>会话来源</th><th>平台 / 类型</th><th>Session ID</th><th>状态</th><th>规则</th><th>最近活动</th><th>操作</th></tr></thead><tbody><tr v-for="item in sources" :key="item.source"><td class="check-column"><input v-model="selectedSources" type="checkbox" :value="item.source"></td><td><strong>{{ sourceLabel(item) }}</strong><code>{{ item.source }}</code><code v-if="item.source_name && item.auto_name">自动名称：{{ item.auto_name }}</code></td><td><span>{{ item.platform || '—' }}</span><NTag size="small" :bordered="false" :type="item.message_type === 'GroupMessage' ? 'info' : item.message_type === 'FriendMessage' ? 'success' : 'default'">{{ messageTypeLabel(item.message_type) }}</NTag></td><td><code>{{ item.session_id || '—' }}</code></td><td><NTag size="small" :bordered="false" :type="sourceStatusType(item.status)">{{ sourceStatusLabel(item.status) }}</NTag></td><td><NTag v-if="sourceRule(item.source) || item.has_rule" size="small" :bordered="false" type="info">已配置</NTag><span v-else class="muted">未配置</span></td><td>{{ formatSourceTime(item.last_seen_at || item.updated_at) }}</td><td><NButton size="small" secondary @click="openSource(item)">{{ sourceRule(item.source) ? '编辑规则' : '配置规则' }}</NButton></td></tr></tbody></table></div>
       <NEmpty v-else description="还没有可配置的会话；请先让机器人收到一条平台消息，再点击刷新" />
     </NCard>
 

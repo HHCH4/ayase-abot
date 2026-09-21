@@ -15,6 +15,9 @@ type conversationRow struct {
 	AppName     string `gorm:"index;size:100;not null"`
 	UserID      string `gorm:"index;size:300;not null"`
 	Source      string `gorm:"index;size:500"`
+	Platform    string `gorm:"index;size:100"`
+	ChatType    string `gorm:"index;size:32"`
+	ChatID      string `gorm:"index;size:300"`
 	WorkspaceID string `gorm:"index;size:64"`
 	// Per-conversation model override; empty inherits the resolved default.
 	ProviderID string `gorm:"size:100"`
@@ -124,7 +127,8 @@ func (r *conversationRepository) CountAll(ctx context.Context, includeArchived b
 
 func (r *conversationRepository) Save(ctx context.Context, item conversation.Conversation) error {
 	row := conversationRow{
-		ID: item.ID, AppName: item.AppName, UserID: item.UserID, Source: item.Source, WorkspaceID: item.WorkspaceID,
+		ID: item.ID, AppName: item.AppName, UserID: item.UserID, Source: item.Source,
+		Platform: item.Platform, ChatType: item.ChatType, ChatID: item.ChatID, WorkspaceID: item.WorkspaceID,
 		ProviderID: item.ProviderID, ModelID: item.ModelID,
 		Title: item.Title, Status: string(item.Status), ArchivedAt: item.ArchivedAt,
 		CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
@@ -152,40 +156,63 @@ func (r *conversationRepository) Delete(ctx context.Context, userID, id string) 
 		if err := tx.Where("scope = ? AND target_id = ?", "conversation", id).Delete(&configBindingRow{}).Error; err != nil {
 			return err
 		}
-		// waiting_tool 的私有恢复载荷只用于跨重启接力；会话物理删除时
-		// 必须先清理，避免因 Runtime invocation 记录保留而残留敏感响应。
-		if err := tx.Exec("DELETE FROM abot_agent_invocation_resumes WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
+		// Runtime 的所有持久化记录都通过 Invocation 关联对话；先删子表，
+		// 再删 Invocation，避免数据与日志页继续显示已删除会话的孤儿记录。
+		deleteRuntimeByInvocation := func(table string) error {
+			return tx.Exec("DELETE FROM "+table+" WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error
+		}
+		runtimeTables := []string{
+			"abot_agent_invocation_resumes",
+			"abot_agent_invocation_resume_outbox",
+			"abot_agent_worktree_baselines",
+			"abot_agent_events",
+			"abot_agent_event_outbox",
+			"abot_agent_event_delivery_inbox",
+			"abot_agent_event_delivery_transactions",
+			"abot_agent_checkpoint_delivery_inbox",
+			"abot_agent_checkpoint_delivery_outbox",
+			"abot_agent_checkpoint_delivery_transactions",
+			"abot_agent_approval_rejection_delivery_outbox",
+			"abot_agent_approval_rejection_delivery_inbox",
+			"abot_agent_approval_rejection_delivery_transactions",
+			"abot_agent_config_delivery_inbox",
+			"abot_agent_config_delivery_outbox",
+			"abot_agent_config_delivery_transactions",
+			"abot_runtime_config_directory_rebind_plans",
+			"abot_runtime_config_directory_rebind_confirmations",
+			"abot_runtime_config_directory_rebind_applies",
+			"abot_runtime_config_directory_rebind_multi_confirmations",
+			"abot_runtime_config_directory_rebind_multi_applies",
+			"abot_runtime_config_directory_rebind_inbox",
+			"abot_agent_runtime_delivery_attempts",
+			"abot_agent_runtime_delivery_groups",
+			"abot_agent_runtime_delivery_group_transactions",
+			"abot_agent_runtime_delivery_group_fences",
+			"abot_agent_runtime_delivery_group_settlements",
+			"abot_agent_runtime_delivery_group_sagas",
+			"abot_agent_runtime_delivery_compensations",
+			"abot_agent_approvals",
+			"abot_agent_tool_calls",
+			"abot_agent_task_plans",
+			"abot_agent_task_contracts",
+			"abot_agent_instruction_snapshots",
+			"abot_agent_context_manifests",
+			"abot_agent_working_sets",
+			"abot_agent_verification_runs",
+			"abot_agent_runtime_snapshots",
+			"abot_agent_toolset_snapshots",
+			"abot_agent_model_capability_snapshots",
+			"abot_agent_eval_runs",
+		}
+		for _, table := range runtimeTables {
+			if err := deleteRuntimeByInvocation(table); err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("conversation_id = ?", id).Delete(&scheduledTaskRow{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Exec("DELETE FROM abot_agent_invocation_resume_outbox WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
-			return err
-		}
-		// P1 TaskPlan 以 Invocation 关联对话；计划本身不应在对话物理删除后变成孤儿。
-		if err := tx.Exec("DELETE FROM abot_agent_task_plans WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec("DELETE FROM abot_agent_task_contracts WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec("DELETE FROM abot_agent_instruction_snapshots WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec("DELETE FROM abot_agent_context_manifests WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec("DELETE FROM abot_agent_working_sets WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec("DELETE FROM abot_agent_verification_runs WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec("DELETE FROM abot_agent_runtime_snapshots WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec("DELETE FROM abot_agent_toolset_snapshots WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec("DELETE FROM abot_agent_model_capability_snapshots WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
+		if err := tx.Exec("DELETE FROM abot_agent_invocations WHERE user_id = ? AND conversation_id = ?", userID, id).Error; err != nil {
 			return err
 		}
 		result := tx.Where("user_id = ? AND id = ?", userID, id).Delete(&conversationRow{})
@@ -201,7 +228,8 @@ func (r *conversationRepository) Delete(ctx context.Context, userID, id string) 
 
 func conversationFromRow(row conversationRow) conversation.Conversation {
 	return conversation.Conversation{
-		ID: row.ID, AppName: row.AppName, UserID: row.UserID, Source: row.Source, WorkspaceID: row.WorkspaceID,
+		ID: row.ID, AppName: row.AppName, UserID: row.UserID, Source: row.Source,
+		Platform: row.Platform, ChatType: row.ChatType, ChatID: row.ChatID, WorkspaceID: row.WorkspaceID,
 		ProviderID: row.ProviderID, ModelID: row.ModelID,
 		Title: row.Title, Status: conversation.Status(row.Status), ArchivedAt: row.ArchivedAt,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,

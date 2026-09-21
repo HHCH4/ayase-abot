@@ -37,7 +37,11 @@ type Conversation struct {
 	// Source 保存平台消息的稳定来源标识，供会话规则按 UMO 命中；普通 WebUI 对话为空。
 	Source string `json:"source,omitempty"`
 	// SourceName 是 /name 为平台来源设置的可读别名；它不改变稳定来源键。
-	SourceName  string `json:"source_name,omitempty"`
+	SourceName string `json:"source_name,omitempty"`
+	// Platform、ChatType 和 ChatID 是从平台来源恢复出的可读上下文，便于管理台明确区分私聊和群聊。
+	Platform    string `json:"platform,omitempty"`
+	ChatType    string `json:"chat_type,omitempty"`
+	ChatID      string `json:"chat_id,omitempty"`
 	WorkspaceID string `json:"workspace_id,omitempty"`
 	// ProviderID and ModelID are an optional per-conversation model override.
 	// Empty means "inherit whatever the configuration bindings resolve", so a
@@ -155,7 +159,7 @@ func (s *Service) List(ctx context.Context, userID, workspaceID string, includeA
 		return nil, err
 	}
 	for index := range items {
-		if err := s.enrichSourceName(ctx, &items[index]); err != nil {
+		if err := s.enrichConversation(ctx, &items[index]); err != nil {
 			return nil, err
 		}
 	}
@@ -174,7 +178,7 @@ func (s *Service) ListAll(ctx context.Context, workspaceID string, includeArchiv
 		return nil, err
 	}
 	for index := range items {
-		if err := s.enrichSourceName(ctx, &items[index]); err != nil {
+		if err := s.enrichConversation(ctx, &items[index]); err != nil {
 			return nil, err
 		}
 	}
@@ -213,7 +217,7 @@ func (s *Service) Get(ctx context.Context, userID, id string) (Conversation, err
 	if item.AppName == "" {
 		item.AppName = s.appName
 	}
-	if err := s.enrichSourceName(ctx, &item); err != nil {
+	if err := s.enrichConversation(ctx, &item); err != nil {
 		return Conversation{}, err
 	}
 	return item, nil
@@ -245,6 +249,7 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (Conversati
 		Source: request.Source, WorkspaceID: request.WorkspaceID, Title: request.Title,
 		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
 	}
+	applySourceMetadata(&item)
 	if s.sessions != nil {
 		if _, err := s.sessions.Create(ctx, &session.CreateRequest{AppName: item.AppName, UserID: item.UserID, SessionID: item.ID}); err != nil {
 			return Conversation{}, fmt.Errorf("创建对话 Session 失败: %w", err)
@@ -256,7 +261,7 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (Conversati
 		}
 		return Conversation{}, err
 	}
-	if err := s.enrichSourceName(ctx, &item); err != nil {
+	if err := s.enrichConversation(ctx, &item); err != nil {
 		return Conversation{}, err
 	}
 	return item, nil
@@ -279,10 +284,42 @@ func (s *Service) EnsureSource(ctx context.Context, userID, id, source string) (
 		return item, nil
 	}
 	item.Source = source
+	applySourceMetadata(&item)
 	if err := s.repository.Save(ctx, item); err != nil {
 		return Conversation{}, err
 	}
 	return item, nil
+}
+
+// enrichConversation 补齐来源元数据和可读别名；来源元数据由稳定 UMO 派生，兼容历史会话记录。
+func (s *Service) enrichConversation(ctx context.Context, item *Conversation) error {
+	applySourceMetadata(item)
+	return s.enrichSourceName(ctx, item)
+}
+
+// applySourceMetadata 从 platform_id:MessageType:session_id 解析管理台需要的会话上下文。
+// 使用 SplitN 保留 Session ID 中可能存在的冒号，避免历史来源被截断。
+func applySourceMetadata(item *Conversation) {
+	if item == nil || strings.TrimSpace(item.Source) == "" {
+		return
+	}
+	parts := strings.SplitN(strings.TrimSpace(item.Source), ":", 3)
+	if item.Platform == "" && len(parts) > 0 {
+		item.Platform = strings.TrimSpace(parts[0])
+	}
+	if item.ChatType == "" && len(parts) > 1 {
+		switch strings.TrimSpace(parts[1]) {
+		case "FriendMessage":
+			item.ChatType = "private"
+		case "GroupMessage":
+			item.ChatType = "group"
+		default:
+			item.ChatType = "other"
+		}
+	}
+	if item.ChatID == "" && len(parts) > 2 {
+		item.ChatID = strings.TrimSpace(parts[2])
+	}
 }
 
 // enrichSourceName 只补充展示字段，任何持久化写入仍以 Source 稳定键为准。
