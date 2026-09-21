@@ -137,14 +137,26 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	if message.Control != nil {
 		return m.handleApprovalControl(ctx, message)
 	}
-	// 群历史在唤醒判断前记录，使未 @ 的成员发言也能进入同一来源的背景。
-	extensionConfig, extensionErr := m.resolveMessageConfig(ctx, message)
-	if extensionErr == nil {
-		m.recordGroupContext(ctx, message, extensionConfig.Extensions)
-	} else {
-		slog.Warn("读取群聊扩展配置失败", "adapter_id", message.AdapterID, "error", extensionErr)
+	// 平台策略先于附件入库与模型执行；配置读取失败时不放宽白名单。
+	platformConfig, platformErr := m.resolveMessageConfig(ctx, message)
+	if platformErr != nil {
+		return fmt.Errorf("读取平台策略失败: %w", platformErr)
 	}
+	message.UniqueSession = platformConfig.Platform.UniqueSession
+	if !m.platformMessageAllowed(message, platformConfig) {
+		return nil
+	}
+	// 群历史在唤醒判断前记录，使未 @ 的成员发言也能进入同一来源的背景。
+	extensionConfig := platformConfig
+	m.recordGroupContext(ctx, message, extensionConfig.Extensions)
 	if message.Text == "" && len(message.Attachments) == 0 {
+		if isGroupChat(message.ChatType) && message.Mentioned && platformConfig.Platform.EmptyMentionWaiting {
+			m.startMentionWait(message)
+			if platformConfig.Platform.EmptyMentionNeedReply {
+				return m.send(ctx, message, "我在，接着发消息就好。")
+			}
+			return nil
+		}
 		// 空消息不会进入 Agent，但仍保留忽略原因，方便排查平台事件解析问题。
 		slog.Info("机器人请求已忽略", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "reason", "empty")
 		return nil
@@ -159,12 +171,16 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	if handled, inputErr := m.handlePendingUserInputReply(ctx, message); handled {
 		return inputErr
 	}
+	waitingForNext := m.consumeMentionWait(message)
 	allowed, admissionErr := m.messageAllowed(ctx, &message)
 	if admissionErr != nil {
 		return fmt.Errorf("读取平台消息配置失败: %w", admissionErr)
 	}
+	if waitingForNext && isGroupChat(message.ChatType) {
+		allowed = true
+	}
 	proactive := false
-	if !allowed && extensionErr == nil && shouldProactiveReply(message, extensionConfig.Extensions) {
+	if !allowed && shouldProactiveReply(message, extensionConfig.Extensions) {
 		// 主动回复只改变本轮的触发判定，后续仍走普通内置 Runtime 和会话权限。
 		allowed = true
 		proactive = true
@@ -182,12 +198,22 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	}
 	command, isCommand := parseBotCommand(message.Text)
 	if isCommand {
+		if platformConfig.Platform.DisableBuiltinCommands {
+			return nil
+		}
 		return m.handleBotCommand(ctx, message, command)
 	}
+	if blockedByPattern(message.Text, platformConfig.Platform.BlockPatterns) {
+		return m.send(ctx, message, "消息未通过内容规则检查。")
+	}
+	if !m.waitPlatformRateLimit(ctx, message, platformConfig.Platform) {
+		return nil
+	}
+	m.sendPlatformPreAck(ctx, message, platformConfig.Platform)
 	// 群历史独立传递，不能混进任务目标或授权判断。
 	idempotencyKey := botMessageIdempotencyKey(message)
 	groupContext := ""
-	if extensionErr == nil && (extensionConfig.Extensions.GroupContextEnabled || proactive) {
+	if extensionConfig.Extensions.GroupContextEnabled || proactive {
 		groupContext = m.groupContextText(message, extensionConfig.Extensions)
 	}
 
@@ -227,7 +253,8 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	}
 	request := agent.ChatRequest{
 		UserID: userID, BotID: message.AdapterID, ConversationID: conversationID, SessionID: conversationID,
-		Message: message.Text, GroupContext: groupContext, Proactive: proactive, Attachments: attachments, IdempotencyKey: idempotencyKey, Stream: true,
+		Message: message.Text, GroupContext: groupContext, Proactive: proactive, Attachments: attachments, IdempotencyKey: idempotencyKey, QueueIfBusy: true, Stream: true,
+		BotDelivery: &agent.BotDeliveryTarget{Platform: string(message.Platform), ChatID: message.ChatID, ChatType: message.ChatType, UserID: message.UserID, MessageID: message.ID, ReplyMessageID: message.ReplyMessageID, UniqueSession: message.UniqueSession},
 	}
 	if workspaceID := strings.TrimSpace(item.WorkspaceID); workspaceID != "" {
 		request.WorkspaceID = &workspaceID
@@ -242,9 +269,12 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	// 启动成功后记录 Durable Runtime 返回的任务标识，后续事件和响应都用它关联。
 	slog.Info("机器人请求已启动", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "invocation_id", invocation.ID, "status", invocation.Status)
 	chatKey := chatBindingKey(message)
-	m.mu.Lock()
-	m.activeInvocations[chatKey] = invocation.ID
-	m.mu.Unlock()
+	// 后续消息已进入持久化队列，当前任务的控制指令仍须指向正在执行的任务。
+	if invocation.QueuedBehind {
+		_ = m.send(ctx, message, "消息已加入队列，前一条处理完成后会继续。")
+	} else {
+		m.setActiveInvocation(message, invocation.ID)
+	}
 	m.observeInvocation(message, chatKey, invocation.ID, timeout)
 	return nil
 }
@@ -347,7 +377,7 @@ func (m *Manager) handleBotCommand(ctx context.Context, message Message, command
 			AdapterID: bot.ID, ChatID: message.ChatID, UserID: message.UserID,
 			Command: descriptor.ID, Action: AuditCommandDenied, Result: "denied",
 		})
-		return m.send(ctx, message, authorization.denyReason())
+		return m.sendPermissionDenied(ctx, message, authorization.denyReason())
 	}
 	return m.dispatchBotCommand(ctx, bot, message, authorization)
 }
@@ -492,7 +522,17 @@ func (m *Manager) statusText(ctx context.Context, message Message) string {
 		// /status the recovery point for progress and terminal delivery after a
 		// process restart, while the Runtime remains the durable source of truth.
 		m.observeInvocation(message, chatBindingKey(message), item.ID, 0)
-		return fmt.Sprintf("当前任务：%s\n状态：%s", shortIdentifier(item.ID), item.Status)
+		// 队列数量从 Runtime 持久化状态读取，重启后也能准确显示。
+		pending, pendingErr := coordinator.ListInvocations(ctx, bindingUserID(message), []agentruntime.InvocationStatus{agentruntime.InvocationQueued})
+		queued := 0
+		if pendingErr == nil {
+			for _, candidate := range pending {
+				if candidate.ConversationID == conversationID && candidate.ID != item.ID {
+					queued++
+				}
+			}
+		}
+		return fmt.Sprintf("当前任务：%s\n状态：%s\n等待队列：%d 条", shortIdentifier(item.ID), item.Status, queued)
 	}
 	return "当前没有运行中的任务。"
 }
@@ -514,25 +554,20 @@ func (m *Manager) controlChatInvocation(ctx context.Context, message Message, ac
 	}
 	m.mu.RLock()
 	coordinator := m.runtimeCoordinator
-	id := m.activeInvocations[chatBindingKey(message)]
 	m.mu.RUnlock()
 	if coordinator == nil {
 		return m.send(ctx, message, "当前没有"+available+"的任务。")
 	}
-	if id == "" {
-		item, found, findErr := m.findActiveInvocation(ctx, message, conversationID)
-		if findErr != nil {
-			return m.send(ctx, message, "读取任务状态失败："+trimError(findErr))
-		}
-		if found {
-			id = item.ID
-			m.observeInvocation(message, chatBindingKey(message), id, 0)
-		}
+	// 始终从 Runtime 读取当前状态，避免队列前进后内存中的旧 ID 指向终态任务。
+	item, found, findErr := m.findActiveInvocation(ctx, message, conversationID)
+	if findErr != nil {
+		return m.send(ctx, message, "读取任务状态失败："+trimError(findErr))
 	}
-	if id == "" {
+	if !found {
 		return m.send(ctx, message, "当前没有"+available+"的任务。")
 	}
-	if _, err := coordinator.CancelInvocation(ctx, id); err != nil {
+	m.observeInvocation(message, chatBindingKey(message), item.ID, 0)
+	if _, err := coordinator.CancelInvocation(ctx, item.ID); err != nil {
 		return m.send(ctx, message, action+"任务失败："+trimError(err))
 	}
 	return m.send(ctx, message, "已请求"+action+"当前任务。")
@@ -564,7 +599,7 @@ func (m *Manager) findActiveInvocation(ctx context.Context, message Message, con
 	}
 	if id != "" {
 		if item, err := coordinator.GetInvocation(ctx, id); err == nil {
-			if !item.Status.Terminal() && item.ConversationID == conversationID {
+			if !item.Status.Terminal() && item.Status != agentruntime.InvocationQueued && item.ConversationID == conversationID {
 				return item, true, nil
 			}
 		} else if !errors.Is(err, agentruntime.ErrNotFound) {
@@ -575,12 +610,24 @@ func (m *Manager) findActiveInvocation(ctx context.Context, message Message, con
 	if err != nil {
 		return agentruntime.Invocation{}, false, err
 	}
+	var firstQueued *agentruntime.Invocation
 	for _, item := range items {
 		if item.ConversationID != conversationID || item.Status.Terminal() {
 			continue
 		}
+		if item.Status == agentruntime.InvocationQueued {
+			if firstQueued == nil {
+				copy := item
+				firstQueued = &copy
+			}
+			continue
+		}
 		m.setActiveInvocation(message, item.ID)
 		return item, true, nil
+	}
+	if firstQueued != nil {
+		m.setActiveInvocation(message, firstQueued.ID)
+		return *firstQueued, true, nil
 	}
 	return agentruntime.Invocation{}, false, nil
 }
@@ -670,6 +717,12 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 		return
 	}
 	m.observedInvocations[invocationID] = struct{}{}
+	// 长期运行仅保留最近的订阅去重键，避免每条消息永久增加内存占用。
+	m.observedOrder = append(m.observedOrder, invocationID)
+	if len(m.observedOrder) > 4096 {
+		delete(m.observedInvocations, m.observedOrder[0])
+		m.observedOrder = m.observedOrder[1:]
+	}
 	coordinator := m.runtimeCoordinator
 	baseCtx := m.baseCtx
 	interval := m.progressInterval
@@ -684,12 +737,13 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 		interval = 30 * time.Second
 	}
 	go func() {
-		if timeout > 0 {
-			timer := time.AfterFunc(timeout, func() {
-				_, _ = coordinator.CancelInvocation(context.Background(), invocationID)
-			})
-			defer timer.Stop()
-		}
+		// 排队等待不计入执行超时；只有真正开始运行后才启动定时器。
+		var executionTimer *time.Timer
+		defer func() {
+			if executionTimer != nil {
+				executionTimer.Stop()
+			}
+		}()
 		backlog, live, unsubscribe, err := coordinator.Subscribe(baseCtx, invocationID, 0)
 		if err != nil {
 			m.clearActiveInvocation(message, invocationID)
@@ -749,6 +803,13 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 				slog.Info("机器人 Runtime 响应事件", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "invocation_id", invocationID, "event_type", event.Type, "data", event.Data)
 			}
 			switch event.Type {
+			case agentruntime.EventInvocationStarted:
+				m.setActiveInvocation(message, invocationID)
+				if timeout > 0 && executionTimer == nil {
+					executionTimer = time.AfterFunc(timeout, func() {
+						_, _ = coordinator.CancelInvocation(context.Background(), invocationID)
+					})
+				}
 			case agentruntime.EventAssistantMessage:
 				if text := eventString(event.Data, "text"); text != "" {
 					sentResponse = true
@@ -818,10 +879,48 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 					return
 				}
 			case <-ticker.C:
-				_ = m.send(baseCtx, message, "任务仍在处理中，请稍候。")
+				// 队列中未开始的消息不定期刷屏，也不提前触发超时。
+				if current, getErr := coordinator.GetInvocation(baseCtx, invocationID); getErr == nil && current.Status != agentruntime.InvocationQueued {
+					_ = m.send(baseCtx, message, "任务仍在处理中，请稍候。")
+				}
 			}
 		}
 	}()
+}
+
+// restoreBotObservers 让重启前已接收的 Bot 队列继续把结果发回原聊天。
+func (m *Manager) restoreBotObservers(ctx context.Context) {
+	m.mu.RLock()
+	coordinator := m.runtimeCoordinator
+	m.mu.RUnlock()
+	if coordinator == nil {
+		return
+	}
+	items, err := coordinator.ListInvocations(ctx, "", runtimeActiveInvocationStatuses())
+	if err != nil {
+		slog.Warn("恢复机器人任务订阅失败", "error", err)
+		return
+	}
+	timeout, timeoutErr := m.resolveRequestTimeout(ctx)
+	if timeoutErr != nil {
+		slog.Warn("恢复机器人任务超时配置失败", "error", timeoutErr)
+		timeout = 5 * time.Minute
+	}
+	for _, item := range items {
+		target := item.BotDelivery
+		if target == nil || item.BotID == "" || target.ChatID == "" {
+			continue
+		}
+		if _, botErr := m.Get(item.BotID); botErr != nil {
+			continue
+		}
+		message := Message{ID: target.MessageID, AdapterID: item.BotID, Platform: Type(target.Platform), ChatID: target.ChatID,
+			ChatType: target.ChatType, UserID: target.UserID, ReplyMessageID: target.ReplyMessageID, UniqueSession: target.UniqueSession, Restored: true}
+		if item.Status != agentruntime.InvocationQueued {
+			m.setActiveInvocation(message, item.ID)
+		}
+		m.observeInvocation(message, chatBindingKey(message), item.ID, timeout)
+	}
 }
 
 func (m *Manager) deliverApproval(ctx context.Context, message Message, event agentruntime.AgentEvent) {
@@ -1250,9 +1349,17 @@ func (m *Manager) approvalReplyAllowed(ctx context.Context, message Message) (bo
 		Action: AuditCommandDenied, Result: "denied",
 	})
 	if isGroupChatType(message.ChatType) {
-		return false, m.send(ctx, message, "审批需要本群管理员权限。")
+		return false, m.sendPermissionDenied(ctx, message, "审批需要本群管理员权限。")
 	}
-	return false, m.send(ctx, message, "审批在私聊中需要全局管理员权限。")
+	return false, m.sendPermissionDenied(ctx, message, "审批在私聊中需要全局管理员权限。")
+}
+
+// sendPermissionDenied 统一普通指令与审批入口的权限提示开关；配置读取失败时保留安全提示。
+func (m *Manager) sendPermissionDenied(ctx context.Context, message Message, reason string) error {
+	if config, err := m.resolveMessageConfig(ctx, message); err == nil && !config.Platform.NoPermissionReply {
+		return nil
+	}
+	return m.send(ctx, message, reason)
 }
 
 // parseApprovalSelection 解析文本平台的选项选择。单个待办时允许回复“1”；
@@ -1473,7 +1580,11 @@ func chatBindingKey(message Message) string {
 	if chatID == "" {
 		chatID = strings.TrimSpace(message.UserID)
 	}
-	return strings.Join([]string{string(message.Platform), strings.TrimSpace(message.AdapterID), strings.TrimSpace(message.ChatType), chatID}, "\x00")
+	parts := []string{string(message.Platform), strings.TrimSpace(message.AdapterID), strings.TrimSpace(message.ChatType), chatID}
+	if message.UniqueSession && isGroupChat(message.ChatType) {
+		parts = append(parts, strings.TrimSpace(message.UserID))
+	}
+	return strings.Join(parts, "\x00")
 }
 
 // messageSessionID 返回平台侧会话 ID；群聊使用群/频道 ID，私聊使用聊天 ID，缺失时回退到用户 ID。
@@ -1551,7 +1662,10 @@ func shortIdentifier(value any) string {
 
 func botRuntimeStartError(err error) string {
 	if errors.Is(err, agentruntime.ErrConflict) {
-		return "当前聊天已有任务在运行，请发送 /status 或 /cancel。"
+		if strings.Contains(err.Error(), "待处理消息已达") {
+			return "当前聊天消息队列已满，请稍后重试。"
+		}
+		return "当前聊天任务暂时无法入队，请稍后重试。"
 	}
 	return "任务启动失败：" + trimError(err)
 }

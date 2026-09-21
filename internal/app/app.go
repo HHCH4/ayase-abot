@@ -639,6 +639,20 @@ func Run(opts bootstrap.Options) error {
 			AdminUserIDs:          append([]string(nil), runtime.PlatformAdminIDs...),
 			WakeupWords:           append([]string(nil), runtime.WakeupWords...),
 			PrivateRequiresWakeup: runtime.PrivateRequiresWakeup,
+			// 平台设置按消息热读取，管理员、白名单、发送样式和限速同步生效。
+			Platform: bot.PlatformConfig{
+				UniqueSession: runtime.Platform.UniqueSession, ReplyPrefix: runtime.Platform.ReplyPrefix,
+				ReplyMention: runtime.Platform.ReplyMention, ReplyQuote: runtime.Platform.ReplyQuote,
+				WhitelistEnabled: runtime.Platform.WhitelistEnabled, WhitelistIDs: append([]string(nil), runtime.Platform.WhitelistIDs...),
+				WhitelistLog: runtime.Platform.WhitelistLog, WhitelistAdminGroup: runtime.Platform.WhitelistAdminGroup,
+				WhitelistAdminPrivate: runtime.Platform.WhitelistAdminPrivate, RateLimitSeconds: runtime.Platform.RateLimitSeconds,
+				RateLimitCount: runtime.Platform.RateLimitCount, RateLimitStrategy: runtime.Platform.RateLimitStrategy,
+				IgnoreBotSelfMessage: runtime.Platform.IgnoreBotSelfMessage, IgnoreAtAll: runtime.Platform.IgnoreAtAll,
+				DisableBuiltinCommands: runtime.Platform.DisableBuiltinCommands, NoPermissionReply: runtime.Platform.NoPermissionReply,
+				EmptyMentionWaiting: runtime.Platform.EmptyMentionWaiting, EmptyMentionNeedReply: runtime.Platform.EmptyMentionNeedReply,
+				BlockPatterns: append([]string(nil), runtime.Platform.BlockPatterns...), CheckResponse: runtime.Platform.CheckResponse,
+				TelegramPreAckEnabled: runtime.Platform.TelegramPreAckEnabled, TelegramPreAckEmoji: runtime.Platform.TelegramPreAckEmoji,
+			},
 			// 扩展页设置必须接到实际 Bot 消息链路；列表复制避免配置草稿共享切片。
 			Extensions: bot.ExtensionConfig{
 				SegmentedReplyEnabled: runtime.Extensions.SegmentedReplyEnabled, SegmentOnlyLLM: runtime.Extensions.SegmentOnlyLLM,

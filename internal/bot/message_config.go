@@ -13,8 +13,35 @@ type MessageConfig struct {
 	AdminUserIDs          []string
 	WakeupWords           []string
 	PrivateRequiresWakeup bool
+	Platform              PlatformConfig
 	// Extensions 在每条消息和每次投递时解析，保证配置文件保存后立即生效。
 	Extensions ExtensionConfig
+}
+
+// PlatformConfig 是 Bot 可以即时执行的平台策略快照。
+type PlatformConfig struct {
+	UniqueSession          bool
+	ReplyPrefix            string
+	ReplyMention           bool
+	ReplyQuote             bool
+	WhitelistEnabled       bool
+	WhitelistIDs           []string
+	WhitelistLog           bool
+	WhitelistAdminGroup    bool
+	WhitelistAdminPrivate  bool
+	RateLimitSeconds       int
+	RateLimitCount         int
+	RateLimitStrategy      string
+	IgnoreBotSelfMessage   bool
+	IgnoreAtAll            bool
+	DisableBuiltinCommands bool
+	NoPermissionReply      bool
+	EmptyMentionWaiting    bool
+	EmptyMentionNeedReply  bool
+	BlockPatterns          []string
+	CheckResponse          bool
+	TelegramPreAckEnabled  bool
+	TelegramPreAckEmoji    string
 }
 
 // ExtensionConfig 仅包含平台消息入口需要的扩展策略，Bot 包不依赖配置中心。
@@ -66,7 +93,8 @@ func (m *Manager) resolveMessageConfig(ctx context.Context, message Message) (Me
 	}
 	m.mu.RUnlock()
 	if resolver == nil {
-		return MessageConfig{}, nil
+		// 兼容未装配配置中心的嵌入调用方：保持既有权限不足提示行为。
+		return MessageConfig{Platform: PlatformConfig{NoPermissionReply: true}}, nil
 	}
 	return resolver(ctx, strings.TrimSpace(message.AdapterID), conversationID)
 }

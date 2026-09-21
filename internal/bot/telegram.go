@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"mime"
@@ -34,6 +35,7 @@ type telegramPlatform struct {
 	client   *http.Client
 	base     string
 	username string
+	selfID   int64
 }
 
 type telegramEnvelope[T any] struct {
@@ -65,6 +67,7 @@ type telegramMessage struct {
 
 type telegramUser struct {
 	ID        int64  `json:"id"`
+	IsBot     bool   `json:"is_bot"`
 	Username  string `json:"username"`
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
@@ -137,6 +140,7 @@ func (p *telegramPlatform) Run(ctx context.Context, handler Handler) error {
 		var result telegramEnvelope[telegramUser]
 		if err := p.call(ctx, "getMe", nil, &result); err == nil && result.OK {
 			p.username = strings.TrimSpace(result.Result.Username)
+			p.selfID = result.Result.ID
 		}
 	}
 	var offset int64
@@ -195,8 +199,24 @@ func (p *telegramPlatform) Send(ctx context.Context, message Message, text strin
 	if chatID == "" {
 		return errors.New("Telegram 目标聊天 ID 为空")
 	}
-	for _, chunk := range splitText(text, telegramMessageLimit) {
+	limit := telegramMessageLimit
+	if message.ReplyMention && isGroupChat(message.ChatType) {
+		limit -= 16
+	}
+	for index, chunk := range splitText(text, limit) {
 		payload := map[string]any{"chat_id": chatID, "text": chunk}
+		// Telegram 使用官方 reply_parameters；@用户以 HTML 链接标记，普通正文转义后避免注入标记。
+		if index == 0 && message.ReplyQuote {
+			if replyID, parseErr := strconv.ParseInt(message.ReplyMessageID, 10, 64); parseErr == nil && replyID > 0 {
+				payload["reply_parameters"] = map[string]any{"message_id": replyID, "allow_sending_without_reply": true}
+			}
+		}
+		if index == 0 && message.ReplyMention && isGroupChat(message.ChatType) {
+			if userID, parseErr := strconv.ParseInt(message.UserID, 10, 64); parseErr == nil && userID > 0 {
+				payload["text"] = fmt.Sprintf(`<a href="tg://user?id=%d">@用户</a> %s`, userID, html.EscapeString(chunk))
+				payload["parse_mode"] = "HTML"
+			}
+		}
 		var result telegramEnvelope[telegramMessage]
 		if err := p.call(ctx, "sendMessage", payload, &result); err != nil {
 			return err
@@ -204,6 +224,25 @@ func (p *telegramPlatform) Send(ctx context.Context, message Message, text strin
 		if !result.OK {
 			return fmt.Errorf("Telegram 发送消息失败: %s", result.Description)
 		}
+	}
+	return nil
+}
+
+// PreAcknowledge 通过 Telegram Bot API 为原消息添加一个普通表情，不影响任务接收结果。
+func (p *telegramPlatform) PreAcknowledge(ctx context.Context, message Message, emoji string) error {
+	messageID, err := strconv.ParseInt(message.ReplyMessageID, 10, 64)
+	if err != nil || messageID <= 0 {
+		return errors.New("Telegram 原消息 ID 无效")
+	}
+	var result telegramEnvelope[bool]
+	if err := p.call(ctx, "setMessageReaction", map[string]any{
+		"chat_id": message.ChatID, "message_id": messageID,
+		"reaction": []map[string]string{{"type": "emoji", "emoji": emoji}},
+	}, &result); err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("Telegram 预回应失败: %s", result.Description)
 	}
 	return nil
 }
@@ -287,17 +326,25 @@ func (p *telegramPlatform) messageFromUpdate(ctx context.Context, update telegra
 		userID = strconv.FormatInt(item.From.ID, 10)
 	}
 	message := Message{
-		ID:        strconv.FormatInt(update.UpdateID, 10),
-		Platform:  TypeTelegram,
-		UserID:    userID,
-		ChatID:    strconv.FormatInt(item.Chat.ID, 10),
-		ChatType:  item.Chat.Type,
-		AutoName:  telegramMessageAutoName(item, userID),
-		Text:      strings.TrimSpace(item.Text),
-		Mentioned: p.telegramMessageMentioned(item),
+		ID:             strconv.FormatInt(update.UpdateID, 10),
+		Platform:       TypeTelegram,
+		UserID:         userID,
+		ChatID:         strconv.FormatInt(item.Chat.ID, 10),
+		ChatType:       item.Chat.Type,
+		AutoName:       telegramMessageAutoName(item, userID),
+		Text:           strings.TrimSpace(item.Text),
+		Mentioned:      p.telegramMessageMentioned(item),
+		ReplyMessageID: strconv.FormatInt(item.MessageID, 10),
+	}
+	if item.From != nil {
+		message.IsSelf = p.selfID != 0 && item.From.ID == p.selfID
 	}
 	if message.Text == "" {
 		message.Text = strings.TrimSpace(item.Caption)
+	}
+	// 单独 @机器人 是等待下一句的触发动作，不把用户名当作模型问题。
+	if isGroupChat(message.ChatType) && message.Mentioned && p.username != "" && strings.EqualFold(message.Text, "@"+p.username) {
+		message.Text = ""
 	}
 	if len(item.Photo) > 0 {
 		photo := item.Photo[len(item.Photo)-1]
@@ -334,7 +381,7 @@ func (p *telegramPlatform) messageFromUpdate(ctx context.Context, update telegra
 			message.Attachments = appendTelegramAttachment(message.Attachments, attachment)
 		}
 	}
-	if message.Text == "" && len(message.Attachments) == 0 {
+	if message.Text == "" && len(message.Attachments) == 0 && !message.Mentioned {
 		return Message{}, errors.New("Telegram 更新不包含文本或支持的附件")
 	}
 	return message, nil

@@ -192,6 +192,7 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .config-editor { min-width: 0; }
 .editor-view-tabs { display: flex; justify-content: flex-end; gap: 6px; margin-bottom: 12px; }
 .field-list { display: grid; gap: 10px; }
+.config-field-section { margin: 18px 0 2px; padding: 0 2px; font-size: 16px; font-weight: 650; color: var(--text); }
 .config-field-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 330px); align-items: center; gap: 24px; min-height: 70px; padding: 14px 16px; border: 1px solid var(--line-soft); border-radius: 12px; background: #fff; }
 .field-copy strong, .field-copy code, .field-copy span { display: block; }.field-copy strong { color: #2b3038; font-size: 13px; }.field-copy code { margin-top: 5px; color: #a0a5ad; font-size: 10px; }.field-copy span { margin-top: 7px; color: #8a8f99; font-size: 12px; line-height: 1.5; }.field-copy .n-tag { margin-top: 7px; }
 .field-control { min-width: 0; }.field-control .n-input, .field-control .n-input-number, .field-control .n-select, .field-control .n-dynamic-tags { width: 100%; }

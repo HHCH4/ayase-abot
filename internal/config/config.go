@@ -180,11 +180,39 @@ type Runtime struct {
 	PlatformAdminIDs      []string
 	WakeupWords           []string
 	PrivateRequiresWakeup bool
+	// 平台策略由消息入口与平台发送器共同执行，不把无效开关暴露为已实现能力。
+	Platform PlatformSettings
 	// 扩展配置由 Bot 入口消费；按配置文件解析，避免界面开关只停留在数据库。
 	Extensions         ExtensionSettings
 	MemoryEnabled      bool
 	MemoryAutoRetrieve bool
 	MemoryMaxResults   int
+}
+
+// PlatformSettings 对齐当前 Telegram/OneBot 能执行的平台通用配置。
+type PlatformSettings struct {
+	UniqueSession          bool
+	ReplyPrefix            string
+	ReplyMention           bool
+	ReplyQuote             bool
+	WhitelistEnabled       bool
+	WhitelistIDs           []string
+	WhitelistLog           bool
+	WhitelistAdminGroup    bool
+	WhitelistAdminPrivate  bool
+	RateLimitSeconds       int
+	RateLimitCount         int
+	RateLimitStrategy      string
+	IgnoreBotSelfMessage   bool
+	IgnoreAtAll            bool
+	DisableBuiltinCommands bool
+	NoPermissionReply      bool
+	EmptyMentionWaiting    bool
+	EmptyMentionNeedReply  bool
+	BlockPatterns          []string
+	CheckResponse          bool
+	TelegramPreAckEnabled  bool
+	TelegramPreAckEmoji    string
 }
 
 // ExtensionSettings 汇总 AstrBot 扩展页的三组内置行为，所有上限都在 Schema 校验。
@@ -487,6 +515,19 @@ func (s *Service) ValidateValues(ctx context.Context, values Values) error {
 	}
 	if boolOr(values["extensions.group_image_caption"], false) && strings.TrimSpace(stringOr(values["extensions.group_image_caption_model"])) == "" {
 		return fmt.Errorf("%w: 自动理解群图片需要选择群图片转述模型", ErrInvalidRequest)
+	}
+	// 用户自定义屏蔽规则必须有界且可编译，避免保存后在消息路径上反复失败。
+	patterns := stringListOr(values["platform.block_patterns"])
+	if len(patterns) > 50 {
+		return fmt.Errorf("%w: 内容屏蔽规则不能超过 50 条", ErrInvalidRequest)
+	}
+	for _, pattern := range patterns {
+		if len(pattern) > 256 {
+			return fmt.Errorf("%w: 单条内容屏蔽规则不能超过 256 字节", ErrInvalidRequest)
+		}
+		if _, err := regexp.Compile(pattern); err != nil {
+			return fmt.Errorf("%w: 内容屏蔽正则无效: %v", ErrInvalidRequest, err)
+		}
 	}
 	providerID, _ := values["ai.default_provider_id"].(string)
 	modelID, _ := values["ai.default_model_id"].(string)
@@ -795,7 +836,28 @@ func buildSchema() Schema {
 		{Key: "platform.wakeup_words", Group: "platform", Label: "唤醒词列表", Type: "list", Default: []string{}, Help: "逐项添加唤醒前缀；群聊未 @ 机器人时，以这些前缀开头的消息也会被处理，并会去掉前缀后交给内置 AI。"},
 		{Key: "platform.private_requires_wakeup", Group: "platform", Label: "私聊需要唤醒词", Type: "boolean", Default: false, Help: "平台适配器可据此过滤未唤醒消息。"},
 		{Key: "platform.reply_prefix", Group: "platform", Label: "回复文本前缀", Type: "string", Default: "", Help: "平台输出前追加的前缀。"},
-		{Key: "platform.reply_mention", Group: "platform", Label: "回复时 @ 发送人", Type: "boolean", Default: false, Help: "平台适配器支持时引用发送人。"},
+		{Key: "platform.reply_mention", Group: "platform", Label: "回复时 @ 发送人", Type: "boolean", Default: false, Help: "OneBot 使用 @ 消息段；Telegram 使用用户提及链接。"},
+		// 仅列出当前适配器具备实际执行路径的 AstrBot 平台选项。
+		{Key: "platform.unique_session", Group: "platform", Label: "隔离群成员会话", Type: "boolean", Default: false, Help: "开启后同群不同成员使用独立的对话与任务队列。"},
+		{Key: "platform.reply_quote", Group: "platform", Label: "回复时引用发送人消息", Type: "boolean", Default: false, Help: "平台支持引用时关联原消息。"},
+		{Key: "platform.empty_mention_waiting", Group: "platform", Label: "仅 @ 时等待下一条消息", Type: "boolean", Default: true, Help: "群成员只 @ 机器人而没有正文时，在一分钟内接收其下一条消息。"},
+		{Key: "platform.empty_mention_need_reply", Group: "platform", Label: "等待时发送提示", Type: "boolean", Default: true, DisplayIf: map[string]any{"platform.empty_mention_waiting": true}},
+		{Key: "platform.whitelist_enabled", Group: "platform", Label: "启用 ID 白名单", Type: "boolean", Default: true, Help: "名单为空时不限制；按会话来源、群 ID 或用户 ID 匹配。"},
+		{Key: "platform.whitelist_ids", Group: "platform", Label: "白名单 ID 列表", Type: "list", Default: []string{}, DisplayIf: map[string]any{"platform.whitelist_enabled": true}, Help: "逐项添加 UMO、群 ID 或用户 ID。"},
+		{Key: "platform.whitelist_log", Group: "platform", Label: "白名单拦截日志", Type: "boolean", Default: true, DisplayIf: map[string]any{"platform.whitelist_enabled": true}},
+		{Key: "platform.whitelist_admin_group", Group: "platform", Label: "群管理员绕过白名单", Type: "boolean", Default: true, DisplayIf: map[string]any{"platform.whitelist_enabled": true}},
+		{Key: "platform.whitelist_admin_private", Group: "platform", Label: "私聊管理员绕过白名单", Type: "boolean", Default: true, DisplayIf: map[string]any{"platform.whitelist_enabled": true}},
+		{Key: "platform.rate_limit_seconds", Group: "platform", Label: "消息速率窗口（秒）", Type: "integer", Default: 60, Min: floatPtr(1), Max: floatPtr(3600)},
+		{Key: "platform.rate_limit_count", Group: "platform", Label: "窗口内最多消息数", Type: "integer", Default: 30, Min: floatPtr(1), Max: floatPtr(1000)},
+		{Key: "platform.rate_limit_strategy", Group: "platform", Label: "超限策略", Type: "select", Default: "stall", Options: []SchemaOption{{Value: "stall", Label: "等待"}, {Value: "discard", Label: "丢弃"}}},
+		{Key: "platform.ignore_bot_self_message", Group: "platform", Label: "忽略机器人自身消息", Type: "boolean", Default: false},
+		{Key: "platform.ignore_at_all", Group: "platform", Label: "忽略 @ 全体成员", Type: "boolean", Default: false},
+		{Key: "platform.disable_builtin_commands", Group: "platform", Label: "禁用内置指令", Type: "boolean", Default: false, Help: "仅禁用普通斜杠指令；审批按钮和待回答问题仍可用。"},
+		{Key: "platform.no_permission_reply", Group: "platform", Label: "权限不足时回复", Type: "boolean", Default: true},
+		{Key: "platform.block_patterns", Group: "platform", Label: "内容屏蔽规则", Type: "list", Default: []string{}, Help: "逐项添加 Go/RE2 正则；匹配的用户消息不会进入模型。"},
+		{Key: "platform.check_response", Group: "platform", Label: "同时检查模型回复", Type: "boolean", Default: false, Help: "启用后，同样用内容屏蔽规则检查模型最终回复。"},
+		{Key: "platform.telegram_pre_ack_enabled", Group: "platform", Label: "Telegram 预回应表情", Type: "boolean", Default: false, Help: "接收有效消息后先对原消息添加表情；平台不允许时仅记录日志。"},
+		{Key: "platform.telegram_pre_ack_emoji", Group: "platform", Label: "预回应表情", Type: "select", Default: "👀", Options: []SchemaOption{{Value: "👀", Label: "👀"}, {Value: "👍", Label: "👍"}, {Value: "🤔", Label: "🤔"}, {Value: "❤", Label: "❤"}}, DisplayIf: map[string]any{"platform.telegram_pre_ack_enabled": true}},
 		// 分段回复只作用于平台文本投递；短消息按标点拆段，长消息保持原样。
 		{Key: "extensions.segmented_reply_enabled", Group: "extensions", Label: "启用分段回复", Type: "boolean", Default: false, Help: "按下列规则将 Bot 文本回复分段发送。"},
 		{Key: "extensions.segment_only_llm", Group: "extensions", Label: "仅对 LLM 结果分段", Type: "boolean", Default: true, DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}, Help: "开启时指令、审批和运行状态消息不会被拆分。"},
@@ -856,6 +918,19 @@ func runtimeFromValues(values Values) Runtime {
 		PlatformAdminIDs:              stringListOr(values["platform.admin_ids"]),
 		WakeupWords:                   stringListOr(values["platform.wakeup_words"]),
 		PrivateRequiresWakeup:         boolOr(values["platform.private_requires_wakeup"], false),
+		Platform: PlatformSettings{
+			UniqueSession: boolOr(values["platform.unique_session"], false), ReplyPrefix: stringOr(values["platform.reply_prefix"]),
+			ReplyMention: boolOr(values["platform.reply_mention"], false), ReplyQuote: boolOr(values["platform.reply_quote"], false),
+			WhitelistEnabled: boolOr(values["platform.whitelist_enabled"], true), WhitelistIDs: stringListOr(values["platform.whitelist_ids"]),
+			WhitelistLog: boolOr(values["platform.whitelist_log"], true), WhitelistAdminGroup: boolOr(values["platform.whitelist_admin_group"], true),
+			WhitelistAdminPrivate: boolOr(values["platform.whitelist_admin_private"], true), RateLimitSeconds: intOr(values["platform.rate_limit_seconds"], 60),
+			RateLimitCount: intOr(values["platform.rate_limit_count"], 30), RateLimitStrategy: stringOrDefault(values["platform.rate_limit_strategy"], "stall"),
+			IgnoreBotSelfMessage: boolOr(values["platform.ignore_bot_self_message"], false), IgnoreAtAll: boolOr(values["platform.ignore_at_all"], false),
+			DisableBuiltinCommands: boolOr(values["platform.disable_builtin_commands"], false), NoPermissionReply: boolOr(values["platform.no_permission_reply"], true),
+			EmptyMentionWaiting: boolOr(values["platform.empty_mention_waiting"], true), EmptyMentionNeedReply: boolOr(values["platform.empty_mention_need_reply"], true),
+			BlockPatterns: stringListOr(values["platform.block_patterns"]), CheckResponse: boolOr(values["platform.check_response"], false),
+			TelegramPreAckEnabled: boolOr(values["platform.telegram_pre_ack_enabled"], false), TelegramPreAckEmoji: stringOrDefault(values["platform.telegram_pre_ack_emoji"], "👀"),
+		},
 		Extensions: ExtensionSettings{
 			SegmentedReplyEnabled: boolOr(values["extensions.segmented_reply_enabled"], false), SegmentOnlyLLM: boolOr(values["extensions.segment_only_llm"], true),
 			SegmentIntervalMethod: stringOrDefault(values["extensions.segment_interval_method"], "random"), SegmentInterval: stringOrDefault(values["extensions.segment_interval"], "1.5,3.5"),

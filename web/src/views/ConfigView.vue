@@ -52,6 +52,20 @@ const currentFields = computed(() => (store.configSchema.fields || []).filter((f
   return text.includes(search.value.trim().toLocaleLowerCase())
 }))
 
+// 平台字段按 AstrBot 的基本、白名单、限速和安全分区展示；搜索结果仍保持扁平。
+function platformSectionStart(key: string) {
+  if (group.value !== 'platform' || search.value.trim()) return ''
+  const sections: Record<string, string> = {
+    'platform.admin_ids': '基本设置',
+    'platform.whitelist_enabled': '白名单',
+    'platform.rate_limit_seconds': '速率限制',
+    'platform.ignore_bot_self_message': '其他行为',
+    'platform.block_patterns': '内容安全',
+    'platform.telegram_pre_ack_enabled': 'Telegram',
+  }
+  return sections[key] || ''
+}
+
 // 这些字段保存的都是供应商模型 ID，统一改用已配置目录选择，避免同一个模型在不同页面重复手写。
 // 群图片转述与普通多模态降级一样，从现有模型目录选择，避免再次手写模型 ID。
 const modelFieldKeys = new Set(['ai.default_model_id', 'image.caption_model', 'voice.stt_model', 'voice.tts_model', 'extensions.group_image_caption_model'])
@@ -466,7 +480,9 @@ onMounted(async () => {
             <section class="config-editor">
               <div class="editor-view-tabs"><NButton size="small" :type="view === 'visual' ? 'primary' : 'default'" @click="view = 'visual'">可视化</NButton><NButton size="small" :type="view === 'json' ? 'primary' : 'default'" @click="jsonText = JSON.stringify(draft, null, 2); view = 'json'">JSON（高级）</NButton></div>
               <div v-if="view === 'visual'" class="field-list">
-                <div v-for="field in currentFields" :key="field.key" class="config-field-row">
+                <template v-for="field in currentFields" :key="field.key">
+                <h3 v-if="platformSectionStart(field.key)" class="config-field-section">{{ platformSectionStart(field.key) }}</h3>
+                <div class="config-field-row">
                   <div class="field-copy"><strong>{{ field.label }}</strong><code>{{ field.key }}</code><span v-if="field.help">{{ field.help }}</span><NTag v-if="field.restart_required" size="small" type="warning">需重启</NTag></div>
                   <div class="field-control">
                     <NCheckbox v-if="field.type === 'boolean'" :checked="fieldValue(field) === true" @update:checked="setValue(field, $event)" />
@@ -478,6 +494,7 @@ onMounted(async () => {
                     <NInput v-else :value="textValue(field)" :type="field.secret ? 'password' : 'text'" @update:value="setValue(field, $event)" />
                   </div>
                 </div>
+                </template>
                 <NEmpty v-if="!currentFields.length" description="当前没有匹配的设置" />
               </div>
               <NInput v-else v-model:value="jsonText" type="textarea" :autosize="{ minRows: 18, maxRows: 30 }" class="json-editor" @update:value="dirty = true" />

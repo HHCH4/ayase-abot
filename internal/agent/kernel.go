@@ -636,6 +636,10 @@ type ChatRequest struct {
 	// to return the already accepted Invocation on retried submissions instead
 	// of creating a second task for the same request.
 	IdempotencyKey string
+	// QueueIfBusy 仅由 Bot 消息入口启用；同一对话后续请求按接收顺序等待。
+	QueueIfBusy bool
+	// BotDelivery 仅用于重启后恢复平台回复目标，模型不会看到这些元数据。
+	BotDelivery *BotDeliveryTarget
 	// BotID 用于解析机器人级配置绑定；WebUI 对话可以留空。
 	BotID string
 	// ConversationID 是正式 API 使用的对话 ID，同时也是底层 ADK Session ID。
@@ -669,6 +673,17 @@ type ChatRequest struct {
 	// Artifact Ref；Data 仅供未装配 Artifact 服务的直接调用方兼容使用。
 	Attachments []Attachment
 	Stream      bool
+}
+
+// BotDeliveryTarget 保存排队机器人消息的最小回传地址，不包含正文或密钥。
+type BotDeliveryTarget struct {
+	Platform       string
+	ChatID         string
+	ChatType       string
+	UserID         string
+	MessageID      string
+	ReplyMessageID string
+	UniqueSession  bool
 }
 
 // Attachment 是 Agent 内核统一使用的附件表示，供应商层无需感知 WebUI 的编码方式。

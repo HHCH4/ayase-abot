@@ -115,6 +115,15 @@ type Message struct {
 	UserID    string
 	ChatID    string
 	ChatType  string
+	// 原始消息 ID 与接收事件 ID 分开，供平台引用回复使用。
+	ReplyMessageID string
+	// 平台事件元数据与配置状态由入口设置，不进入模型提示词。
+	IsSelf        bool
+	AtAll         bool
+	UniqueSession bool
+	ReplyMention  bool
+	ReplyQuote    bool
+	Restored      bool
 	// AutoName 是平台提供的群名、昵称或用户名，仅用于 UMO 目录展示；它不
 	// 参与来源键计算，也不会覆盖用户通过 /name 设置的手工别名。
 	AutoName    string
@@ -315,6 +324,7 @@ type Manager struct {
 	activeConversations map[string]string
 	activeInvocations   map[string]string
 	observedInvocations map[string]struct{}
+	observedOrder []string
 	pendingApprovals    map[string][]approvalTicket
 	pendingUserInputs   map[string][]userInputTicket
 	progressInterval    time.Duration
@@ -322,6 +332,10 @@ type Manager struct {
 	groupHistory      map[string][]string
 	groupHistoryOrder []string
 	groupImageCaption func(context.Context, string, agent.Attachment) (string, error)
+	// 限速时间窗仅保留有界活跃来源，避免长期运行的树莓派积累状态。
+	rateWindows map[string][]time.Time
+	rateOrder   []string
+	mentionWait map[string]time.Time
 	// commands is the chat command catalog. It is replaced only during
 	// construction or plugin registration, never while dispatching.
 	commands *CommandRegistry
@@ -374,6 +388,8 @@ func NewManager(ctx context.Context, repository Repository, kernel *agent.Kernel
 		commands:         commands,
 		sourceNames:      make(map[string]string),
 		groupHistory:     make(map[string][]string),
+		rateWindows:      make(map[string][]time.Time),
+		mentionWait:      make(map[string]time.Time),
 	}
 	for _, item := range items {
 		if item.Status == "" {
@@ -454,6 +470,8 @@ func (m *Manager) Start(ctx context.Context) error {
 			slog.Warn("机器人启动失败", "adapter_id", id, "error", err)
 		}
 	}
+	// Runtime 先于适配器恢复；连接启动后按持久化回传目标重新订阅排队任务。
+	m.restoreBotObservers(ctx)
 	return nil
 }
 
@@ -828,6 +846,14 @@ func (m *Manager) sendRaw(ctx context.Context, message Message, text string) err
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// 回复样式按当前配置热读取，分段时每一段都使用一致的前缀与平台引用选项。
+	if config, configErr := m.resolveMessageConfig(ctx, message); configErr == nil {
+		text = config.Platform.ReplyPrefix + text
+		message.ReplyMention = config.Platform.ReplyMention
+		message.ReplyQuote = config.Platform.ReplyQuote
+	} else {
+		slog.Warn("读取平台回复配置失败", "adapter_id", message.AdapterID, "error", configErr)
+	}
 	m.mu.RLock()
 	entry, ok := m.runtimes[message.AdapterID]
 	m.mu.RUnlock()
@@ -838,7 +864,31 @@ func (m *Manager) sendRaw(ctx context.Context, message Message, text string) err
 	}
 	// 发送前记录完整响应正文，确保普通回复、指令回复和主动投递走同一条日志链路。
 	slog.Info("机器人发送响应", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_type", message.ChatType, "chat_id", message.ChatID, "user_id", message.UserID, "message_id", message.ID, "text", text, "text_length", len([]rune(text)))
-	if err := entry.platform.Send(ctx, message, text); err != nil {
+	err := entry.platform.Send(ctx, message, text)
+	if errors.Is(err, ErrNotRunning) && message.Restored {
+		// 重启恢复的排队任务可能早于 OneBot 重连完成；仅对确定未发送的错误等待连接。
+		deadline := time.NewTimer(2 * time.Minute)
+		defer deadline.Stop()
+		for errors.Is(err, ErrNotRunning) {
+			pause := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				pause.Stop()
+				return ctx.Err()
+			case <-deadline.C:
+				pause.Stop()
+				return err
+			case <-pause.C:
+			}
+			m.mu.RLock()
+			current, running := m.runtimes[message.AdapterID]
+			m.mu.RUnlock()
+			if running {
+				err = current.platform.Send(ctx, message, text)
+			}
+		}
+	}
+	if err != nil {
 		// 发送失败仍带上原始正文，便于区分平台拒绝、连接断开和内容生成问题。
 		slog.Error("机器人发送响应失败", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "text", text, "error", err)
 		return err
@@ -927,7 +977,12 @@ func bindingFor(message Message) (string, string) {
 	if chatID == "" {
 		chatID = strings.TrimSpace(message.UserID)
 	}
-	key := strings.Join([]string{string(message.Platform), message.AdapterID, message.ChatType, chatID}, "\x00")
+	parts := []string{string(message.Platform), message.AdapterID, message.ChatType, chatID}
+	// 群成员隔离仅改变内部会话键，平台回复仍发回原群。
+	if message.UniqueSession && isGroupChat(message.ChatType) {
+		parts = append(parts, strings.TrimSpace(message.UserID))
+	}
+	key := strings.Join(parts, "\x00")
 	hash := sha256.Sum256([]byte(key))
 	short := hex.EncodeToString(hash[:])[:32]
 	return "bot:" + message.AdapterID + ":" + short, "bot-" + short

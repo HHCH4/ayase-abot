@@ -50,6 +50,10 @@ func (m *Manager) sendConfigured(ctx context.Context, message Message, text stri
 
 // sendLLM 只供最终模型结果使用，防止审批卡片和指令答复被“仅 LLM”策略误拆。
 func (m *Manager) sendLLM(ctx context.Context, message Message, text string) error {
+	// 可选对最终模型正文应用同一组内容规则，控制消息与审批卡片不受影响。
+	if config, err := m.resolveMessageConfig(ctx, message); err == nil && config.Platform.CheckResponse && blockedByPattern(text, config.Platform.BlockPatterns) {
+		return m.sendRaw(ctx, message, "模型回复未通过内容规则检查。")
+	}
 	return m.sendConfigured(ctx, message, text, true)
 }
 

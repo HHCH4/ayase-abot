@@ -303,7 +303,7 @@ func (p *oneBotPlatform) Send(ctx context.Context, message Message, text string)
 	if conn == nil {
 		return ErrNotRunning
 	}
-	for _, chunk := range splitText(text, oneBotMessageLimit) {
+	for index, chunk := range splitText(text, oneBotMessageLimit) {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -312,6 +312,18 @@ func (p *oneBotPlatform) Send(ctx context.Context, message Message, text string)
 		params := map[string]any{
 			"message_type": message.ChatType,
 			"message":      chunk,
+		}
+		// OneBot 使用结构化消息段实现引用与 @，不拼接可被平台误解析的 CQ 文本。
+		if index == 0 && (message.ReplyQuote || message.ReplyMention && isGroupChat(message.ChatType)) {
+			segments := make([]map[string]any, 0, 3)
+			if message.ReplyQuote && message.ReplyMessageID != "" {
+				segments = append(segments, map[string]any{"type": "reply", "data": map[string]any{"id": oneBotIDValue(message.ReplyMessageID)}})
+			}
+			if message.ReplyMention && isGroupChat(message.ChatType) && message.UserID != "" {
+				segments = append(segments, map[string]any{"type": "at", "data": map[string]any{"qq": oneBotIDValue(message.UserID)}})
+			}
+			segments = append(segments, map[string]any{"type": "text", "data": map[string]any{"text": chunk}})
+			params["message"] = segments
 		}
 		if params["message_type"] == "group" {
 			params["group_id"] = oneBotIDValue(message.ChatID)
@@ -391,20 +403,37 @@ func (p *oneBotPlatform) messageFromEvent(ctx context.Context, event oneBotEvent
 		return Message{}, errors.New("OneBot 消息目标为空")
 	}
 	text, attachments := parseOneBotMessage(ctx, p.client, event.Message)
-	if strings.TrimSpace(text) == "" && len(attachments) == 0 {
+	if strings.TrimSpace(text) == "" && len(attachments) == 0 && !p.oneBotMessageMentioned(event) {
 		return Message{}, errors.New("OneBot 消息不包含文本或支持的附件")
 	}
 	return Message{
-		ID:          rawID(event.MessageID),
-		Platform:    TypeOneBot11,
-		UserID:      userID,
-		ChatID:      chatID,
-		ChatType:    chatType,
-		AutoName:    oneBotMessageAutoName(event, chatID, userID),
-		Text:        strings.TrimSpace(text),
-		Attachments: attachments,
-		Mentioned:   !isGroupChat(chatType) || p.oneBotMessageMentioned(event),
+		ID:             rawID(event.MessageID),
+		Platform:       TypeOneBot11,
+		UserID:         userID,
+		ChatID:         chatID,
+		ChatType:       chatType,
+		AutoName:       oneBotMessageAutoName(event, chatID, userID),
+		Text:           strings.TrimSpace(text),
+		Attachments:    attachments,
+		Mentioned:      !isGroupChat(chatType) || p.oneBotMessageMentioned(event),
+		ReplyMessageID: rawID(event.MessageID),
+		IsSelf:         userID != "" && userID == rawID(event.SelfID),
+		AtAll:          oneBotAtAll(event.Message),
 	}, nil
+}
+
+// oneBotAtAll 只识别结构化 @全体 消息，避免普通文字误触发过滤。
+func oneBotAtAll(raw json.RawMessage) bool {
+	var segments []oneBotSegment
+	if json.Unmarshal(raw, &segments) != nil {
+		return false
+	}
+	for _, segment := range segments {
+		if segment.Type == "at" && strings.EqualFold(stringValue(segment.Data["qq"]), "all") {
+			return true
+		}
+	}
+	return false
 }
 
 // oneBotMessageAutoName 将群名缺失时可获得的群号和用户昵称组合成可读名称；

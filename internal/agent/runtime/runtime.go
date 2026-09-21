@@ -144,8 +144,11 @@ type Invocation struct {
 	ConfigSnapshot       string `json:"-"`
 	ConfigSnapshotDigest string `json:"config_snapshot_digest,omitempty"`
 	Message              string `json:"message,omitempty"`
+	// QueuedBehind 只用于本次接收回执，不写入持久化记录或公开 API。
+	QueuedBehind bool `json:"-" gorm:"-"`
 	// 群历史是低信任背景，持久化供排队任务重启恢复，但不公开为任务目标。
-	GroupContext string `json:"-"`
+	GroupContext string                   `json:"-"`
+	BotDelivery  *agent.BotDeliveryTarget `json:"-"`
 	// 主动回复标记随任务持久化，确保恢复后仍保持无工具权限。
 	Proactive bool `json:"-"`
 	// Attachments are persisted with the accepted input so a queued
@@ -1916,33 +1919,28 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("恢复排队任务失败: %w", err)
 	}
+	// 重启时每个对话只启动队首，等待审批的对话不能越过当前任务。
+	blocked := make(map[string]bool)
+	waiting, err := c.repo.ListInvocations(ctx, "", []InvocationStatus{InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationCancelling})
+	if err != nil {
+		return fmt.Errorf("读取待恢复任务失败: %w", err)
+	}
+	for _, invocation := range waiting {
+		blocked[invocation.UserID+"\x00"+invocation.ConversationID] = true
+	}
+	// 数据库列表顺序不是队列契约：每个会话只恢复创建时间最早的一条。
+	first := make(map[string]Invocation)
 	for _, invocation := range active {
-		var workspaceID *string
-		if strings.TrimSpace(invocation.WorkspaceID) != "" {
-			value := invocation.WorkspaceID
-			workspaceID = &value
-		}
-		c.refreshRuntimeSnapshot(ctx, invocation.ID)
-		request := agent.ChatRequest{
-			UserID: invocation.UserID, IdempotencyKey: invocation.IdempotencyKey, BotID: invocation.BotID, ConversationID: invocation.ConversationID,
-			SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID, WorkspaceID: workspaceID, TargetPath: invocation.TargetPath,
-			Message: invocation.Message, GroupContext: invocation.GroupContext, Proactive: invocation.Proactive, Attachments: cloneAttachments(invocation.Attachments), ConfigSnapshot: invocation.ConfigSnapshot, Stream: true,
-		}
-		if resume, resumeErr := c.resumeContentForInvocation(ctx, invocation.ID); resumeErr != nil {
-			message := "runtime_recovery: 读取待恢复工具响应失败: " + resumeErr.Error()
-			if ok, transitionErr := c.repo.TransitionInvocation(context.WithoutCancel(ctx), invocation.ID, InvocationQueued, InvocationFailed, message); transitionErr != nil {
-				return transitionErr
-			} else if ok {
-				c.emitTerminal(context.WithoutCancel(ctx), invocation.ID, EventInvocationFailed, map[string]any{"error": message, "reason": "resume_handoff_read_failed"})
-			}
+		key := invocation.UserID + "\x00" + invocation.ConversationID
+		if blocked[key] {
 			continue
-		} else if resume != nil {
-			request.ResumeContent = resume
-			request.Message = ""
-			request.GroupContext = ""
-			request.Attachments = nil
 		}
-		c.launch(invocation.ID, request)
+		if previous, ok := first[key]; !ok || invocation.CreatedAt.Before(previous.CreatedAt) || invocation.CreatedAt.Equal(previous.CreatedAt) && invocation.ID < previous.ID {
+			first[key] = invocation
+		}
+	}
+	for _, invocation := range first {
+		c.launchQueuedInvocation(ctx, invocation)
 	}
 	c.startResumeOutboxLoop()
 	c.startRuntimeEventOutboxLoop()
@@ -4058,6 +4056,19 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 		if lookup, ok := c.repo.(InvocationIdempotencyRepository); ok {
 			existing, lookupErr := lookup.GetInvocationByIdempotencyKey(ctx, request.UserID, request.ConversationID, request.IdempotencyKey)
 			if lookupErr == nil {
+				// 平台重试同一消息时仍告知它在队列中，不能覆盖当前任务指针。
+				if request.QueueIfBusy && existing.Status == InvocationQueued {
+					pending, pendingErr := c.repo.ListInvocations(ctx, request.UserID, []InvocationStatus{InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationCancelling})
+					if pendingErr != nil {
+						return Invocation{}, pendingErr
+					}
+					for _, item := range pending {
+						if item.ConversationID == existing.ConversationID && item.ID != existing.ID && (item.Status != InvocationQueued || item.CreatedAt.Before(existing.CreatedAt)) {
+							existing.QueuedBehind = true
+							break
+						}
+					}
+				}
 				return existing, nil
 			}
 			if !errors.Is(lookupErr, ErrNotFound) {
@@ -4071,10 +4082,22 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 	if err != nil {
 		return Invocation{}, err
 	}
+	queueBehind := false
+	queuedCount := 0
 	for _, existing := range active {
 		if existing.ConversationID == request.ConversationID {
-			return Invocation{}, fmt.Errorf("%w: 当前对话已有运行中的 invocation %s", ErrConflict, existing.ID)
+			if !request.QueueIfBusy {
+				return Invocation{}, fmt.Errorf("%w: 当前对话已有运行中的 invocation %s", ErrConflict, existing.ID)
+			}
+			queueBehind = true
+			if existing.Status == InvocationQueued {
+				queuedCount++
+			}
 		}
+	}
+	// 有界队列防止失联平台无限堆积附件引用与任务快照。
+	if queueBehind && queuedCount >= 32 {
+		return Invocation{}, fmt.Errorf("%w: 当前聊天待处理消息已达 32 条", ErrConflict)
 	}
 	now := time.Now().UTC()
 	workspaceID := ""
@@ -4108,7 +4131,7 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 		ID: newID("invocation"), UserID: request.UserID, IdempotencyKey: request.IdempotencyKey, BotID: request.BotID,
 		ConversationID: request.ConversationID, WorkspaceID: workspaceID, TargetPath: strings.TrimSpace(request.TargetPath), SessionID: request.SessionID,
 		ProviderID: strings.TrimSpace(request.ProviderID), ModelID: strings.TrimSpace(request.ModelID),
-		Message: request.Message, GroupContext: request.GroupContext, Proactive: request.Proactive, Attachments: cloneAttachments(request.Attachments),
+		Message: request.Message, GroupContext: request.GroupContext, BotDelivery: request.BotDelivery, Proactive: request.Proactive, Attachments: cloneAttachments(request.Attachments),
 		Status: InvocationQueued, CreatedAt: now, UpdatedAt: now,
 	}
 	if err := c.repo.CreateInvocation(ctx, item); err != nil {
@@ -4169,7 +4192,10 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 			return Invocation{}, fmt.Errorf("创建 Runtime Snapshot 失败: %w", snapshotErr)
 		}
 	}
-	c.launch(item.ID, request)
+	if !queueBehind {
+		c.launch(item.ID, request)
+	}
+	item.QueuedBehind = queueBehind
 	return item, nil
 }
 
@@ -8040,6 +8066,61 @@ func (c *Coordinator) emitTerminal(ctx context.Context, id, eventType string, da
 	}
 }
 
+// launchNextQueued 在接收窗口结束后选择最早的待处理任务；其他对话不受阻塞。
+func (c *Coordinator) launchNextQueued(userID, conversationID string) {
+	c.admissionMu.Lock()
+	defer c.admissionMu.Unlock()
+	ctx := context.Background()
+	items, err := c.repo.ListInvocations(ctx, userID, []InvocationStatus{InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationCancelling})
+	if err != nil {
+		return
+	}
+	var next *Invocation
+	for index := range items {
+		item := &items[index]
+		if item.ConversationID != conversationID {
+			continue
+		}
+		if item.Status != InvocationQueued {
+			return
+		}
+		if next == nil || item.CreatedAt.Before(next.CreatedAt) || item.CreatedAt.Equal(next.CreatedAt) && item.ID < next.ID {
+			next = item
+		}
+	}
+	if next != nil {
+		c.launchQueuedInvocation(ctx, *next)
+	}
+}
+
+// launchQueuedInvocation 从已保存的消息与附件引用恢复一轮请求，不重新接收平台数据。
+func (c *Coordinator) launchQueuedInvocation(ctx context.Context, invocation Invocation) {
+	var workspaceID *string
+	if invocation.WorkspaceID != "" {
+		value := invocation.WorkspaceID
+		workspaceID = &value
+	}
+	c.refreshRuntimeSnapshot(ctx, invocation.ID)
+	request := agent.ChatRequest{
+		UserID: invocation.UserID, IdempotencyKey: invocation.IdempotencyKey, BotID: invocation.BotID, ConversationID: invocation.ConversationID,
+		SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID, WorkspaceID: workspaceID, TargetPath: invocation.TargetPath,
+		Message: invocation.Message, GroupContext: invocation.GroupContext, Proactive: invocation.Proactive, Attachments: cloneAttachments(invocation.Attachments), ConfigSnapshot: invocation.ConfigSnapshot, Stream: true,
+	}
+	if resume, resumeErr := c.resumeContentForInvocation(ctx, invocation.ID); resumeErr != nil {
+		message := "runtime_recovery: 读取待恢复工具响应失败: " + resumeErr.Error()
+		if ok, transitionErr := c.repo.TransitionInvocation(context.WithoutCancel(ctx), invocation.ID, InvocationQueued, InvocationFailed, message); transitionErr == nil && ok {
+			c.emitTerminal(context.WithoutCancel(ctx), invocation.ID, EventInvocationFailed, map[string]any{"error": message, "reason": "resume_handoff_read_failed"})
+		}
+		return
+	} else if resume != nil {
+		request.ResumeContent = resume
+		request.Message = ""
+		request.GroupContext = ""
+		request.Attachments = nil
+	}
+	c.launch(invocation.ID, request)
+}
+
 func (c *Coordinator) appendAndPublish(ctx context.Context, event AgentEvent) (AgentEvent, error) {
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
@@ -8072,6 +8153,12 @@ func (c *Coordinator) publishStoredEvent(stored AgentEvent) {
 		}
 	}
 	c.mu.Unlock()
+	// 所有终态事件（包括原子恢复提交）都推动持久化队列，避免拒绝或重启后卡住。
+	if isTerminalEvent(stored.Type) {
+		if invocation, err := c.repo.GetInvocation(context.Background(), stored.InvocationID); err == nil && invocation.Status.Terminal() {
+			go c.launchNextQueued(invocation.UserID, invocation.ConversationID)
+		}
+	}
 }
 
 func isTerminalEvent(eventType string) bool {
