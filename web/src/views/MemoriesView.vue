@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { NAlert, NButton, NCard, NEmpty, NForm, NFormItem, NInput, NModal, NSpace, NTag, useMessage } from 'naive-ui'
 import { clearMemories, createMemory, deleteMemory, readMemories, updateMemory } from '@/api'
+import AppIcon from '@/components/AppIcon.vue'
 import { useAppStore } from '@/stores/app'
 import { useRouter } from 'vue-router'
 import type { MemoryItem } from '@/types'
@@ -121,7 +122,7 @@ onMounted(async () => {
       </div>
       <NSpace>
         <NButton secondary :loading="loading" @click="load">刷新</NButton>
-        <NButton type="primary" @click="openCreate">＋ 添加记忆</NButton>
+        <NButton type="primary" @click="openCreate"><AppIcon name="plus" :size="14" />添加记忆</NButton>
       </NSpace>
     </div>
 
@@ -161,4 +162,3 @@ onMounted(async () => {
     </NModal>
   </div>
 </template>
-

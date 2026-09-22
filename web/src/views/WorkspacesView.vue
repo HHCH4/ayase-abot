@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { NAlert, NButton, NCard, NEmpty, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, NSpace, NSwitch, NTag, useMessage } from 'naive-ui'
 import { artifactContentURL, cancelCommandRun, commandOutputDownloadURL, readCommandRuns, readLocalDirectories, readOperations, readRemoteDirectories, readWorkspaceFiles, request } from '@/api'
+import AppIcon from '@/components/AppIcon.vue'
 import { useAppStore } from '@/stores/app'
 import { useRoute, useRouter } from 'vue-router'
 import type { ArtifactExtraction, ArtifactRef, CommandRun, Conversation, DirectoryListing, Operation, TestResult, Workspace } from '@/types'
@@ -423,13 +424,13 @@ onMounted(() => {
   <div class="page-view">
     <div class="page-intro">
       <div><p class="eyebrow">PROJECTS</p><h2>项目</h2><p>每个项目绑定一个由你明确选择的本机或远程目录，并可以包含多个独立对话。</p></div>
-      <NButton type="primary" size="large" @click="openCreate">＋ 创建项目</NButton>
+      <NButton type="primary" size="large" @click="openCreate"><AppIcon name="plus" :size="14" />创建项目</NButton>
     </div>
 
     <NAlert v-if="!store.workspaces.length" type="info" :show-icon="false" class="empty-panel">尚未创建项目。项目目录不会自动生成，创建时必须由你明确指定源文件夹。</NAlert>
     <div class="workspace-grid">
       <NCard v-for="workspace in store.workspaces" :key="workspace.id" class="workspace-card" hoverable>
-        <template #header><div class="workspace-card-title"><span class="workspace-icon">▱</span><div><strong>{{ workspace.name }}</strong><span>{{ workspace.id }}</span></div></div></template>
+        <template #header><div class="workspace-card-title"><span class="workspace-icon"><AppIcon name="folder" :size="19" /></span><div><strong>{{ workspace.name }}</strong><span>{{ workspace.id }}</span></div></div></template>
         <template #header-extra><NTag round size="small" :type="workspace.status === 'ready' ? 'success' : workspace.status === 'error' ? 'error' : 'warning'">{{ workspace.status === 'ready' ? '已连接' : workspace.status === 'error' ? '连接失败' : '待检查' }}</NTag></template>
         <div class="workspace-root"><span>{{ workspace.type === 'remote' ? `远程 · ${store.remoteTargets.find((item) => item.id === workspace.remote_target_id)?.name || 'SSH'}` : workspace.type === 'ssh' ? '旧版 SSH · ' : '本地 · ' }}</span>{{ workspace.root_path }}</div>
         <p v-if="workspace.status_message" class="muted">{{ workspace.status_message }}</p>
@@ -440,7 +441,7 @@ onMounted(() => {
           </button>
           <span v-if="!workspaceConversations(workspace.id).length" class="muted">还没有对话，点击“新建对话”开始。</span>
         </div>
-        <template #footer><NSpace wrap :size="8"><NButton size="small" secondary @click="createConversation(workspace)">＋ 新建对话</NButton><NButton size="small" secondary @click="openFiles(workspace)">文件</NButton><NButton size="small" secondary @click="test(workspace)">测试</NButton><NButton size="small" secondary @click="openEdit(workspace)">编辑</NButton><NButton size="small" tertiary type="error" @click="remove(workspace)">删除</NButton></NSpace></template>
+        <template #footer><NSpace wrap :size="8"><NButton size="small" secondary @click="createConversation(workspace)"><AppIcon name="plus" :size="13" />新建对话</NButton><NButton size="small" secondary @click="openFiles(workspace)"><AppIcon name="folder" :size="13" />文件</NButton><NButton size="small" secondary @click="test(workspace)">测试</NButton><NButton size="small" secondary @click="openEdit(workspace)"><AppIcon name="edit" :size="13" />编辑</NButton><NButton size="small" tertiary type="error" @click="remove(workspace)"><AppIcon name="trash" :size="13" />删除</NButton></NSpace></template>
       </NCard>
     </div>
 
@@ -464,13 +465,13 @@ onMounted(() => {
 
     <NModal v-model:show="showDirectoryPicker" preset="card" style="width: min(760px, calc(100vw - 32px))" title="选择项目文件夹">
       <NSpace align="center" :wrap="false" class="directory-toolbar"><NInput v-model:value="directoryPath" placeholder="输入绝对路径" @keyup.enter="loadDirectories()" /><NButton secondary :loading="directoryLoading" @click="loadDirectories()">前往</NButton><NButton secondary :disabled="!directoryParent || directoryLoading" @click="loadDirectories(directoryParent)">上级</NButton></NSpace>
-      <div class="directory-list"><button v-for="entry in directoryEntries" :key="entry.path" type="button" class="directory-entry" @click="entry.is_dir ? loadDirectories(entry.path) : undefined"><span>▱</span><span>{{ entry.name }}</span><NButton v-if="entry.is_dir" size="tiny" type="primary" @click.stop="chooseDirectory(entry.path)">选择</NButton></button><span v-if="!directoryEntries.length" class="muted">当前目录没有可进入的子目录。</span></div>
+      <div class="directory-list"><button v-for="entry in directoryEntries" :key="entry.path" type="button" class="directory-entry" @click="entry.is_dir ? loadDirectories(entry.path) : undefined"><AppIcon :name="entry.is_dir ? 'folder' : 'file'" :size="15" /><span>{{ entry.name }}</span><NButton v-if="entry.is_dir" size="tiny" type="primary" @click.stop="chooseDirectory(entry.path)">选择</NButton></button><span v-if="!directoryEntries.length" class="muted">当前目录没有可进入的子目录。</span></div>
       <template #footer><div class="modal-footer"><NButton @click="showDirectoryPicker = false">取消</NButton><NButton type="primary" :disabled="!directoryPath" @click="chooseDirectory(directoryPath)">选择当前目录</NButton></div></template>
     </NModal>
 
     <NModal v-model:show="showFiles" preset="card" style="width: min(900px, calc(100vw - 32px))" :title="`${selectedWorkspace?.name || '项目'} · 文件`">
       <div class="file-browser-toolbar"><code>{{ filePath }}</code><NSpace><NInput v-model:value="searchQuery" size="small" :placeholder="searchMode === 'regex' ? '正则搜索项目内容' : '搜索项目内容'" @keyup.enter="searchWorkspace" /><NSelect v-model:value="searchMode" size="small" :options="[{ label: '原文', value: 'literal' }, { label: '正则', value: 'regex' }]" style="width: 76px" /><NInput v-model:value="searchGlob" size="small" placeholder="glob（可选）" style="width: 150px" /><NSwitch v-model:value="searchCaseInsensitive" size="small" /><span class="muted">忽略大小写</span><NInputNumber v-model:value="searchContextLines" size="small" :min="0" :max="5" :show-button="false" placeholder="上下文" style="width: 76px" /><NInputNumber v-model:value="searchMaxHits" size="small" :min="1" :max="100" :show-button="false" style="width: 76px" /><NButton size="small" secondary @click="searchWorkspace">搜索</NButton><NButton size="small" secondary @click="loadGitStatus">Git 状态</NButton><NButton size="small" secondary @click="loadGitDiff">Git diff</NButton><NButton size="small" secondary @click="loadGitLog">Git log</NButton><NButton size="small" secondary @click="selectedWorkspace && openFiles(selectedWorkspace, '.')">回到根目录</NButton></NSpace></div>
-      <div class="file-browser-list"><button v-for="file in files" :key="file.path" type="button" class="file-entry" @click="readFile(file)"><span>{{ file.is_dir ? '▱' : '·' }}</span><strong>{{ file.name }}</strong><small>{{ file.is_dir ? '目录' : `${file.size || 0} bytes` }}</small></button><NEmpty v-if="!files.length" description="目录为空" /></div>
+      <div class="file-browser-list"><button v-for="file in files" :key="file.path" type="button" class="file-entry" @click="readFile(file)"><AppIcon :name="file.is_dir ? 'folder' : 'file'" :size="15" /><strong>{{ file.name }}</strong><small>{{ file.is_dir ? '目录' : `${file.size || 0} bytes` }}</small></button><NEmpty v-if="!files.length" description="目录为空" /></div>
       <div v-if="searchMatches.length" class="workspace-result-panel"><strong>搜索结果（{{ searchMatches.length }}）</strong><button v-for="match in searchMatches" :key="`${match.path}:${match.line}`" type="button" class="workspace-result-row" @click="openSearchMatch(match)"><code>{{ match.path }}:{{ match.line }}</code><span>{{ match.preview }}</span></button></div>
       <div v-if="gitOutput" class="workspace-result-panel"><strong>Git 状态</strong><pre>{{ gitOutput }}</pre></div>
       <div v-if="gitDiffOutput" class="workspace-result-panel"><strong>Git diff</strong><pre>{{ gitDiffOutput }}</pre></div>

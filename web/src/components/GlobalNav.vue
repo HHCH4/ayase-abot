@@ -1,31 +1,32 @@
 <script setup lang="ts">
 import { RouterLink, useRoute } from 'vue-router'
+import AppIcon from '@/components/AppIcon.vue'
 
 defineProps<{ collapsed?: boolean }>()
 
 const route = useRoute()
 
-// 图标沿用参考图的多彩风格；分组只承担视觉分层，不额外引入层级导航。
+// 使用统一 SVG 图标，避免 Emoji 在不同系统字体下出现尺寸和颜色不一致。
 const navGroups = [
   {
     label: '',
     items: [
-      { name: 'status', label: '总览', icon: '📊' },
-      { name: 'bots', label: '机器人', icon: '🤖' },
-      { name: 'bot-commands', label: '指令', icon: '⌨️' },
-      { name: 'providers', label: '模型供应商', icon: '✨' },
-      { name: 'config', label: '配置文件', icon: '⚙️' },
+      { name: 'status', label: '总览', icon: 'dashboard' },
+      { name: 'bots', label: '机器人', icon: 'bot' },
+      { name: 'bot-commands', label: '指令', icon: 'terminal' },
+      { name: 'providers', label: '模型供应商', icon: 'sparkles' },
+      { name: 'config', label: '配置文件', icon: 'settings' },
     ],
   },
   {
     label: '资源',
     items: [
-      { name: 'memories', label: '长期记忆', icon: '🧠' },
-      { name: 'remote-targets', label: '远程主机', icon: '🖥️' },
-      { name: 'personas', label: '人格设定', icon: '🎭' },
-      { name: 'data', label: '数据与日志', icon: '📈' },
-      { name: 'session-management', label: '自定义规则', icon: '🧩' },
-      { name: 'cron', label: '未来任务', icon: '⏰' },
+      { name: 'memories', label: '长期记忆', icon: 'book' },
+      { name: 'remote-targets', label: '远程主机', icon: 'monitor' },
+      { name: 'personas', label: '人格设定', icon: 'users' },
+      { name: 'data', label: '数据与日志', icon: 'chart' },
+      { name: 'session-management', label: '自定义规则', icon: 'rules' },
+      { name: 'cron', label: '未来任务', icon: 'calendar' },
     ],
   },
 ]
@@ -44,7 +45,7 @@ const navGroups = [
           :class="{ active: route.name === item.name }"
           :title="item.label"
         >
-          <span class="nav-item-icon" aria-hidden="true">{{ item.icon }}</span>
+          <span class="nav-item-icon"><AppIcon :name="item.icon" :size="17" /></span>
           <span class="nav-item-label">{{ item.label }}</span>
         </RouterLink>
       </div>

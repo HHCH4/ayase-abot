@@ -4737,6 +4737,62 @@ func (c *Coordinator) ListInvocations(ctx context.Context, userID string, status
 	return c.repo.ListInvocations(ctx, strings.TrimSpace(userID), statuses)
 }
 
+// CancelConversationInvocations 取消指定会话中所有尚未结束的任务，并等待它们真正进入终态。
+// 删除会话时必须先完成这一步，否则后续的附件清理会让旧任务在恢复或收尾阶段读不到附件。
+func (c *Coordinator) CancelConversationInvocations(ctx context.Context, userID, conversationID string) error {
+	if c == nil || c.repo == nil {
+		return nil
+	}
+	userID = strings.TrimSpace(userID)
+	conversationID = strings.TrimSpace(conversationID)
+	if userID == "" || conversationID == "" {
+		return errors.New("取消会话任务需要 user_id 和 conversation_id")
+	}
+	statuses := []InvocationStatus{
+		InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool,
+		InvocationWaitingUser, InvocationWaitingSubagents, InvocationCancelling,
+	}
+	items, err := c.repo.ListInvocations(ctx, userID, statuses)
+	if err != nil {
+		return err
+	}
+	// 先发出所有取消请求，避免逐个等待时后续任务被前一个任务重新拉起。
+	for _, item := range items {
+		if item.ConversationID != conversationID {
+			continue
+		}
+		if _, cancelErr := c.CancelInvocation(ctx, item.ID); cancelErr != nil && !errors.Is(cancelErr, ErrNotFound) {
+			return fmt.Errorf("取消任务 %s 失败: %w", item.ID, cancelErr)
+		}
+	}
+	// 运行中的任务需要等待执行循环响应取消信号，确认终态后才允许删除其 Artifact。
+	waitContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		remaining, listErr := c.repo.ListInvocations(waitContext, userID, statuses)
+		if listErr != nil {
+			return listErr
+		}
+		active := false
+		for _, item := range remaining {
+			if item.ConversationID == conversationID {
+				active = true
+				break
+			}
+		}
+		if !active {
+			return nil
+		}
+		select {
+		case <-waitContext.Done():
+			return fmt.Errorf("等待会话任务结束超时: %w", waitContext.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 func (c *Coordinator) ListEvents(ctx context.Context, invocationID string, after int64, limit int) ([]AgentEvent, error) {
 	if _, err := c.repo.GetInvocation(ctx, invocationID); err != nil {
 		return nil, err

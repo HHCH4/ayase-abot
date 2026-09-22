@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { NAlert, NButton, NCard, NEmpty, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, NSpace, NSwitch, NTag, useMessage } from 'naive-ui'
 import { request } from '@/api'
+import AppIcon from '@/components/AppIcon.vue'
 import { useAppStore } from '@/stores/app'
 import type { RemoteTarget, TestResult } from '@/types'
 
@@ -139,13 +140,13 @@ onMounted(async () => {
         <h2>远程主机</h2>
         <p>连接参数独立于项目保存，同一台主机可以被多个项目复用。只有测试成功并确认主机指纹后，远程项目才会启用。</p>
       </div>
-      <NButton type="primary" size="large" @click="openEditor()">＋ 添加远程主机</NButton>
+      <NButton type="primary" size="large" @click="openEditor()"><AppIcon name="plus" :size="14" />添加远程主机</NButton>
     </div>
 
     <NAlert v-if="!sortedTargets.length" type="info" :show-icon="false" class="empty-panel">还没有远程主机。添加时不需要先保存，直接点击“测试连接”即可获取指纹；确认无误后再保存指纹。</NAlert>
     <div v-else class="remote-target-grid">
       <NCard v-for="target in sortedTargets" :key="target.id" class="remote-target-card" hoverable>
-        <template #header><div class="workspace-card-title"><span class="workspace-icon">⌁</span><div><strong>{{ target.name }}</strong><span>{{ target.user }}@{{ target.host }}:{{ target.port }}</span></div></div></template>
+        <template #header><div class="workspace-card-title"><span class="workspace-icon"><AppIcon name="monitor" :size="19" /></span><div><strong>{{ target.name }}</strong><span>{{ target.user }}@{{ target.host }}:{{ target.port }}</span></div></div></template>
         <template #header-extra><NTag round size="small" :type="statusOf(target).type">{{ statusOf(target).label }}</NTag></template>
         <div class="remote-target-meta"><span>SSH</span><span>{{ target.auth_type === 'key-file' ? '私钥认证' : target.auth_type === 'password' ? '密码认证' : 'ssh-agent' }}</span><span>项目可复用</span></div>
         <p class="muted">{{ target.status_message || (target.host_key_fingerprint ? '已记录主机指纹' : '尚未确认主机指纹') }}</p>

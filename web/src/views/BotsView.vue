@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { NAlert, NButton, NCard, NDynamicTags, NEmpty, NForm, NFormItem, NInput, NInputNumber, NSelect, NSpace, NSwitch, NTag, useMessage } from 'naive-ui'
 import { request } from '@/api'
+import AppIcon from '@/components/AppIcon.vue'
 import { useAppStore } from '@/stores/app'
 import type { Bot } from '@/types'
 
@@ -191,7 +192,7 @@ onMounted(async () => {
         <h2>机器人</h2>
         <p>管理 Telegram 和 OneBot 11 连接实例。NapCat 反向 WebSocket 默认连接到这里配置的监听地址。</p>
       </div>
-      <NButton type="primary" size="large" @click="createBot">＋ 创建机器人</NButton>
+      <NButton type="primary" size="large" @click="createBot"><AppIcon name="plus" :size="14" />创建机器人</NButton>
     </div>
 
     <div class="bot-workbench">

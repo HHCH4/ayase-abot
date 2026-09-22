@@ -97,6 +97,24 @@ func (m *Manager) recordGroupContext(ctx context.Context, message Message, setti
 	m.groupHistory[source] = items
 }
 
+// clearGroupContext 清除指定 UMO 的群聊背景；新建会话不能继承旧会话的群消息缓存。
+func (m *Manager) clearGroupContext(source string) {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.groupHistory, source)
+	for index, item := range m.groupHistoryOrder {
+		if item != source {
+			continue
+		}
+		m.groupHistoryOrder = append(m.groupHistoryOrder[:index], m.groupHistoryOrder[index+1:]...)
+		break
+	}
+}
+
 // groupContextText 在同一 UMO 内读取最近历史；内容长度再限一次以保护模型上下文。
 func (m *Manager) groupContextText(message Message, settings ExtensionConfig) string {
 	if !isGroupChat(message.ChatType) || (!settings.GroupContextEnabled && !settings.ProactiveReplyEnabled) {

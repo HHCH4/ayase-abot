@@ -2,6 +2,7 @@
 import { computed, reactive, ref } from 'vue'
 import { NAlert, NButton, NCard, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, NSpace, NTag, useMessage } from 'naive-ui'
 import { request } from '@/api'
+import AppIcon from '@/components/AppIcon.vue'
 import { useAppStore } from '@/stores/app'
 import type { CapabilityObservationRecord, CapabilityProbeResult, ModelCapabilityProfile, Provider, ProviderModel } from '@/types'
 
@@ -340,7 +341,7 @@ async function remove(provider: Provider) {
         <h2>供应商与模型目录</h2>
         <p>集中管理 OpenAI Chat / Responses 兼容接口和 Gemini 供应商，保存后立即加入 Agent 模型池。</p>
       </div>
-      <NButton type="primary" size="large" @click="openEditor()">＋ 添加供应商</NButton>
+      <NButton type="primary" size="large" @click="openEditor()"><AppIcon name="plus" :size="14" />添加供应商</NButton>
     </div>
 
     <NAlert v-if="store.providers.length === 0" type="info" :show-icon="false" class="empty-panel">
@@ -477,7 +478,7 @@ async function remove(provider: Provider) {
               </div>
             </div>
           </div>
-          <NButton dashed block @click="addModel">＋ 添加模型</NButton>
+          <NButton dashed block @click="addModel"><AppIcon name="plus" :size="14" />添加模型</NButton>
         </div>
       </NForm>
       <template #footer>

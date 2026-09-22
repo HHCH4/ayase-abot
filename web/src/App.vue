@@ -3,6 +3,7 @@ import { computed, onBeforeMount, ref } from 'vue'
 import { RouterLink, RouterView, useRoute } from 'vue-router'
 import { NConfigProvider, NMessageProvider, lightTheme, type GlobalThemeOverrides } from 'naive-ui'
 import GlobalNav from '@/components/GlobalNav.vue'
+import AppIcon from '@/components/AppIcon.vue'
 import { useAppStore } from '@/stores/app'
 
 const route = useRoute()
@@ -71,7 +72,7 @@ onBeforeMount(() => {
               :aria-label="navCollapsed ? '展开导航' : '收起导航'"
               :aria-expanded="!navCollapsed"
               @click="navCollapsed = !navCollapsed"
-            >☰</button>
+            ><AppIcon name="menu" :size="17" /></button>
             <RouterLink to="/status" class="top-brand">
               <span class="top-brand-name">Abot</span>
               <span class="top-brand-version">v{{ appVersion }}</span>
@@ -80,7 +81,7 @@ onBeforeMount(() => {
           <div class="top-bar-actions">
             <span class="top-bar-status" :class="{ warning: Boolean(store.lastError) }">{{ statusText }}</span>
             <RouterLink to="/chat" class="top-chat-entry">
-              <span class="top-chat-entry-icon" aria-hidden="true">💬</span>
+              <AppIcon class="top-chat-entry-icon" name="chat" :size="14" />
               <span>chat</span>
             </RouterLink>
           </div>

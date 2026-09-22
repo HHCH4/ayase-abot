@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { NAlert, NButton, NCard, NCheckbox, NEmpty, NForm, NFormItem, NInput, NModal, NSpace, NTag, useMessage } from 'naive-ui'
 import { deletePersona, readPersonaRevisions, readPersonas, request, savePersona, setDefaultPersona } from '@/api'
+import AppIcon from '@/components/AppIcon.vue'
 import type { Persona, PersonaRevision } from '@/types'
 
 const message = useMessage()
@@ -160,14 +161,14 @@ onMounted(load)
         <NButton secondary :loading="loading" @click="load">刷新</NButton>
         <NButton secondary @click="importInput?.click()">导入</NButton>
         <input ref="importInput" class="visually-hidden" type="file" accept="application/json,.json" @change="importPersona">
-        <NButton type="primary" @click="openCreate">＋ 新建人格</NButton>
+        <NButton type="primary" @click="openCreate"><AppIcon name="plus" :size="14" />新建人格</NButton>
       </NSpace>
     </div>
 
     <div v-if="personas.length" class="persona-grid">
       <NCard v-for="item in personas" :key="item.id" class="persona-card" :bordered="false" :class="{ selected: selected?.id === item.id }" @click="selectedID = item.id">
         <div class="persona-card-heading">
-          <div class="detail-avatar">🎭</div>
+          <div class="detail-avatar"><AppIcon name="users" :size="20" /></div>
           <div class="persona-card-copy">
             <strong>{{ item.name }}</strong>
             <span>{{ item.id }}</span>

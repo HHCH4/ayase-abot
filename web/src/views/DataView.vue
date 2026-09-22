@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { NButton, NCard, NEmpty, NInput, NModal, NSelect, NSpace, NTabPane, NTag, NTabs, useMessage } from 'naive-ui'
 import { archiveStoredConversation, deleteStoredConversation, openDataLogStream, readConversationMessages, readDataConversations, readDataTraces, readDashboardStats, readInvocationTrace, unarchiveStoredConversation } from '@/api'
+import AppIcon from '@/components/AppIcon.vue'
 import type { Conversation, ConversationMessage, DashboardStats, DataLogEntry, InvocationTrace } from '@/types'
 
 const message = useMessage()
@@ -358,7 +359,7 @@ watch(autoScrollLogs, () => {
           <div class="log-terminal-toolbar">
             <div class="log-level-filters">
               <button v-for="level in logLevels" :key="level" type="button" class="log-filter-chip" :class="{ active: selectedLogLevels.includes(level) }" @click="toggleLogLevel(level)">
-                <span>✓</span>{{ level }}
+                <AppIcon v-if="selectedLogLevels.includes(level)" name="check" :size="13" />{{ level }}
               </button>
             </div>
             <div class="log-terminal-actions">

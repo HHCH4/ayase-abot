@@ -1131,8 +1131,14 @@ func (s *Server) chat(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if s.conversations != nil && conversationID != "" {
-		if _, getErr := s.conversations.Get(request.Context(), payload.UserID, conversationID); getErr != nil {
+		item, getErr := s.conversations.Get(request.Context(), payload.UserID, conversationID)
+		if getErr != nil {
 			writeError(writer, getErr)
+			return
+		}
+		// 归档会话只能查看和删除，不能再接收新任务，避免删除流程与新请求并发。
+		if item.Status != conversation.StatusActive {
+			writeError(writer, fmt.Errorf("会话当前状态为 %s，不能继续聊天", item.Status))
 			return
 		}
 	}

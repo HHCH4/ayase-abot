@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { NButton, NCard, NCheckbox, NEmpty, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, NSpace, NTag, useMessage } from 'naive-ui'
 import { batchSessionRules, createSessionRule, deleteSessionRule, deleteSessionRuleGroup, readPersonas, readSessionRuleGroups, readSessionRules, readSessionSources, resetSessionRuleField, saveSessionRule, saveSessionRuleGroup } from '@/api'
+import AppIcon from '@/components/AppIcon.vue'
 import { useAppStore } from '@/stores/app'
 import type { Persona, SessionRule, SessionRuleGroup, SessionSource } from '@/types'
 
@@ -311,7 +312,7 @@ async function removeGroup(item: SessionRuleGroup) {
         <h2>自定义规则</h2>
         <p>来源从已经产生过消息的会话中选择，按 UMO 覆盖处理、内置 AI、模型、人格和知识库选项；所有规则都在本地内置 Agent 边界内执行。</p>
       </div>
-      <NSpace><NButton secondary :loading="loading" @click="load">刷新</NButton><NButton type="primary" @click="openCreate()">＋ 新建规则</NButton></NSpace>
+      <NSpace><NButton secondary :loading="loading" @click="load">刷新</NButton><NButton type="primary" @click="openCreate()"><AppIcon name="plus" :size="14" />新建规则</NButton></NSpace>
     </div>
 
     <NCard class="detail-card" :bordered="false">
@@ -335,7 +336,7 @@ async function removeGroup(item: SessionRuleGroup) {
     </NCard>
 
     <NCard class="detail-card group-card" :bordered="false">
-      <div class="section-heading-row"><div><h3>会话分组</h3><p>分组只保存来源集合，批量修改时会展开为精确来源。</p></div><NButton secondary @click="openGroupCreate">＋ 新建分组</NButton></div>
+      <div class="section-heading-row"><div><h3>会话分组</h3><p>分组只保存来源集合，批量修改时会展开为精确来源。</p></div><NButton secondary @click="openGroupCreate"><AppIcon name="plus" :size="14" />新建分组</NButton></div>
       <div v-if="groups.length" class="group-list"><div v-for="item in groups" :key="item.id" class="group-row"><div><strong>{{ item.name }}</strong><span>{{ item.description || '暂无描述' }}</span></div><NTag size="small" :bordered="false">{{ item.members.length }} 个来源</NTag><NSpace size="small"><NButton size="small" secondary @click="openGroupEdit(item)">编辑</NButton><NButton size="small" tertiary type="error" @click="removeGroup(item)">删除</NButton></NSpace></div></div>
       <NEmpty v-else description="还没有分组" />
     </NCard>

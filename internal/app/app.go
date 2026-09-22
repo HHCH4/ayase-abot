@@ -523,6 +523,13 @@ func Run(opts bootstrap.Options) error {
 	if err != nil {
 		return err
 	}
+	// 删除会话前先让 Runtime 终止该会话的排队和运行中任务，保护其附件引用直到任务收尾完成。
+	conversationService.SetInvocationDeletionHook(func(deleteCtx context.Context, userID, conversationID string) error {
+		if runtimeCoordinator == nil {
+			return nil
+		}
+		return runtimeCoordinator.CancelConversationInvocations(deleteCtx, userID, conversationID)
+	})
 	// 领域服务通过只读适配器接入通用检索层。适配器只返回有界证据摘要，
 	// 不把记忆、会话或工作区的底层仓储暴露给子 Agent。
 	if err := runtimeCoordinator.SetRetrievalAdapter(agentruntime.NewRetrievalAdapter("memory", func(retrieveCtx context.Context, request agentruntime.RetrievalRequest) ([]agentruntime.EvidenceItem, error) {

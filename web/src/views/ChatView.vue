@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { NAlert, NButton, NEmpty, NForm, NFormItem, NInput, NScrollbar, NSelect, NSpace, NSpin, NTag, useMessage } from 'naive-ui'
 import { readConversationContext, readConversationMessages, readInvocationCapabilities, readInvocationPlan, readInvocationResult, readInvocationRuntimeSnapshot, readInvocationSubAgents, readInvocationToolSet, readInvocationTrace, readInvocationVerifications, readSubAgentGroup, request, streamChat, uploadArtifact } from '@/api'
 import ConversationActions from '@/components/ConversationActions.vue'
+import AppIcon from '@/components/AppIcon.vue'
 import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
 import ProviderDialog from '@/components/ProviderDialog.vue'
 import { useAppStore } from '@/stores/app'
@@ -24,6 +25,7 @@ const selectedModel = ref('')
 const providerID = ref('')
 const profileID = ref('')
 const sending = ref(false)
+const preparingConversation = ref(false)
 const loadingMessages = ref(false)
 const statusText = ref('')
 const showSettings = ref(false)
@@ -151,7 +153,7 @@ const displayStatus = computed(() => {
   if (pendingUserInput.value) return '等待回答'
   if (sending.value) return statusText.value || '运行中'
   if (statusText.value) return statusText.value
-  if (!selectedConversation.value) return '选择一个对话'
+  if (!selectedConversation.value) return '发送消息后自动创建对话'
   return selectedConversation.value.status === 'active' ? '就绪' : '已归档'
 })
 const statusTagType = computed<'default' | 'success' | 'warning' | 'error' | 'info'>(() => {
@@ -264,6 +266,9 @@ function applyProfile(id = profileID.value) {
 
 async function selectConversation(id: string, updateRoute = true) {
   if (id !== conversationID.value) {
+    // 切换会话立即清空旧消息，避免新会话加载期间继续显示或误认为继承了旧历史。
+    conversationMessages.value = []
+    contextStatus.value = { compressed: false, compaction_count: 0 }
     statusText.value = ''
     runtimeTimeline.value = []
     pendingApproval.value = null
@@ -346,6 +351,27 @@ async function ensureConversation() {
   conversationMessages.value = []
   contextStatus.value = { compressed: false, compaction_count: 0 }
   if (fromRoute) await router.replace({ name: 'chat' })
+}
+
+// createAutomaticConversation 为没有当前会话的首次消息准备普通对话。
+// 创建成功后立即刷新列表并选中，保证后续附件和消息都绑定到同一个会话。
+async function createAutomaticConversation(title = '新对话'): Promise<Conversation | null> {
+  if (preparingConversation.value) return null
+  preparingConversation.value = true
+  try {
+    const created = await request<Conversation>('/api/v1/conversations', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: userID.value, title: title.trim() || '新对话' }),
+    })
+    await store.reloadConversations(userID.value)
+    await selectConversation(created.id)
+    return store.conversations.find((item) => item.id === created.id) || created
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '自动创建对话失败')
+    return null
+  } finally {
+    preparingConversation.value = false
+  }
 }
 
 async function createConversation() {
@@ -474,6 +500,11 @@ async function chooseFiles(event: Event) {
     }
     currentTotal += file.size
     accepted.push(file)
+  }
+  // 没有会话时，选择附件也要先建立会话，避免附件成为没有归属的孤立对象。
+  if (accepted.length && !selectedConversation.value) {
+    const created = await createAutomaticConversation()
+    if (!created) return
   }
   const loaded = await Promise.allSettled(accepted.map(uploadFile))
   loaded.forEach((item) => item.status === 'fulfilled' ? attachments.value.push(item.value) : message.error(item.reason?.message || '上传附件失败'))
@@ -642,8 +673,13 @@ async function scrollToBottom() {
 async function send() {
   const text = inputText.value.trim()
   const model = selectedModel.value.trim()
-  const item = selectedConversation.value
-  if ((!text && !attachments.value.length) || !item || item.status !== 'active' || !model || sending.value) return
+  if ((!text && !attachments.value.length) || !model || sending.value || preparingConversation.value) return
+  let item: Conversation | undefined = selectedConversation.value
+  if (!item) {
+    // 删除全部会话后仍允许直接发送，首次消息会自动创建新的普通会话。
+    item = (await createAutomaticConversation()) || undefined
+  }
+  if (!item || item.status !== 'active') return
   const outgoing = attachments.value.map((item) => ({ ...item }))
   conversationMessages.value.push({ role: 'user', text, attachment_count: outgoing.length, timestamp: new Date().toISOString() })
   conversationMessages.value.push({ role: 'assistant', text: '', timestamp: new Date().toISOString() })
@@ -765,20 +801,20 @@ onMounted(async () => {
         <span class="chat-rail-brand-copy"><strong>Abot</strong><small>Chat</small></span>
       </div>
       <button type="button" class="rail-nav-item" @click="createConversation">
-        <span class="rail-nav-icon" aria-hidden="true">＋</span>创建对话
+        <span class="rail-nav-icon"><AppIcon name="plus" :size="15" /></span>创建对话
       </button>
       <NScrollbar class="chat-rail-scroll">
         <div class="rail-section-head">
           <span>项目</span>
-          <button type="button" class="rail-section-add" title="新建项目" aria-label="新建项目" @click="showProjectDialog = true">＋</button>
+          <button type="button" class="rail-section-add" title="新建项目" aria-label="新建项目" @click="showProjectDialog = true"><AppIcon name="plus" :size="14" /></button>
         </div>
         <div v-for="workspace in projectWorkspaces" :key="workspace.id" class="rail-project">
           <div class="rail-project-head">
             <button type="button" class="rail-project-toggle" :aria-label="`${isProjectExpanded(workspace) ? '收起' : '展开'}${workspace.name}`" @click="toggleProject(workspace)">
               <span class="rail-chevron">{{ isProjectExpanded(workspace) ? '⌄' : '›' }}</span>
             </button>
-            <span class="rail-project-name" :title="workspace.root_path"><span class="rail-folder">▱</span><span class="rail-label">{{ workspace.name }}</span></span>
-            <button type="button" class="rail-project-add" :aria-label="`在${workspace.name}中新建对话`" @click="createProjectConversation(workspace)">＋</button>
+            <span class="rail-project-name" :title="workspace.root_path"><span class="rail-folder"><AppIcon name="folder" :size="14" /></span><span class="rail-label">{{ workspace.name }}</span></span>
+            <button type="button" class="rail-project-add" :aria-label="`在${workspace.name}中新建对话`" @click="createProjectConversation(workspace)"><AppIcon name="plus" :size="14" /></button>
           </div>
           <div v-if="isProjectExpanded(workspace)" class="rail-children">
             <div v-for="item in projectConversations(workspace)" :key="item.id" class="rail-conversation-row">
@@ -815,7 +851,7 @@ onMounted(async () => {
       </NScrollbar>
       <div class="chat-rail-footer">
         <button type="button" class="rail-nav-item" @click="showSettings = true">
-          <span class="rail-nav-icon" aria-hidden="true">⚙</span>设置
+        <span class="rail-nav-icon"><AppIcon name="settings" :size="15" /></span>设置
         </button>
       </div>
     </aside>
@@ -829,7 +865,7 @@ onMounted(async () => {
         <div class="chat-topbar-actions">
           <span class="chat-topbar-status">{{ displayStatus }}</span>
           <button type="button" class="chat-switch-button" title="返回 Bot 管理台" @click="router.push({ name: 'status' })">
-            <span aria-hidden="true">🤖</span>Bot
+            <AppIcon name="bot" :size="16" />Bot
           </button>
         </div>
       </header>
@@ -854,7 +890,7 @@ onMounted(async () => {
             <div class="message-bubble">
               <pre v-if="item.text">{{ item.text }}</pre>
               <span v-if="!item.text && item.role === 'assistant' && sending && index === conversationMessages.length - 1" class="typing-indicator"><i /><i /><i /></span>
-              <div v-if="item.attachment_count" class="message-attachment-count">📎 {{ item.attachment_count }} 个附件</div>
+              <div v-if="item.attachment_count" class="message-attachment-count"><AppIcon name="paperclip" :size="13" /> {{ item.attachment_count }} 个附件</div>
             </div>
           </div>
         </div>
@@ -868,7 +904,7 @@ onMounted(async () => {
           <span v-else class="chat-activity-count">{{ runtimeTimeline.length }} 条记录</span>
         </div>
         <div v-if="pendingApproval" class="chat-approval-card">
-          <div class="approval-icon">!</div>
+          <div class="approval-icon"><AppIcon name="shield" :size="16" /></div>
           <div class="approval-copy">
             <strong>{{ pendingApproval.toolName }}</strong>
             <p>{{ pendingApproval.hint }}</p>
@@ -888,7 +924,7 @@ onMounted(async () => {
           </div>
           <div v-if="pendingUserInput.options.length" class="user-input-options">
             <button v-for="(option, index) in pendingUserInput.options" :key="option.id" type="button" class="user-input-option" :class="{ selected: pendingUserInput.selectedIDs.includes(option.id) }" @click="togglePendingUserInputOption(option.id)">
-              <span class="user-input-option-index">{{ pendingUserInput.allowMultiple ? (pendingUserInput.selectedIDs.includes(option.id) ? '✓' : '') : index + 1 }}</span>
+              <span class="user-input-option-index"><AppIcon v-if="pendingUserInput.allowMultiple && pendingUserInput.selectedIDs.includes(option.id)" name="check" :size="14" /><template v-else-if="!pendingUserInput.allowMultiple">{{ index + 1 }}</template></span>
               <span class="user-input-option-copy"><strong>{{ option.label }}</strong><small v-if="option.description">{{ option.description }}</small></span>
               <NTag v-if="option.recommended" size="small" type="info" :bordered="false">推荐</NTag>
             </button>
@@ -900,7 +936,7 @@ onMounted(async () => {
           </div>
         </div>
         <div v-if="instructionConflict" class="chat-conflict-card">
-          <div class="conflict-icon">↻</div>
+          <div class="conflict-icon"><AppIcon name="refresh" :size="16" /></div>
           <div class="conflict-copy">
             <strong>项目指令已变化</strong>
             <p>为避免把新规则静默带入副作用，请先确认当前指令快照，再重新提交审批。</p>
@@ -1016,20 +1052,20 @@ onMounted(async () => {
     <footer class="chat-composer-shell">
       <div v-if="attachments.length" class="attachment-strip">
         <div v-for="(attachment, index) in attachments" :key="`${attachment.name}-${index}`" class="attachment-chip">
-          <span>📎 {{ attachment.name }}</span><NButton text type="error" aria-label="移除附件" @click="removeAttachment(index)">×</NButton>
+          <span><AppIcon name="paperclip" :size="13" /> {{ attachment.name }}</span><NButton text type="error" aria-label="移除附件" @click="removeAttachment(index)"><AppIcon name="close" :size="15" /></NButton>
         </div>
       </div>
       <div class="chat-composer">
-        <NInput v-model:value="inputText" class="chat-composer-input" type="textarea" :autosize="{ minRows: 1, maxRows: 6 }" placeholder="给 Abot 发消息…" :disabled="!selectedConversation || selectedConversation.status !== 'active' || sending" @keydown.ctrl.enter.prevent="send" @keydown.meta.enter.prevent="send" />
+        <NInput v-model:value="inputText" class="chat-composer-input" type="textarea" :autosize="{ minRows: 1, maxRows: 6 }" placeholder="给 Abot 发消息…" :disabled="(selectedConversation && selectedConversation.status !== 'active') || sending || preparingConversation" @keydown.ctrl.enter.prevent="send" @keydown.meta.enter.prevent="send" />
         <div class="chat-composer-toolbar">
           <div class="chat-composer-tools">
             <input ref="fileInput" type="file" multiple class="visually-hidden" accept="image/*,application/pdf,text/*,.json,.md,.csv,.doc,.docx,.xls,.xlsx" @change="chooseFiles" />
-            <NButton quaternary circle aria-label="添加文件" :disabled="!selectedConversation || selectedConversation.status !== 'active' || sending" @click="fileInput?.click()">＋</NButton>
+            <NButton quaternary circle aria-label="添加文件" :disabled="(selectedConversation && selectedConversation.status !== 'active') || sending || preparingConversation" @click="fileInput?.click()"><AppIcon name="paperclip" :size="16" /></NButton>
             <NSelect v-model:value="topbarModelValue" :options="topbarModelOptions" size="tiny" class="composer-select composer-model-select" placeholder="选择模型" />
             <NSelect v-model:value="reasoningEffort" :options="reasoningEffortOptions" size="tiny" class="composer-select composer-effort-select" />
           </div>
           <div class="chat-send-hint">⌘↵ 发送</div>
-          <NButton class="chat-send-button" type="primary" circle :loading="sending" :disabled="!selectedConversation || selectedConversation.status !== 'active' || (!inputText.trim() && !attachments.length)" aria-label="发送消息" @click="send">↑</NButton>
+          <NButton class="chat-send-button" type="primary" circle :loading="sending || preparingConversation" :disabled="(selectedConversation && selectedConversation.status !== 'active') || sending || preparingConversation || (!inputText.trim() && !attachments.length)" aria-label="发送消息" @click="send"><AppIcon name="arrow-up" :size="16" /></NButton>
         </div>
       </div>
       <p class="chat-disclaimer">Abot 可能会出错，请检查重要信息。</p>
@@ -1041,10 +1077,10 @@ onMounted(async () => {
 
     <transition name="chat-settings">
       <aside v-if="showSettings" class="chat-settings-panel">
-        <div class="chat-settings-header"><div><span class="eyebrow">CONVERSATION</span><strong>对话设置</strong></div><NButton quaternary circle aria-label="关闭设置" @click="showSettings = false">×</NButton></div>
+        <div class="chat-settings-header"><div><span class="eyebrow">CONVERSATION</span><strong>对话设置</strong></div><NButton quaternary circle aria-label="关闭设置" @click="showSettings = false"><AppIcon name="close" :size="16" /></NButton></div>
         <NForm label-placement="top" :show-feedback="false">
           <NFormItem label="对话"><NSelect :value="conversationID" :options="activeConversations.map((item) => ({ label: conversationLabel(item), value: item.id }))" placeholder="选择一个对话" @update:value="selectConversation" /></NFormItem>
-          <NSpace wrap><NButton type="primary" @click="createConversation">＋ 新建对话</NButton><NButton secondary :disabled="selectedConversation?.status !== 'active'" @click="archiveConversation()">归档</NButton><NButton secondary :disabled="selectedConversation?.status !== 'archived'" @click="unarchiveConversation()">恢复</NButton><NButton tertiary type="error" :disabled="selectedConversation?.status !== 'archived'" @click="deleteConversation()">删除</NButton></NSpace>
+          <NSpace wrap><NButton type="primary" @click="createConversation"><AppIcon name="plus" :size="14" />新建对话</NButton><NButton secondary :disabled="selectedConversation?.status !== 'active'" @click="archiveConversation()">归档</NButton><NButton secondary :disabled="selectedConversation?.status !== 'archived'" @click="unarchiveConversation()">恢复</NButton><NButton tertiary type="error" :disabled="selectedConversation?.status !== 'archived'" @click="deleteConversation()">删除</NButton></NSpace>
           <div class="chat-settings-divider" />
           <NFormItem label="配置文件"><NSelect v-model:value="profileID" :options="profileOptions" @update:value="bindProfile" /><small>系统默认 → 机器人 → 当前对话。</small></NFormItem>
           <NFormItem label="子 Agent"><NSelect :value="subAgentMode" :options="subAgentModeOptions" :disabled="selectedConversation?.status !== 'active'" @update:value="setSubAgentMode" /><small>当前：{{ subAgentEffectiveEnabled ? '已启用' : '已停用' }}。也可以在聊天中使用 /subagent on、/subagent off 或 /subagent inherit。</small></NFormItem>
@@ -1053,11 +1089,11 @@ onMounted(async () => {
             <div v-for="item in store.providers" :key="item.id" class="settings-provider-row">
               <span class="settings-provider-name">{{ item.name }}</span>
               <span class="rail-item-actions always">
-                <button type="button" class="rail-item-action" title="编辑" aria-label="编辑供应商" @click="openProviderDialog(item)">✎</button>
-                <button type="button" class="rail-item-action danger" title="删除" aria-label="删除供应商" @click="removeProvider(item)">✕</button>
+                <button type="button" class="rail-item-action" title="编辑" aria-label="编辑供应商" @click="openProviderDialog(item)"><AppIcon name="edit" :size="14" /></button>
+                <button type="button" class="rail-item-action danger" title="删除" aria-label="删除供应商" @click="removeProvider(item)"><AppIcon name="trash" :size="14" /></button>
               </span>
             </div>
-            <button type="button" class="settings-provider-add" @click="openProviderDialog(null)">＋ 添加供应商</button>
+            <button type="button" class="settings-provider-add" @click="openProviderDialog(null)"><AppIcon name="plus" :size="14" />添加供应商</button>
           </div>
           <NFormItem label="模型"><NSelect v-model:value="modelSelectValue" :options="modelOptions" placeholder="选择已配置模型" /></NFormItem>
           <NFormItem label="用户 ID"><NInput v-model:value="userID" /></NFormItem>

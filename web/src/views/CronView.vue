@@ -2,6 +2,7 @@
 import { onMounted, reactive, ref } from 'vue'
 import { NButton, NCard, NEmpty, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, NSpace, NTag, useMessage } from 'naive-ui'
 import { deleteScheduledTask, readScheduledTasks, saveScheduledTask, setScheduledTaskStatus } from '@/api'
+import AppIcon from '@/components/AppIcon.vue'
 import { useAppStore } from '@/stores/app'
 import type { ScheduledTask, ScheduledTaskMode } from '@/types'
 
@@ -151,7 +152,7 @@ onMounted(load)
         <h2>未来任务</h2>
         <p>创建一次性、周期性或 Cron 任务。到期后由本地调度器启动内置 AI，外部 Dify、Coze、百炼、DeerFlow 等执行方式不会被启用。</p>
       </div>
-      <NSpace><NButton secondary :loading="loading" @click="load">刷新</NButton><NButton type="primary" @click="openCreate">＋ 新建任务</NButton></NSpace>
+      <NSpace><NButton secondary :loading="loading" @click="load">刷新</NButton><NButton type="primary" @click="openCreate"><AppIcon name="plus" :size="14" />新建任务</NButton></NSpace>
     </div>
 
     <div v-if="tasks.length" class="task-grid">

@@ -210,16 +210,16 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 		return nil
 	}
 	m.sendPlatformPreAck(ctx, message, platformConfig.Platform)
-	// 群历史独立传递，不能混进任务目标或授权判断。
+	userID, conversationID, err := m.conversationForMessage(ctx, message)
+	if err != nil {
+		return err
+	}
+	// 在解析完会话后再读取群历史；如果这是新会话，conversationForMessage
+	// 已经清除了旧 UMO 缓存，当前请求不会把上一会话的群消息带进来。
 	idempotencyKey := botMessageIdempotencyKey(message)
 	groupContext := ""
 	if extensionConfig.Extensions.GroupContextEnabled || proactive {
 		groupContext = m.groupContextText(message, extensionConfig.Extensions)
-	}
-
-	userID, conversationID, err := m.conversationForMessage(ctx, message)
-	if err != nil {
-		return err
 	}
 	lock := m.bindingLock(conversationID)
 	lock.Lock()
@@ -437,6 +437,9 @@ func (m *Manager) conversationForMessage(ctx context.Context, message Message) (
 	if err != nil {
 		return "", "", fmt.Errorf("创建机器人会话失败: %w", err)
 	}
+	// 稳定基础会话不存在时代表来源开启了一个全新的会话，不能继续使用
+	// 进程内保留的旧群聊背景；当前消息仍会作为本轮独立输入发送。
+	m.clearGroupContext(messageSource(message))
 	m.setActiveConversation(key, item.ID)
 	return userID, item.ID, nil
 }
@@ -492,6 +495,8 @@ func (m *Manager) startNewConversation(ctx context.Context, message Message) err
 	if createErr != nil {
 		return fmt.Errorf("创建新机器人会话失败: %w", createErr)
 	}
+	// /new 明确要求从空上下文开始，连同来源级群聊背景一起重置。
+	m.clearGroupContext(messageSource(message))
 	key := chatBindingKey(message)
 	m.mu.Lock()
 	m.activeConversations[key] = created.ID

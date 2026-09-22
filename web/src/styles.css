@@ -58,7 +58,8 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .top-bar-status.warning { color: #b57938; }
 .top-chat-entry { display: flex; align-items: center; gap: 7px; height: 32px; padding: 0 14px; border-radius: 999px; background: #1f2329; color: #fff; font-size: 13px; font-weight: 600; text-decoration: none; transition: .16s ease; }
 .top-chat-entry:hover { background: #343a42; }
-.top-chat-entry-icon { font-size: 12px; }
+.app-icon { display: block; flex: none; }
+.top-chat-entry-icon { opacity: .9; }
 
 .app-body { display: flex; flex: 1; min-height: 0; }
 
@@ -71,7 +72,7 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .nav-item { display: flex; align-items: center; gap: 11px; min-height: 40px; margin-bottom: 2px; padding: 8px 10px; border-radius: 9px; color: var(--text-2); font-size: 13.5px; font-weight: 550; text-decoration: none; transition: .16s ease; }
 .nav-item:hover { background: #f4f5f7; color: var(--text); }
 .nav-item.active { background: var(--brand-soft); color: var(--brand); font-weight: 650; }
-.nav-item-icon { display: grid; place-items: center; flex: none; width: 22px; font-size: 16px; line-height: 1; }
+.nav-item-icon { display: grid; place-items: center; flex: none; width: 22px; color: currentColor; line-height: 1; }
 .nav-item-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .app-nav.collapsed .nav-group-label { display: none; }
 .app-nav.collapsed .nav-item { justify-content: center; gap: 0; padding: 8px 0; }

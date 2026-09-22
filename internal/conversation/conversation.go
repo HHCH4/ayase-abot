@@ -119,6 +119,7 @@ type Service struct {
 	sessions           session.Service
 	appName            string
 	artifactDeletion   func(context.Context, string) error
+	invocationDeletion func(context.Context, string, string) error
 	workspaceValidator WorkspaceValidator
 	sourceNameResolver SourceNameResolver
 	mu                 sync.Mutex
@@ -142,6 +143,14 @@ func NewService(repository Repository, sessions session.Service, appName string)
 // deletion so an unavailable object store aborts the destructive operation.
 func (s *Service) SetArtifactDeletionHook(hook func(context.Context, string) error) {
 	s.artifactDeletion = hook
+}
+
+// SetInvocationDeletionHook 在删除会话前清理仍属于该会话的运行中任务。
+// 该回调只负责让任务进入终态，具体的附件和会话删除仍由本服务完成。
+func (s *Service) SetInvocationDeletionHook(hook func(context.Context, string, string) error) {
+	s.mu.Lock()
+	s.invocationDeletion = hook
+	s.mu.Unlock()
 }
 
 // SetSourceNameResolver 让管理台读取 /name 的来源别名；未安装时保持原有会话结构不变。
@@ -569,12 +578,29 @@ func (s *Service) Unarchive(ctx context.Context, userID, id string) (Conversatio
 	return item, nil
 }
 
-// Delete 只允许删除已归档对话，并先清除 ADK Session，再清除对话元数据和关联操作。
-// 删除不是软删除：成功后不再存在可查询的对话记录。
+// Delete 只允许删除已归档对话，并依次终止运行任务、清除附件、ADK Session
+// 和对话元数据。删除不是软删除：成功后不再存在可查询的对话记录。
 func (s *Service) Delete(ctx context.Context, userID, id string) error {
+	item, err := s.Get(ctx, userID, id)
+	if err != nil {
+		return err
+	}
+	if item.Status != StatusArchived {
+		return fmt.Errorf("%w: 当前状态为 %s", ErrDeleteRequiresArchive, item.Status)
+	}
+	// 先取消并等待旧任务结束，避免任务仍在读取附件时被下面的清理流程删除。
+	s.mu.Lock()
+	invocationDeletion := s.invocationDeletion
+	s.mu.Unlock()
+	if invocationDeletion != nil {
+		if err := invocationDeletion(ctx, item.UserID, item.ID); err != nil {
+			return fmt.Errorf("取消会话运行中任务失败: %w", err)
+		}
+	}
+	// 回调期间可能发生并发状态变化，重新读取并加锁后再次校验，避免误删被恢复的会话。
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	item, err := s.Get(ctx, userID, id)
+	item, err = s.Get(ctx, userID, id)
 	if err != nil {
 		return err
 	}
