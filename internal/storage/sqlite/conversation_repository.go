@@ -158,6 +158,15 @@ func (r *conversationRepository) Delete(ctx context.Context, userID, id string) 
 		}
 		// Runtime 的所有持久化记录都通过 Invocation 关联对话；先删子表，
 		// 再删 Invocation，避免数据与日志页继续显示已删除会话的孤儿记录。
+		if err := tx.Exec("DELETE FROM abot_agent_subagent_evidence WHERE group_id IN (SELECT id FROM abot_agent_subagent_groups WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?))", id).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec("DELETE FROM abot_agent_subagent_runs WHERE group_id IN (SELECT id FROM abot_agent_subagent_groups WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?))", id).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec("DELETE FROM abot_agent_subagent_groups WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error; err != nil {
+			return err
+		}
 		deleteRuntimeByInvocation := func(table string) error {
 			return tx.Exec("DELETE FROM "+table+" WHERE invocation_id IN (SELECT id FROM abot_agent_invocations WHERE conversation_id = ?)", id).Error
 		}

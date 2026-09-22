@@ -26,6 +26,8 @@ import type {
   ToolSetSnapshot,
   ModelCapabilitySnapshot,
   WorktreeBaseline,
+  SubAgentGroup,
+  SubAgentGroupDetail,
   Persona,
   PersonaRevision,
   SessionRule,
@@ -122,6 +124,14 @@ export async function readInvocationToolSet(invocationID: string): Promise<ToolS
 
 export async function readInvocationCapabilities(invocationID: string): Promise<ModelCapabilitySnapshot> {
   return request<ModelCapabilitySnapshot>(`/api/v1/invocations/${encodeURIComponent(invocationID)}/model-capabilities`)
+}
+
+export async function readInvocationSubAgents(invocationID: string): Promise<SubAgentGroup[]> {
+  return request<SubAgentGroup[]>(`/api/v1/invocations/${encodeURIComponent(invocationID)}/subagents`)
+}
+
+export async function readSubAgentGroup(groupID: string): Promise<SubAgentGroupDetail> {
+  return request<SubAgentGroupDetail>(`/api/v1/subagent-groups/${encodeURIComponent(groupID)}`)
 }
 
 export async function readConfigRevisions(profileID: string): Promise<ConfigRevision[]> {

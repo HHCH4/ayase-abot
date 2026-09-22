@@ -12,8 +12,10 @@ import (
 	"log/slog"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"Abot/internal/document"
+	"Abot/internal/provider"
 
 	adkmodel "google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
@@ -119,14 +121,31 @@ func safeAttachmentLabel(value string) string {
 	return strings.TrimSpace(builder.String())
 }
 
+// limitAttachmentText 为图片子 Agent 和文档摘要限制 UTF-8 文本大小，避免
+// 截断多字节字符后把无效字节继续传给模型或写入日志。
+func limitAttachmentText(value string, maxBytes int) string {
+	if maxBytes <= 0 || len([]byte(value)) <= maxBytes {
+		return value
+	}
+	data := []byte(value[:maxBytes])
+	for len(data) > 0 && !utf8.Valid(data) {
+		data = data[:len(data)-1]
+	}
+	return string(data) + "\n[内容已截断]\n"
+}
+
 // attachmentMaterializingLLM keeps Artifact bytes out of Session/Event while
 // preserving native image/audio/file input for providers that support it.
 // The delegate sees a defensive request copy and the original request remains
 // metadata-only for the rest of ADK.
 type attachmentMaterializingLLM struct {
-	delegate adkmodel.LLM
-	resolver AttachmentResolver
-	userID   string
+	delegate                    adkmodel.LLM
+	resolver                    AttachmentResolver
+	userID                      string
+	invocationID                string
+	primary                     provider.ResolvedModel
+	runtime                     RuntimeOptions
+	documentImageSubagentRunner DocumentImageSubagentRunner
 }
 
 func (m *attachmentMaterializingLLM) Name() string {
@@ -226,6 +245,22 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 				"truncated", truncated,
 				"warnings", parsed.Warnings,
 			)
+			if len(parsed.Images) > 0 && m.documentImageSubagentRunner != nil {
+				results, analyzeErr := m.documentImageSubagentRunner.AnalyzeDocumentImages(ctx, DocumentImageAnalysisRequest{
+					InvocationID: m.invocationID,
+					UserID:       m.userID,
+					DocumentName: ref.Name,
+					Query:        query,
+					Images:       parsed.Images,
+					Primary:      m.primary,
+					Runtime:      m.runtime,
+				})
+				if analyzeErr != nil {
+					rendered += "\n[图片解析提示] 视觉子 Agent 执行失败：" + limitAttachmentText(analyzeErr.Error(), 2048)
+				} else {
+					rendered += renderDocumentImageAnalysis(results)
+				}
+			}
 			copyContent.Parts = append(copyContent.Parts, genai.NewPartFromText(text+"\n\n"+rendered))
 			continue
 		}
@@ -235,6 +270,39 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 		}})
 	}
 	return copyContent, nil
+}
+
+// renderDocumentImageAnalysis 把视觉子 Agent 的短摘要重新绑定到文档定位，
+// 这样主模型既能看到图片事实，也不会把不同图片的内容混成无来源的段落。
+func renderDocumentImageAnalysis(results []DocumentImageAnalysisResult) string {
+	if len(results) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	builder.WriteString("\n[图片视觉分析]\n")
+	for _, result := range results {
+		locator := safeAttachmentLabel(result.Locator)
+		if locator == "" {
+			locator = "未标记位置"
+		}
+		builder.WriteString("[来源：")
+		builder.WriteString(locator)
+		builder.WriteString("]\n")
+		if strings.TrimSpace(result.Error) != "" {
+			builder.WriteString("分析失败：")
+			builder.WriteString(limitAttachmentText(strings.TrimSpace(result.Error), 2048))
+			builder.WriteByte('\n')
+			continue
+		}
+		text := strings.TrimSpace(result.Text)
+		if text == "" {
+			builder.WriteString("未返回可用分析。\n")
+			continue
+		}
+		builder.WriteString(limitAttachmentText(text, 16<<10))
+		builder.WriteByte('\n')
+	}
+	return builder.String()
 }
 
 // contentTextForDocument 提取当前模型请求中的文本，用于文档块的轻量相关性筛选。

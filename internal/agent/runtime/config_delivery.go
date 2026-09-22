@@ -318,7 +318,7 @@ func (o RuntimeConfigDeliveryOutbox) Matches(other RuntimeConfigDeliveryOutbox) 
 	if leftErr != nil || rightErr != nil {
 		return false
 	}
-	return left.ID == right.ID && left.InvocationID == right.InvocationID && left.Source == right.Source && left.Destination == right.Destination && left.DeliveryID == right.DeliveryID && left.ExpectedDigest == right.ExpectedDigest && left.SnapshotDigest == right.SnapshotDigest && left.SnapshotVersion == right.SnapshotVersion && left.IdempotencyKey == right.IdempotencyKey && left.Projection == right.Projection
+	return left.ID == right.ID && left.InvocationID == right.InvocationID && left.Source == right.Source && left.Destination == right.Destination && left.DeliveryID == right.DeliveryID && left.ExpectedDigest == right.ExpectedDigest && left.SnapshotDigest == right.SnapshotDigest && left.SnapshotVersion == right.SnapshotVersion && left.IdempotencyKey == right.IdempotencyKey && agent.RuntimeConfigSnapshotDigest(mustMarshalRuntimeConfigProjection(left.Projection)) == agent.RuntimeConfigSnapshotDigest(mustMarshalRuntimeConfigProjection(right.Projection))
 }
 
 func (e RuntimeConfigDeliveryEnvelope) normalize() (RuntimeConfigDeliveryEnvelope, error) {

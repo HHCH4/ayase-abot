@@ -4,7 +4,7 @@ import { NButton, NCard, NCheckbox, NDynamicTags, NEmpty, NInput, NInputNumber, 
 import { readConfigRevisions, readPersonas, request } from '@/api'
 import { configuredModelOptions, makeModelReference, parseModelReference } from '@/model-catalog'
 import { useAppStore } from '@/stores/app'
-import type { ConfigField, ConfigProfile, ConfigRevision } from '@/types'
+import type { ConfigField, ConfigProfile, ConfigRevision, SubAgentProfileDescriptor, SubAgentProfileSettings } from '@/types'
 
 const store = useAppStore()
 const message = useMessage()
@@ -19,6 +19,7 @@ const systemDraft = reactive<Record<string, unknown>>({
   log_level: 'info', request_timeout_seconds: 300,
   artifact_quota_bytes: 4 * 1024 * 1024 * 1024, artifact_stale_upload_seconds: 86400, artifact_input_retention_seconds: 7 * 86400,
   modal_fallback_enabled: false, modal_fallback_provider_id: '', modal_fallback_vision_model: '', modal_fallback_audio_model: '',
+  subagent_profiles: {},
 })
 const revisions = ref<ConfigRevision[]>([])
 const dirty = ref(false)
@@ -255,6 +256,78 @@ function setFallbackModel(field: ConfigField, value: unknown) {
   if (!String(systemDraft.modal_fallback_provider_id || '').trim()) systemDraft.modal_fallback_provider_id = reference.providerID
 }
 
+const subagentProfileSchema = computed<SubAgentProfileDescriptor[]>(() => store.systemSettings.subagent_profile_schema || [])
+
+function subagentProfilesDraft(): Record<string, SubAgentProfileSettings> {
+  const value = systemDraft.subagent_profiles
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return value as Record<string, SubAgentProfileSettings>
+}
+
+function subagentProfileValue(profileID: string): SubAgentProfileSettings {
+  return subagentProfilesDraft()[profileID] || {}
+}
+
+function subagentModelOptions(profileID: string) {
+  const current = subagentProfileValue(profileID)
+  const currentProvider = String(current.provider_id || '').trim()
+  const currentModel = String(current.model_id || '').trim()
+  const result = [{ label: '继承主 Agent 模型', value: '' }, ...configuredModelOptions(store.providers).map((item) => ({ label: item.label, value: item.value }))]
+  if (currentProvider && currentModel && !result.some((item) => parseModelReference(item.value)?.providerID === currentProvider && parseModelReference(item.value)?.modelID === currentModel)) {
+    result.push({ label: `当前值：${currentProvider} / ${currentModel}（目录外）`, value: makeModelReference(currentProvider, currentModel) })
+  }
+  return result
+}
+
+function subagentModelControlValue(profileID: string) {
+  const current = subagentProfileValue(profileID)
+  const providerID = String(current.provider_id || '').trim()
+  const modelID = String(current.model_id || '').trim()
+  if (!providerID || !modelID) return ''
+  return makeModelReference(providerID, modelID)
+}
+
+function setSubagentModel(profileID: string, value: unknown) {
+  const profiles = subagentProfilesDraft()
+  const current = { ...subagentProfileValue(profileID) }
+  const reference = parseModelReference(String(value || ''))
+  current.provider_id = reference?.providerID || ''
+  current.model_id = reference?.modelID || ''
+  if (Object.values(current).every((item) => item === undefined || item === null || item === '')) delete profiles[profileID]
+  else profiles[profileID] = current
+  systemDraft.subagent_profiles = profiles
+}
+
+function setSubagentValue(profileID: string, key: keyof SubAgentProfileSettings, value: unknown) {
+  const profiles = subagentProfilesDraft()
+  const current = { ...subagentProfileValue(profileID) }
+  if (value === null || value === undefined || value === '') delete current[key]
+  else current[key] = value as never
+  // 空 profile 不落盘，保证“继承主 Agent”仍然是明确的默认语义。
+  if (Object.values(current).every((item) => item === undefined || item === null || item === '')) delete profiles[profileID]
+  else profiles[profileID] = current
+  systemDraft.subagent_profiles = profiles
+}
+
+function subagentNumberValue(profileID: string, key: keyof SubAgentProfileSettings) {
+  const value = subagentProfileValue(profileID)[key]
+  return typeof value === 'number' ? value : null
+}
+
+const reasoningOptions = [
+  { label: '继承主 Agent', value: '' },
+  { label: '最少', value: 'minimal' },
+  { label: '低', value: 'low' },
+  { label: '中', value: 'medium' },
+  { label: '高', value: 'high' },
+]
+
+const failurePolicyOptions = [
+  { label: '继承默认（继续其它节点）', value: '' },
+  { label: '继续其它节点', value: 'continue' },
+  { label: '遇到失败立即中止', value: 'abort' },
+]
+
 function syncSystemDraft() {
   const value = store.systemSettings
   Object.keys(systemDraft).forEach((key) => { delete systemDraft[key] })
@@ -263,6 +336,7 @@ function syncSystemDraft() {
     artifact_quota_bytes: value.artifact_quota_bytes, artifact_stale_upload_seconds: value.artifact_stale_upload_seconds, artifact_input_retention_seconds: value.artifact_input_retention_seconds,
     modal_fallback_enabled: value.modal_fallback_enabled, modal_fallback_provider_id: value.modal_fallback_provider_id,
     modal_fallback_vision_model: value.modal_fallback_vision_model, modal_fallback_audio_model: value.modal_fallback_audio_model,
+    subagent_profiles: clone(value.subagent_profiles || {}),
   })
 }
 
@@ -514,6 +588,25 @@ onMounted(async () => {
                 <NSelect v-else-if="field.type === 'select'" :value="String(systemFieldValue(field) ?? '')" :options="field.options || []" @update:value="setSystemValue(field, $event)" />
                 <NInputNumber v-else-if="field.type === 'integer' || field.type === 'number'" :value="systemNumberValue(field)" :min="field.min" :max="field.max" :step="field.type === 'number' ? 0.01 : 1" :show-button="false" @update:value="setSystemValue(field, $event)" />
                 <NInput v-else :value="systemTextValue(field)" :type="field.secret ? 'password' : 'text'" @update:value="setSystemValue(field, $event)" />
+              </div>
+            </div>
+            <div v-if="subagentProfileSchema.length" class="subagent-settings-panel">
+              <div class="section-heading-row">
+                <div><h3>子 Agent 配置</h3><p>每种受控子 Agent 可以单独选择已配置的内置模型、思考强度和执行预算。留空表示继承主 Agent；模型引用只使用本机 Provider 目录，不会启用外部 Agent 服务。</p></div>
+              </div>
+              <div v-for="profile in subagentProfileSchema" :key="profile.id" class="subagent-profile-card">
+                <div class="subagent-profile-heading"><div><strong>{{ profile.label }}</strong><code>subagent_profiles.{{ profile.id }}</code><span>{{ profile.description }}</span></div></div>
+                <div class="subagent-profile-grid">
+                  <label class="subagent-control"><span>模型</span><NSelect :value="subagentModelControlValue(profile.id)" :options="subagentModelOptions(profile.id)" filterable clearable @update:value="setSubagentModel(profile.id, $event)" /></label>
+                  <label class="subagent-control"><span>思考强度</span><NSelect :value="String(subagentProfileValue(profile.id).reasoning_effort || '')" :options="reasoningOptions" @update:value="setSubagentValue(profile.id, 'reasoning_effort', $event)" /></label>
+                  <label class="subagent-control"><span>温度（留空继承）</span><NInputNumber :value="subagentNumberValue(profile.id, 'temperature')" :min="0" :max="2" :step="0.01" clearable :show-button="false" @update:value="setSubagentValue(profile.id, 'temperature', $event)" /></label>
+                  <label class="subagent-control"><span>Top P（留空继承）</span><NInputNumber :value="subagentNumberValue(profile.id, 'top_p')" :min="0.01" :max="1" :step="0.01" clearable :show-button="false" @update:value="setSubagentValue(profile.id, 'top_p', $event)" /></label>
+                  <label class="subagent-control"><span>最大输出 token（0 为默认）</span><NInputNumber :value="subagentNumberValue(profile.id, 'max_output_tokens')" :min="0" :max="1536" :step="1" clearable :show-button="false" @update:value="setSubagentValue(profile.id, 'max_output_tokens', $event)" /></label>
+                  <label class="subagent-control"><span>超时秒数（0 为默认）</span><NInputNumber :value="subagentNumberValue(profile.id, 'timeout_seconds')" :min="0" :max="300" :step="1" clearable :show-button="false" @update:value="setSubagentValue(profile.id, 'timeout_seconds', $event)" /></label>
+                  <label class="subagent-control"><span>最大并发（0 为默认）</span><NInputNumber :value="subagentNumberValue(profile.id, 'max_concurrency')" :min="0" :max="4" :step="1" clearable :show-button="false" @update:value="setSubagentValue(profile.id, 'max_concurrency', $event)" /></label>
+                  <label class="subagent-control"><span>输出预算字节（0 为默认）</span><NInputNumber :value="subagentNumberValue(profile.id, 'output_budget_bytes')" :min="0" :max="131072" :step="1024" clearable :show-button="false" @update:value="setSubagentValue(profile.id, 'output_budget_bytes', $event)" /></label>
+                  <label class="subagent-control"><span>失败策略</span><NSelect :value="String(subagentProfileValue(profile.id).failure_policy || '')" :options="failurePolicyOptions" @update:value="setSubagentValue(profile.id, 'failure_policy', $event)" /></label>
+                </div>
               </div>
             </div>
             <div class="save-bar"><span>保存后立即应用</span><NButton type="primary" @click="saveSystem">保存系统设置</NButton></div>

@@ -199,9 +199,14 @@ func (s *Server) deleteConversation(writer http.ResponseWriter, request *http.Re
 		writeError(writer, err)
 		return
 	}
-	if err := service.Delete(request.Context(), conversationUserID(request), request.PathValue("id")); err != nil {
+	userID := conversationUserID(request)
+	conversationID := request.PathValue("id")
+	if err := service.Delete(request.Context(), userID, conversationID); err != nil {
 		writeError(writer, err)
 		return
+	}
+	if s.runtime != nil {
+		s.runtime.InvalidateRetrievalCache(userID, conversationID, "")
 	}
 	writer.WriteHeader(http.StatusNoContent)
 }

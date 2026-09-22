@@ -1772,9 +1772,11 @@ func validRuntimeInvocationTransition(from, to agentruntime.InvocationStatus) bo
 	case agentruntime.InvocationQueued:
 		return to == agentruntime.InvocationRunning || to == agentruntime.InvocationCancelling || to == agentruntime.InvocationCancelled || to == agentruntime.InvocationFailed
 	case agentruntime.InvocationRunning:
-		return to == agentruntime.InvocationWaitingApproval || to == agentruntime.InvocationWaitingTool || to == agentruntime.InvocationWaitingUser || to == agentruntime.InvocationQueued || to == agentruntime.InvocationCompleted || to == agentruntime.InvocationFailed || to == agentruntime.InvocationCancelling || to == agentruntime.InvocationCancelled
+		return to == agentruntime.InvocationWaitingApproval || to == agentruntime.InvocationWaitingTool || to == agentruntime.InvocationWaitingUser || to == agentruntime.InvocationWaitingSubagents || to == agentruntime.InvocationQueued || to == agentruntime.InvocationCompleted || to == agentruntime.InvocationFailed || to == agentruntime.InvocationCancelling || to == agentruntime.InvocationCancelled
 	case agentruntime.InvocationWaitingApproval, agentruntime.InvocationWaitingTool, agentruntime.InvocationWaitingUser:
 		return to == agentruntime.InvocationQueued || to == agentruntime.InvocationCancelling || to == agentruntime.InvocationCancelled || to == agentruntime.InvocationExpired || to == agentruntime.InvocationFailed
+	case agentruntime.InvocationWaitingSubagents:
+		return to == agentruntime.InvocationRunning || to == agentruntime.InvocationQueued || to == agentruntime.InvocationCancelling || to == agentruntime.InvocationCancelled || to == agentruntime.InvocationExpired || to == agentruntime.InvocationFailed
 	case agentruntime.InvocationCancelling:
 		return to == agentruntime.InvocationCancelled || to == agentruntime.InvocationFailed
 	default:

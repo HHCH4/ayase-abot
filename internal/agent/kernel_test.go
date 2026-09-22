@@ -206,6 +206,34 @@ func TestKernelUsesRuntimeConfigResolver(t *testing.T) {
 	}
 }
 
+func TestKernelResolveRuntimeOptionsReusesConfiguredModel(t *testing.T) {
+	repo := &kernelTestRepository{providers: map[string]provider.Provider{
+		"configured": {ID: "configured", Name: "已配置供应商", BaseURL: "http://127.0.0.1:9999/v1", Protocol: provider.ProtocolOpenAICompatible,
+			Models: []provider.Model{{ID: "configured-model", DisplayName: "已配置模型", Enabled: true}},
+		},
+	}}
+	registry, err := provider.NewRegistry(context.Background(), repo, map[provider.Protocol]provider.Adapter{provider.ProtocolOpenAICompatible: &kernelTestAdapter{}})
+	if err != nil {
+		t.Fatalf("创建配置解析测试 Registry 失败: %v", err)
+	}
+	kernel, err := NewKernel(Config{
+		AppName: "runtime-options-test", SessionService: session.InMemoryService(), Providers: registry,
+		RuntimeConfigResolver: func(context.Context, string, string, string) (RuntimeOptions, error) {
+			return RuntimeOptions{AIEnabled: true, ProviderID: "configured", ModelID: "configured-model"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("创建配置解析测试 Kernel 失败: %v", err)
+	}
+	resolved, err := kernel.ResolveRuntimeOptions(context.Background(), ChatRequest{UserID: "user-configured", SessionID: "session-configured"})
+	if err != nil {
+		t.Fatalf("解析已配置 Runtime 失败: %v", err)
+	}
+	if !resolved.AIEnabled || resolved.ProviderID != "configured" || resolved.ModelID != "configured-model" {
+		t.Fatalf("没有复用已配置模型: %#v", resolved)
+	}
+}
+
 func TestKernelUsesConversationWorkspaceAndRejectsArchivedConversation(t *testing.T) {
 	repo := &kernelTestRepository{providers: map[string]provider.Provider{
 		"demo": {ID: "demo", Name: "演示供应商", BaseURL: "http://127.0.0.1:9999/v1", Protocol: provider.ProtocolOpenAICompatible,

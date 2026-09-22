@@ -353,6 +353,22 @@ type WorkspacePolicy struct {
 	CommandTimeoutSeconds int
 }
 
+// SubAgentProfileOptions 是单个受控子 Agent 的可覆盖运行参数。
+// 指针数值用于区分“显式设置为 0”和“继承主 Agent”这两个语义；Provider/Model
+// 只允许引用已经注册的内置 Provider，子 Agent 仍然不会获得工具或网络能力。
+type SubAgentProfileOptions struct {
+	ProviderID        string
+	ModelID           string
+	ReasoningEffort   string
+	Temperature       *float64
+	TopP              *float64
+	MaxOutputTokens   int
+	TimeoutSeconds    int
+	MaxConcurrency    int
+	OutputBudgetBytes int
+	FailurePolicy     string
+}
+
 // RuntimeOptions 是配置中心解析后的 Agent 运行参数。零值只适合作为 Resolver 的错误返回，不代表完整配置。
 type RuntimeOptions struct {
 	AIEnabled                     bool
@@ -389,6 +405,25 @@ type RuntimeOptions struct {
 	ModalFallbackProviderID       string
 	ModalFallbackVisionModel      string
 	ModalFallbackAudioModel       string
+	SubAgentProfiles              map[string]SubAgentProfileOptions
+}
+
+// SubAgentProfile 返回 profile 的配置副本；未配置时返回 false，调用方应继承
+// 主 Agent 参数和 Runtime 内置预算，而不是把空值解释成新的路由。
+func (runtime RuntimeOptions) SubAgentProfile(profile string) (SubAgentProfileOptions, bool) {
+	profile = strings.TrimSpace(profile)
+	if profile == "" || runtime.SubAgentProfiles == nil {
+		return SubAgentProfileOptions{}, false
+	}
+	value, ok := runtime.SubAgentProfiles[profile]
+	if !ok {
+		return SubAgentProfileOptions{}, false
+	}
+	value.ProviderID = strings.TrimSpace(value.ProviderID)
+	value.ModelID = strings.TrimSpace(value.ModelID)
+	value.ReasoningEffort = strings.TrimSpace(value.ReasoningEffort)
+	value.FailurePolicy = strings.TrimSpace(value.FailurePolicy)
+	return value, true
 }
 
 // RuntimeConfigResolver 按 bot、用户和对话解析当前有效配置。
@@ -462,6 +497,7 @@ type Kernel struct {
 	memoryTools                   func(context.Context, string) ([]tool.Tool, error)
 	attachmentResolver            AttachmentResolver
 	attachmentListResolver        AttachmentListResolver
+	documentImageSubagentRunner   DocumentImageSubagentRunner
 	modalFallbackUsageObserver    ModalFallbackUsageObserver
 	modalFallbackOutputObserver   ModalFallbackOutputObserver
 	defaultRuntime                RuntimeOptions
@@ -1802,6 +1838,59 @@ func (k *Kernel) warmRuntimeToolCatalog(ctx context.Context, runtime RuntimeOpti
 	return nil
 }
 
+// ResolveRuntimeOptions 解析指定用户和会话当前生效的内置 AI 配置，但不
+// 启动模型调用。Runtime 的子 Agent 入口使用它复用同一套会话覆盖、模型
+// 配置和 AI 开关，避免调用方再次手填已经配置过的 Provider/Model。
+func (k *Kernel) ResolveRuntimeOptions(ctx context.Context, request ChatRequest) (RuntimeOptions, error) {
+	if k == nil || k.sessions == nil {
+		return RuntimeOptions{}, errors.New("Kernel 尚未完整装配")
+	}
+	request.UserID = strings.TrimSpace(request.UserID)
+	request.SessionID = strings.TrimSpace(request.SessionID)
+	request.ConversationID = strings.TrimSpace(request.ConversationID)
+	if request.ConversationID == "" {
+		request.ConversationID = request.SessionID
+	}
+	if request.SessionID == "" {
+		request.SessionID = request.ConversationID
+	}
+	if request.UserID == "" || request.SessionID == "" {
+		return RuntimeOptions{}, errors.New("user_id 和 session_id 不能为空")
+	}
+	if k.conversations != nil {
+		item, err := k.conversations.Get(ctx, request.UserID, request.ConversationID)
+		if err != nil {
+			return RuntimeOptions{}, err
+		}
+		if item.Status != conversation.StatusActive {
+			return RuntimeOptions{}, conversation.ErrArchived
+		}
+		request.ConversationID = item.ID
+		request.SessionID = item.ID
+	}
+	lockKey, lock := k.acquireSessionLock(request.UserID, request.SessionID)
+	lock.mu.Lock()
+	defer k.releaseSessionLock(lockKey, lock)
+	stored, err := k.ensureSession(ctx, request.UserID, request.SessionID)
+	if err != nil {
+		return RuntimeOptions{}, err
+	}
+	runtime, err := k.resolveRuntimeOptions(ctx, request, stored)
+	if err != nil {
+		return RuntimeOptions{}, err
+	}
+	if strings.TrimSpace(request.ProviderID) != "" {
+		runtime.ProviderID = strings.TrimSpace(request.ProviderID)
+	}
+	if strings.TrimSpace(request.ModelID) != "" {
+		runtime.ModelID = strings.TrimSpace(request.ModelID)
+	}
+	if strings.TrimSpace(request.ReasoningEffort) != "" {
+		runtime.AIReasoningEffort = strings.TrimSpace(request.ReasoningEffort)
+	}
+	return runtime, nil
+}
+
 // ResolveRuntimeConfigSnapshot computes the current effective metadata-only
 // projection without starting a model turn. Runtime uses it immediately before
 // accepting an approval/tool resume so changed configuration remains pending
@@ -2027,7 +2116,11 @@ func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedMode
 		// turns whose request carries only ResumeContent. If a persisted ref is
 		// encountered without an Artifact resolver, fail closed at the provider
 		// boundary instead of silently sending metadata in place of the file.
-		model = &attachmentMaterializingLLM{delegate: model, resolver: k.attachmentResolver, userID: strings.TrimSpace(userID)}
+		model = &attachmentMaterializingLLM{
+			delegate: model, resolver: k.attachmentResolver, userID: strings.TrimSpace(userID),
+			invocationID: strings.TrimSpace(invocationID), primary: resolved, runtime: runtime,
+			documentImageSubagentRunner: k.documentImageRunner(),
+		}
 	}
 	if manifestModel.ContextWindow > 0 {
 		// A provider may reject a request even when the local heuristic fits. A

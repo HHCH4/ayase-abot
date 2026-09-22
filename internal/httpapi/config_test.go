@@ -90,12 +90,12 @@ func TestConfigCenterAPIProfilesBindingsAndSystemSettings(t *testing.T) {
 	if err := service.Bind(context.Background(), configsvc.BindingBot, "bot-a", ""); err != nil {
 		t.Fatalf("解除机器人配置绑定失败: %v", err)
 	}
-	settings := callHTTP(handler, http.MethodPut, "/api/v1/system-settings", `{"log_level":"debug","request_timeout_seconds":60,"modal_fallback_enabled":true,"modal_fallback_provider_id":" fallback ","modal_fallback_vision_model":" vision ","modal_fallback_audio_model":" audio "}`)
-	if settings.Code != http.StatusOK || !strings.Contains(settings.Body.String(), `"log_level":"debug"`) || !strings.Contains(settings.Body.String(), `"modal_fallback_enabled":true`) || !strings.Contains(settings.Body.String(), `"modal_fallback_provider_id":"fallback"`) {
+	settings := callHTTP(handler, http.MethodPut, "/api/v1/system-settings", `{"log_level":"debug","request_timeout_seconds":60,"modal_fallback_enabled":true,"modal_fallback_provider_id":" fallback ","modal_fallback_vision_model":" vision ","modal_fallback_audio_model":" audio ","subagent_profiles":{"document_image":{"provider_id":"fallback","model_id":"vision","reasoning_effort":"high","max_output_tokens":512}}}`)
+	if settings.Code != http.StatusOK || !strings.Contains(settings.Body.String(), `"log_level":"debug"`) || !strings.Contains(settings.Body.String(), `"modal_fallback_enabled":true`) || !strings.Contains(settings.Body.String(), `"modal_fallback_provider_id":"fallback"`) || !strings.Contains(settings.Body.String(), `"subagent_profiles"`) {
 		t.Fatalf("系统设置保存失败: %d %s", settings.Code, settings.Body.String())
 	}
 	settingsView := callHTTP(handler, http.MethodGet, "/api/v1/system-settings", "")
-	if settingsView.Code != http.StatusOK || !strings.Contains(settingsView.Body.String(), `"restart_required":false`) || !strings.Contains(settingsView.Body.String(), `"modal_fallback_audio_model":"audio"`) {
+	if settingsView.Code != http.StatusOK || !strings.Contains(settingsView.Body.String(), `"restart_required":false`) || !strings.Contains(settingsView.Body.String(), `"modal_fallback_audio_model":"audio"`) || !strings.Contains(settingsView.Body.String(), `"subagent_profile_schema"`) || !strings.Contains(settingsView.Body.String(), `"reasoning_effort":"high"`) {
 		t.Fatalf("系统设置 Schema 缺少热更新元数据: %d %s", settingsView.Code, settingsView.Body.String())
 	}
 	invalidSettings := callHTTP(handler, http.MethodPut, "/api/v1/system-settings", `{"log_level":"trace","request_timeout_seconds":60}`)

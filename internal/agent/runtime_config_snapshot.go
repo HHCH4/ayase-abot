@@ -61,35 +61,51 @@ type RuntimeConfigSnapshot struct {
 // RuntimeOptionsSnapshot contains only scalar policy and budget values. Text
 // fields from RuntimeOptions are represented by the digests above.
 type RuntimeOptionsSnapshot struct {
-	AIEnabled                     bool    `json:"ai_enabled"`
-	AITemperature                 float64 `json:"ai_temperature"`
-	AIReasoningEffort             string  `json:"ai_reasoning_effort,omitempty"`
-	AITopP                        float64 `json:"ai_top_p"`
-	AIMaxOutputTokens             int     `json:"ai_max_output_tokens"`
-	AIRequestRetries              int     `json:"ai_request_retries"`
-	CompactionEnabled             bool    `json:"compaction_enabled"`
-	CompactionRatio               float64 `json:"compaction_ratio"`
-	CompactionSafetyTokens        int     `json:"compaction_safety_tokens"`
-	CompactionRetentionEvents     int     `json:"compaction_retention_events"`
-	CompactionInterval            int     `json:"compaction_interval"`
-	CompactionOverlap             int     `json:"compaction_overlap"`
-	CompactionUnknownWindowTokens int     `json:"compaction_unknown_window_tokens"`
-	AgentMaxToolCalls             int     `json:"agent_max_tool_calls"`
-	ToolSchemaBudgetTokens        int     `json:"tool_schema_budget_tokens"`
-	WorkspaceEnabled              bool    `json:"workspace_enabled"`
-	WorkspaceReadEnabled          bool    `json:"workspace_read_enabled"`
-	WorkspaceWriteEnabled         bool    `json:"workspace_write_enabled"`
-	WorkspaceExecEnabled          bool    `json:"workspace_exec_enabled"`
-	WorkspaceGitEnabled           bool    `json:"workspace_git_enabled"`
-	WorkspaceCommandTimeoutSecs   int     `json:"workspace_command_timeout_secs"`
-	MessageStreamingEnabled       bool    `json:"message_streaming_enabled"`
-	MemoryEnabled                 bool    `json:"memory_enabled"`
-	MemoryAutoRetrieve            bool    `json:"memory_auto_retrieve"`
-	MemoryMaxResults              int     `json:"memory_max_results"`
-	ModalFallbackEnabled          bool    `json:"modal_fallback_enabled"`
-	ModalFallbackProviderID       string  `json:"modal_fallback_provider_id,omitempty"`
-	ModalFallbackVisionModel      string  `json:"modal_fallback_vision_model,omitempty"`
-	ModalFallbackAudioModel       string  `json:"modal_fallback_audio_model,omitempty"`
+	AIEnabled                     bool                                      `json:"ai_enabled"`
+	AITemperature                 float64                                   `json:"ai_temperature"`
+	AIReasoningEffort             string                                    `json:"ai_reasoning_effort,omitempty"`
+	AITopP                        float64                                   `json:"ai_top_p"`
+	AIMaxOutputTokens             int                                       `json:"ai_max_output_tokens"`
+	AIRequestRetries              int                                       `json:"ai_request_retries"`
+	CompactionEnabled             bool                                      `json:"compaction_enabled"`
+	CompactionRatio               float64                                   `json:"compaction_ratio"`
+	CompactionSafetyTokens        int                                       `json:"compaction_safety_tokens"`
+	CompactionRetentionEvents     int                                       `json:"compaction_retention_events"`
+	CompactionInterval            int                                       `json:"compaction_interval"`
+	CompactionOverlap             int                                       `json:"compaction_overlap"`
+	CompactionUnknownWindowTokens int                                       `json:"compaction_unknown_window_tokens"`
+	AgentMaxToolCalls             int                                       `json:"agent_max_tool_calls"`
+	ToolSchemaBudgetTokens        int                                       `json:"tool_schema_budget_tokens"`
+	WorkspaceEnabled              bool                                      `json:"workspace_enabled"`
+	WorkspaceReadEnabled          bool                                      `json:"workspace_read_enabled"`
+	WorkspaceWriteEnabled         bool                                      `json:"workspace_write_enabled"`
+	WorkspaceExecEnabled          bool                                      `json:"workspace_exec_enabled"`
+	WorkspaceGitEnabled           bool                                      `json:"workspace_git_enabled"`
+	WorkspaceCommandTimeoutSecs   int                                       `json:"workspace_command_timeout_secs"`
+	MessageStreamingEnabled       bool                                      `json:"message_streaming_enabled"`
+	MemoryEnabled                 bool                                      `json:"memory_enabled"`
+	MemoryAutoRetrieve            bool                                      `json:"memory_auto_retrieve"`
+	MemoryMaxResults              int                                       `json:"memory_max_results"`
+	ModalFallbackEnabled          bool                                      `json:"modal_fallback_enabled"`
+	ModalFallbackProviderID       string                                    `json:"modal_fallback_provider_id,omitempty"`
+	ModalFallbackVisionModel      string                                    `json:"modal_fallback_vision_model,omitempty"`
+	ModalFallbackAudioModel       string                                    `json:"modal_fallback_audio_model,omitempty"`
+	SubAgentProfiles              map[string]SubAgentProfileOptionsSnapshot `json:"subagent_profiles,omitempty"`
+}
+
+// SubAgentProfileOptionsSnapshot 是子 Agent 配置的无秘密快照。它只包含模型
+// 目录引用、生成参数和受控预算，不包含 Provider 凭据或外部服务地址。
+type SubAgentProfileOptionsSnapshot struct {
+	ProviderID        string   `json:"provider_id,omitempty"`
+	ModelID           string   `json:"model_id,omitempty"`
+	ReasoningEffort   string   `json:"reasoning_effort,omitempty"`
+	Temperature       *float64 `json:"temperature,omitempty"`
+	TopP              *float64 `json:"top_p,omitempty"`
+	MaxOutputTokens   int      `json:"max_output_tokens,omitempty"`
+	TimeoutSeconds    int      `json:"timeout_seconds,omitempty"`
+	MaxConcurrency    int      `json:"max_concurrency,omitempty"`
+	OutputBudgetBytes int      `json:"output_budget_bytes,omitempty"`
+	FailurePolicy     string   `json:"failure_policy,omitempty"`
 }
 
 // BuildRuntimeConfigSnapshot creates a deterministic projection from the
@@ -130,6 +146,27 @@ func BuildRuntimeConfigSnapshot(appName string, runtime RuntimeOptions, resolved
 }
 
 func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
+	profiles := make(map[string]SubAgentProfileOptionsSnapshot, len(runtime.SubAgentProfiles))
+	for profile, value := range runtime.SubAgentProfiles {
+		item := SubAgentProfileOptionsSnapshot{
+			ProviderID: value.ProviderID, ModelID: value.ModelID, ReasoningEffort: value.ReasoningEffort,
+			MaxOutputTokens: value.MaxOutputTokens, TimeoutSeconds: value.TimeoutSeconds,
+			MaxConcurrency: value.MaxConcurrency, OutputBudgetBytes: value.OutputBudgetBytes,
+			FailurePolicy: value.FailurePolicy,
+		}
+		if value.Temperature != nil {
+			number := *value.Temperature
+			item.Temperature = &number
+		}
+		if value.TopP != nil {
+			number := *value.TopP
+			item.TopP = &number
+		}
+		profiles[profile] = item
+	}
+	if len(profiles) == 0 {
+		profiles = nil
+	}
 	return RuntimeOptionsSnapshot{
 		AIEnabled:                     runtime.AIEnabled,
 		AITemperature:                 runtime.AITemperature,
@@ -160,6 +197,7 @@ func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
 		ModalFallbackProviderID:       strings.TrimSpace(runtime.ModalFallbackProviderID),
 		ModalFallbackVisionModel:      strings.TrimSpace(runtime.ModalFallbackVisionModel),
 		ModalFallbackAudioModel:       strings.TrimSpace(runtime.ModalFallbackAudioModel),
+		SubAgentProfiles:              profiles,
 	}
 }
 
@@ -274,7 +312,54 @@ func validateRuntimeOptionsSnapshot(options RuntimeOptionsSnapshot) error {
 			return fmt.Errorf("%w: %s 超出长度限制", ErrInvalidRuntimeConfigSnapshot, name)
 		}
 	}
+	for profile, value := range options.SubAgentProfiles {
+		profile = strings.TrimSpace(profile)
+		if profile == "" || len(profile) > 64 {
+			return fmt.Errorf("%w: 子 Agent profile 名称无效", ErrInvalidRuntimeConfigSnapshot)
+		}
+		for name, text := range map[string]string{
+			"provider_id":      value.ProviderID,
+			"model_id":         value.ModelID,
+			"reasoning_effort": value.ReasoningEffort,
+			"failure_policy":   value.FailurePolicy,
+		} {
+			if len(text) > 128 {
+				return fmt.Errorf("%w: 子 Agent %s.%s 超出长度限制", ErrInvalidRuntimeConfigSnapshot, profile, name)
+			}
+		}
+		for name, number := range map[string]float64{
+			"temperature": pointerFloat64(value.Temperature),
+			"top_p":       pointerFloat64(value.TopP),
+		} {
+			if math.IsNaN(number) || math.IsInf(number, 0) {
+				return fmt.Errorf("%w: 子 Agent %s.%s 不是有限数值", ErrInvalidRuntimeConfigSnapshot, profile, name)
+			}
+		}
+		if value.Temperature != nil && (*value.Temperature < 0 || *value.Temperature > 2) || value.TopP != nil && (*value.TopP < 0.01 || *value.TopP > 1) {
+			return fmt.Errorf("%w: 子 Agent %s 的采样参数超出范围", ErrInvalidRuntimeConfigSnapshot, profile)
+		}
+		if value.MaxOutputTokens < 0 || value.MaxOutputTokens > 1536 || value.TimeoutSeconds < 0 || value.TimeoutSeconds > 300 || value.MaxConcurrency < 0 || value.MaxConcurrency > 4 || value.OutputBudgetBytes < 0 || value.OutputBudgetBytes > 128<<10 {
+			return fmt.Errorf("%w: 子 Agent %s 的预算超出范围", ErrInvalidRuntimeConfigSnapshot, profile)
+		}
+		switch strings.ToLower(strings.TrimSpace(value.ReasoningEffort)) {
+		case "", "minimal", "low", "medium", "high":
+		default:
+			return fmt.Errorf("%w: 子 Agent %s 的思考强度无效", ErrInvalidRuntimeConfigSnapshot, profile)
+		}
+		switch strings.ToLower(strings.TrimSpace(value.FailurePolicy)) {
+		case "", "continue", "abort":
+		default:
+			return fmt.Errorf("%w: 子 Agent %s 的失败策略无效", ErrInvalidRuntimeConfigSnapshot, profile)
+		}
+	}
 	return nil
+}
+
+func pointerFloat64(value *float64) float64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 // ParseRuntimeConfigSnapshot accepts only one bounded JSON document and

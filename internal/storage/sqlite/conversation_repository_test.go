@@ -113,6 +113,22 @@ func TestConversationDeleteRemovesADKEventsAndWorkspaceOperations(t *testing.T) 
 	if err := invocationRepo.CreateInvocation(context.Background(), invocation); err != nil {
 		t.Fatalf("写入待恢复 invocation 失败: %v", err)
 	}
+	subAgentRepo, ok := invocationRepo.(agentruntime.SubAgentRepository)
+	if !ok {
+		t.Fatal("SQLite runtime 未实现 SubAgentRepository")
+	}
+	subAgentEvidenceRepo, ok := invocationRepo.(agentruntime.SubAgentEvidenceRepository)
+	if !ok {
+		t.Fatal("SQLite runtime 未实现 SubAgentEvidenceRepository")
+	}
+	subAgentGroup := agentruntime.SubAgentGroup{ID: "group-conversation-delete", InvocationID: invocation.ID, Profile: agentruntime.SubAgentProfileResearch, ExpectedCount: 1, MaxConcurrency: 1, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	subAgentRun := agentruntime.SubAgentRun{ID: "run-conversation-delete", GroupID: subAgentGroup.ID, InvocationID: invocation.ID, Profile: agentruntime.SubAgentProfileResearch, Ordinal: 0, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := subAgentRepo.CreateSubAgentGroup(context.Background(), subAgentGroup, []agentruntime.SubAgentRun{subAgentRun}); err != nil {
+		t.Fatalf("写入子 Agent group 失败: %v", err)
+	}
+	if err := subAgentEvidenceRepo.SaveSubAgentEvidence(context.Background(), subAgentGroup.ID, []agentruntime.EvidenceItem{{EvidenceID: "evidence-conversation-delete", SourceKind: "conversation", Excerpt: "要随对话删除的证据"}}); err != nil {
+		t.Fatalf("写入子 Agent evidence 失败: %v", err)
+	}
 	handoffRepo, ok := invocationRepo.(agentruntime.InvocationResumeRepository)
 	if !ok {
 		t.Fatal("SQLite runtime repository 未实现 InvocationResumeRepository")
@@ -128,5 +144,11 @@ func TestConversationDeleteRemovesADKEventsAndWorkspaceOperations(t *testing.T) 
 	}
 	if _, err := handoffRepo.GetInvocationResume(context.Background(), invocation.ID); !errors.Is(err, agentruntime.ErrNotFound) {
 		t.Fatalf("删除会话后待恢复 handoff 仍存在: %v", err)
+	}
+	if _, err := subAgentRepo.GetSubAgentGroup(context.Background(), subAgentGroup.ID); !errors.Is(err, agentruntime.ErrNotFound) {
+		t.Fatalf("删除会话后子 Agent group 仍存在: %v", err)
+	}
+	if _, err := subAgentEvidenceRepo.ListSubAgentEvidence(context.Background(), subAgentGroup.ID, 10, ""); !errors.Is(err, agentruntime.ErrNotFound) {
+		t.Fatalf("删除会话后子 Agent evidence 仍存在: %v", err)
 	}
 }

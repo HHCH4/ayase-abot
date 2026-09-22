@@ -95,6 +95,61 @@ type RevisionRepository interface {
 	ListRevisions(context.Context, string) ([]Revision, error)
 }
 
+// SubAgentProfileSettings 是单个受控子 Agent profile 的运行参数。
+// 空字符串和 0 表示继承主 Agent 的对应设置；Provider/Model 只保存目录引用，
+// 不把 API Key、BaseURL 或模型上下文写入系统配置。
+type SubAgentProfileSettings struct {
+	ProviderID        string   `json:"provider_id,omitempty"`
+	ModelID           string   `json:"model_id,omitempty"`
+	ReasoningEffort   string   `json:"reasoning_effort,omitempty"`
+	Temperature       *float64 `json:"temperature,omitempty"`
+	TopP              *float64 `json:"top_p,omitempty"`
+	MaxOutputTokens   int      `json:"max_output_tokens,omitempty"`
+	TimeoutSeconds    int      `json:"timeout_seconds,omitempty"`
+	MaxConcurrency    int      `json:"max_concurrency,omitempty"`
+	OutputBudgetBytes int      `json:"output_budget_bytes,omitempty"`
+	FailurePolicy     string   `json:"failure_policy,omitempty"`
+}
+
+// SubAgentProfileDescriptor 是 WebUI 用来解释 profile 职责的稳定目录。
+// 目录只描述本项目内置的受控职责，不允许通过配置动态加载外部 Agent。
+type SubAgentProfileDescriptor struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
+var subAgentProfileDescriptors = []SubAgentProfileDescriptor{
+	{ID: "document_image", Label: "文档图片分析", Description: "解析 PDF、Word、Excel 等文档中的图片；原图只在当前调用中传递，不写入日志或子 Agent记录。"},
+	{ID: "memory_retrieval", Label: "长期记忆检索", Description: "从当前用户的长期记忆中读取有界证据；不会跨用户访问。"},
+	{ID: "knowledge_retrieval", Label: "知识检索", Description: "知识库来源的受控检索入口；未装配知识库时不会伪造结果。"},
+	{ID: "conversation_retrieval", Label: "会话检索", Description: "在指定会话边界内检索历史消息摘要。"},
+	{ID: "web_research", Label: "网页研究", Description: "网页研究来源的受控入口；未装配网页服务时明确返回不可用。"},
+	{ID: "workspace_search", Label: "工作区搜索", Description: "在已授权工作区边界内读取搜索证据；不授予写入或执行权限。"},
+	{ID: "structured_query", Label: "结构化查询", Description: "结构化数据查询入口；查询能力由已装配的只读适配器决定。"},
+	{ID: "retrieval_aggregate", Label: "检索汇总", Description: "聚合多个检索来源并去重、排序、保留引用。"},
+	{ID: "research", Label: "研究汇总", Description: "只对已准备好的证据做分析和汇总，不调用工具、不访问网络。"},
+	{ID: "workspace_review", Label: "工作区审查", Description: "只读审查已传入的工作区内容，不自行修改文件。"},
+	{ID: "workspace_change", Label: "工作区变更", Description: "变更职责仍必须走主 Agent 的工具和人工审批链；此 profile 不会被无工具 Runner 直接执行。"},
+	{ID: "verification", Label: "结果验证", Description: "对已完成结果做受限验证和事实核对，不扩大任务权限。"},
+}
+
+// SubAgentProfileSchema 返回受控 profile 目录的副本，避免调用方修改全局目录。
+func SubAgentProfileSchema() []SubAgentProfileDescriptor {
+	result := make([]SubAgentProfileDescriptor, len(subAgentProfileDescriptors))
+	copy(result, subAgentProfileDescriptors)
+	return result
+}
+
+func knownSubAgentProfile(id string) bool {
+	for _, item := range subAgentProfileDescriptors {
+		if item.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // SystemSettings 只包含当前已有真实运行时效果的系统设置。
 type SystemSettings struct {
 	LogLevel              string `json:"log_level"`
@@ -114,6 +169,9 @@ type SystemSettings struct {
 	ModalFallbackProviderID  string `json:"modal_fallback_provider_id"`
 	ModalFallbackVisionModel string `json:"modal_fallback_vision_model"`
 	ModalFallbackAudioModel  string `json:"modal_fallback_audio_model"`
+	// SubAgentProfiles 是每种受控子 Agent 的独立路由、思考强度和预算设置。
+	// 未配置的 profile 继承当前主 Agent 配置；配置只允许使用上面的稳定目录。
+	SubAgentProfiles map[string]SubAgentProfileSettings `json:"subagent_profiles"`
 }
 
 // Artifact 存储约束的默认值与边界。这些数值同时用于 Schema 校验和运行时维护
@@ -1013,6 +1071,7 @@ func normalizeSystemSettings(settings SystemSettings) SystemSettings {
 	settings.ModalFallbackProviderID = strings.TrimSpace(settings.ModalFallbackProviderID)
 	settings.ModalFallbackVisionModel = strings.TrimSpace(settings.ModalFallbackVisionModel)
 	settings.ModalFallbackAudioModel = strings.TrimSpace(settings.ModalFallbackAudioModel)
+	settings.SubAgentProfiles = normalizeSubAgentProfiles(settings.SubAgentProfiles)
 	if settings.RequestTimeoutSeconds == 0 {
 		settings.RequestTimeoutSeconds = 300
 	}
@@ -1027,6 +1086,30 @@ func normalizeSystemSettings(settings SystemSettings) SystemSettings {
 		settings.ArtifactInputRetentionSeconds = DefaultArtifactInputRetentionSeconds
 	}
 	return settings
+}
+
+func normalizeSubAgentProfiles(values map[string]SubAgentProfileSettings) map[string]SubAgentProfileSettings {
+	if len(values) == 0 {
+		return map[string]SubAgentProfileSettings{}
+	}
+	result := make(map[string]SubAgentProfileSettings, len(values))
+	for key, value := range values {
+		key = strings.TrimSpace(key)
+		value.ProviderID = strings.TrimSpace(value.ProviderID)
+		value.ModelID = strings.TrimSpace(value.ModelID)
+		value.ReasoningEffort = strings.ToLower(strings.TrimSpace(value.ReasoningEffort))
+		value.FailurePolicy = strings.ToLower(strings.TrimSpace(value.FailurePolicy))
+		if value.Temperature != nil {
+			number := *value.Temperature
+			value.Temperature = &number
+		}
+		if value.TopP != nil {
+			number := *value.TopP
+			value.TopP = &number
+		}
+		result[key] = value
+	}
+	return result
 }
 
 func validateSystemSettings(settings SystemSettings) error {
@@ -1054,6 +1137,55 @@ func validateSystemSettings(settings SystemSettings) error {
 	} {
 		if len(value) > 128 {
 			return fmt.Errorf("%w: %s 长度不能超过 128 个字符", ErrInvalidRequest, key)
+		}
+	}
+	if err := validateSubAgentProfiles(settings.SubAgentProfiles); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateSubAgentProfiles(values map[string]SubAgentProfileSettings) error {
+	for profile, value := range values {
+		profile = strings.TrimSpace(profile)
+		if !knownSubAgentProfile(profile) {
+			return fmt.Errorf("%w: 未知子 Agent profile %q", ErrInvalidRequest, profile)
+		}
+		for key, item := range map[string]string{
+			profile + ".provider_id": value.ProviderID,
+			profile + ".model_id":    value.ModelID,
+		} {
+			if len(item) > 128 {
+				return fmt.Errorf("%w: 子 Agent 设置 %s 长度不能超过 128 个字符", ErrInvalidRequest, key)
+			}
+		}
+		switch value.ReasoningEffort {
+		case "", "minimal", "low", "medium", "high":
+		default:
+			return fmt.Errorf("%w: 子 Agent %s 的思考强度无效", ErrInvalidRequest, profile)
+		}
+		if value.Temperature != nil && (*value.Temperature < 0 || *value.Temperature > 2 || math.IsNaN(*value.Temperature) || math.IsInf(*value.Temperature, 0)) {
+			return fmt.Errorf("%w: 子 Agent %s 的 temperature 必须在 0-2 之间", ErrInvalidRequest, profile)
+		}
+		if value.TopP != nil && (*value.TopP < 0.01 || *value.TopP > 1 || math.IsNaN(*value.TopP) || math.IsInf(*value.TopP, 0)) {
+			return fmt.Errorf("%w: 子 Agent %s 的 top_p 必须在 0.01-1 之间", ErrInvalidRequest, profile)
+		}
+		if value.MaxOutputTokens < 0 || value.MaxOutputTokens > 1536 {
+			return fmt.Errorf("%w: 子 Agent %s 的最大输出 token 必须在 0-1536 之间", ErrInvalidRequest, profile)
+		}
+		if value.TimeoutSeconds < 0 || value.TimeoutSeconds > 300 {
+			return fmt.Errorf("%w: 子 Agent %s 的超时必须在 0-300 秒之间", ErrInvalidRequest, profile)
+		}
+		if value.MaxConcurrency < 0 || value.MaxConcurrency > 4 {
+			return fmt.Errorf("%w: 子 Agent %s 的并发数必须在 0-4 之间", ErrInvalidRequest, profile)
+		}
+		if value.OutputBudgetBytes < 0 || value.OutputBudgetBytes > 128<<10 {
+			return fmt.Errorf("%w: 子 Agent %s 的输出预算必须在 0-131072 字节之间", ErrInvalidRequest, profile)
+		}
+		switch value.FailurePolicy {
+		case "", "continue", "abort":
+		default:
+			return fmt.Errorf("%w: 子 Agent %s 的失败策略无效", ErrInvalidRequest, profile)
 		}
 	}
 	return nil
