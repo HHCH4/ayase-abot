@@ -307,6 +307,7 @@ func builtinCommandDescriptors() []CommandDescriptor {
 		{ID: "dashboard_update", Name: "dashboard_update", Category: CategoryAdmin, Description: "检查并更新内嵌管理台资源", DefaultPermission: PermissionGlobalAdmin, Scope: ScopeBot, DefaultEnabled: true},
 		{ID: "model", Name: "model", Category: CategoryConfig, Description: "查看或切换当前会话模型", DefaultPermission: PermissionPrivateUser, Scope: ScopeSession, DefaultEnabled: true},
 		{ID: "persona", Name: "persona", Category: CategoryConfig, Description: "查看或切换当前会话人格", DefaultPermission: PermissionPrivateUser, Scope: ScopeSession, DefaultEnabled: true},
+		{ID: "subagent", Name: "subagent", Category: CategoryConfig, Description: "查看或切换当前会话主 Agent 是否启用子 Agent", DefaultPermission: PermissionPrivateUser, Scope: ScopeSession, DefaultEnabled: true},
 		{ID: "workspace", Name: "workspace", Category: CategoryConfig, Description: "查看或绑定工作区", DefaultPermission: PermissionGlobalAdmin, Scope: ScopeBot, DefaultEnabled: true},
 		{ID: "admin list", Name: "admin list", Category: CategoryAdmin, Description: "列出本群管理员", DefaultPermission: PermissionGlobalAdmin, Scope: ScopeChat, DefaultEnabled: true},
 		{ID: "admin add", Name: "admin add", Category: CategoryAdmin, Description: "添加群管理员", DefaultPermission: PermissionGlobalAdmin, Scope: ScopeChat, DefaultEnabled: true},

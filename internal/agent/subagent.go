@@ -13,6 +13,10 @@ import (
 	"google.golang.org/genai"
 )
 
+// ErrSubAgentsDisabled is returned when the main Agent is not allowed to
+// launch a child Agent for the current runtime configuration.
+var ErrSubAgentsDisabled = errors.New("当前会话已停用子 Agent")
+
 // DocumentImageAnalysisRequest 是文档解析层交给视觉子 Agent 的最小请求。
 // 原始图片只在当前调用栈中存在，不进入 Runtime 事件、会话历史或持久化表。
 type DocumentImageAnalysisRequest struct {
@@ -65,6 +69,9 @@ func (k *Kernel) AnalyzeDocumentImage(ctx context.Context, request DocumentImage
 	if k == nil {
 		return "", errors.New("Agent Kernel 不能为空")
 	}
+	if !request.Runtime.SubAgentsEnabled() {
+		return "", ErrSubAgentsDisabled
+	}
 	if len(request.Images) != 1 {
 		return "", errors.New("视觉子 Agent 一次只能分析一张图片")
 	}
@@ -77,7 +84,13 @@ func (k *Kernel) AnalyzeDocumentImage(ctx context.Context, request DocumentImage
 // RunBuiltInSubAgent 使用已注册的内置 Provider 执行一轮无工具文本调用。
 // 子 Agent 不创建 ADK 会话、不继承主会话历史，也不会获得工作区或网络工具。
 func (k *Kernel) RunBuiltInSubAgent(ctx context.Context, request BuiltInSubAgentRequest) (string, error) {
-	if k == nil || k.providers == nil {
+	if k == nil {
+		return "", errors.New("Agent Kernel 不能为空")
+	}
+	if !request.Runtime.SubAgentsEnabled() {
+		return "", ErrSubAgentsDisabled
+	}
+	if k.providers == nil {
 		return "", errors.New("内置 AI Provider Registry 未装配")
 	}
 	prompt := strings.TrimSpace(request.Prompt)

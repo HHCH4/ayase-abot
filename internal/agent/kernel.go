@@ -371,7 +371,11 @@ type SubAgentProfileOptions struct {
 
 // RuntimeOptions 是配置中心解析后的 Agent 运行参数。零值只适合作为 Resolver 的错误返回，不代表完整配置。
 type RuntimeOptions struct {
-	AIEnabled                     bool
+	AIEnabled bool
+	// SubAgentEnabled controls whether the main Agent may launch any child Agent.
+	// nil preserves the historical enabled behavior for callers that construct
+	// partial RuntimeOptions values.
+	SubAgentEnabled               *bool
 	ProviderID                    string
 	ModelID                       string
 	AITemperature                 float64
@@ -406,6 +410,16 @@ type RuntimeOptions struct {
 	ModalFallbackVisionModel      string
 	ModalFallbackAudioModel       string
 	SubAgentProfiles              map[string]SubAgentProfileOptions
+}
+
+// SubAgentsEnabled returns the effective master switch. RuntimeOptions is also
+// used by embedders and older tests that build partial values directly; an
+// unset switch therefore means enabled for backward compatibility.
+func (runtime RuntimeOptions) SubAgentsEnabled() bool {
+	if runtime.SubAgentEnabled == nil {
+		return true
+	}
+	return *runtime.SubAgentEnabled
 }
 
 // SubAgentProfile 返回 profile 的配置副本；未配置时返回 false，调用方应继承
@@ -790,8 +804,9 @@ func NewKernel(config Config) (*Kernel, error) {
 	if overlap > interval {
 		return nil, errors.New("滑动窗口压缩重叠数不能大于压缩间隔")
 	}
+	defaultSubAgentEnabled := true
 	defaultRuntime := RuntimeOptions{
-		AIEnabled: true, Instruction: config.Instruction,
+		AIEnabled: true, SubAgentEnabled: &defaultSubAgentEnabled, Instruction: config.Instruction,
 		CompactionEnabled: config.EnableCompaction, CompactionRatio: ratio,
 		CompactionSafetyTokens: safety, CompactionRetentionEvents: retention,
 		CompactionInterval: interval, CompactionOverlap: overlap,

@@ -19,6 +19,7 @@ const systemDraft = reactive<Record<string, unknown>>({
   log_level: 'info', request_timeout_seconds: 300,
   artifact_quota_bytes: 4 * 1024 * 1024 * 1024, artifact_stale_upload_seconds: 86400, artifact_input_retention_seconds: 7 * 86400,
   modal_fallback_enabled: false, modal_fallback_provider_id: '', modal_fallback_vision_model: '', modal_fallback_audio_model: '',
+  subagent_enabled: true,
   subagent_profiles: {},
 })
 const revisions = ref<ConfigRevision[]>([])
@@ -336,6 +337,7 @@ function syncSystemDraft() {
     artifact_quota_bytes: value.artifact_quota_bytes, artifact_stale_upload_seconds: value.artifact_stale_upload_seconds, artifact_input_retention_seconds: value.artifact_input_retention_seconds,
     modal_fallback_enabled: value.modal_fallback_enabled, modal_fallback_provider_id: value.modal_fallback_provider_id,
     modal_fallback_vision_model: value.modal_fallback_vision_model, modal_fallback_audio_model: value.modal_fallback_audio_model,
+    subagent_enabled: value.subagent_enabled !== false,
     subagent_profiles: clone(value.subagent_profiles || {}),
   })
 }
@@ -592,7 +594,7 @@ onMounted(async () => {
             </div>
             <div v-if="subagentProfileSchema.length" class="subagent-settings-panel">
               <div class="section-heading-row">
-                <div><h3>子 Agent 配置</h3><p>每种受控子 Agent 可以单独选择已配置的内置模型、思考强度和执行预算。留空表示继承主 Agent；模型引用只使用本机 Provider 目录，不会启用外部 Agent 服务。</p></div>
+                <div><h3>子 Agent 配置</h3><p>每种子 Agent 类型可以单独选择已配置的内置模型、思考强度和执行预算。留空表示继承主 Agent；模型引用只使用本机 Provider 目录，不会启用外部 Agent 服务。</p></div>
               </div>
               <div v-for="profile in subagentProfileSchema" :key="profile.id" class="subagent-profile-card">
                 <div class="subagent-profile-heading"><div><strong>{{ profile.label }}</strong><code>subagent_profiles.{{ profile.id }}</code><span>{{ profile.description }}</span></div></div>

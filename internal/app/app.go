@@ -433,6 +433,7 @@ func Run(opts bootstrap.Options) error {
 			// A per-conversation override wins over the resolved default, so a
 			// chat can switch models without changing the bot or global config.
 			source := conversationID
+			var conversationSubAgentEnabled *bool
 			if item, getErr := conversationService.Get(ctx, userID, conversationID); getErr == nil {
 				if strings.TrimSpace(item.Source) != "" {
 					source = item.Source
@@ -442,6 +443,10 @@ func Run(opts bootstrap.Options) error {
 				}
 				if override := strings.TrimSpace(item.ModelID); override != "" {
 					runtime.ModelID = override
+				}
+				if item.SubAgentEnabled != nil {
+					enabled := *item.SubAgentEnabled
+					conversationSubAgentEnabled = &enabled
 				}
 			}
 			// 会话规则优先于全局配置，但只能覆盖内置 Runtime 已支持的模型、人格和启停状态。
@@ -482,6 +487,11 @@ func Run(opts bootstrap.Options) error {
 			if settingsErr != nil {
 				return agent.RuntimeOptions{}, settingsErr
 			}
+			subAgentEnabled := settings.IsSubAgentEnabled()
+			if conversationSubAgentEnabled != nil {
+				subAgentEnabled = *conversationSubAgentEnabled
+			}
+			subAgentEnabledValue := subAgentEnabled
 			return agent.RuntimeOptions{
 				AIEnabled: runtime.AIEnabled, ProviderID: runtime.ProviderID, ModelID: runtime.ModelID,
 				AITemperature: runtime.AITemperature, AIReasoningEffort: runtime.AIReasoningEffort, AITopP: runtime.AITopP, AIMaxOutputTokens: runtime.AIMaxOutputTokens, AIRequestRetries: runtime.AIRequestRetries,
@@ -497,6 +507,7 @@ func Run(opts bootstrap.Options) error {
 				MemoryEnabled: runtime.MemoryEnabled, MemoryAutoRetrieve: runtime.MemoryAutoRetrieve, MemoryMaxResults: runtime.MemoryMaxResults,
 				ModalFallbackEnabled: settings.ModalFallbackEnabled, ModalFallbackProviderID: settings.ModalFallbackProviderID,
 				ModalFallbackVisionModel: settings.ModalFallbackVisionModel, ModalFallbackAudioModel: settings.ModalFallbackAudioModel,
+				SubAgentEnabled:  &subAgentEnabledValue,
 				SubAgentProfiles: subAgentRuntimeProfiles(settings),
 			}, nil
 		},

@@ -162,6 +162,9 @@ func (m *SubAgentManager) RunBuiltInSubAgentGroup(ctx context.Context, request B
 	if m == nil {
 		return nil, errors.New("子 Agent 管理器不能为空")
 	}
+	if !request.Runtime.SubAgentsEnabled() {
+		return nil, agent.ErrSubAgentsDisabled
+	}
 	m.mu.Lock()
 	textRunner := m.textRunner
 	closed := m.closed
@@ -793,6 +796,9 @@ func (m *SubAgentManager) finishGroup(ctx context.Context, group SubAgentGroup, 
 func (m *SubAgentManager) RunRetrieval(ctx context.Context, request RetrievalRequest) (RetrievalSummary, error) {
 	if m == nil {
 		return RetrievalSummary{}, errors.New("子 Agent 管理器不能为空")
+	}
+	if !request.Runtime.SubAgentsEnabled() {
+		return RetrievalSummary{}, agent.ErrSubAgentsDisabled
 	}
 	m.mu.Lock()
 	closed := m.closed

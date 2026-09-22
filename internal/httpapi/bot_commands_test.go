@@ -56,6 +56,9 @@ func TestBotCommandCatalogPolicyAndAuditAPI(t *testing.T) {
 	if listed.Code != http.StatusOK {
 		t.Fatalf("列出指令状态码 = %d，响应 = %s", listed.Code, listed.Body.String())
 	}
+	if listed.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("指令目录不应被浏览器缓存: %q", listed.Header().Get("Cache-Control"))
+	}
 	var payload struct {
 		Commands []bot.EffectiveCommand `json:"commands"`
 	}
@@ -72,6 +75,7 @@ func TestBotCommandCatalogPolicyAndAuditAPI(t *testing.T) {
 		}
 	}
 	workspaceFound := false
+	subAgentFound := false
 	for _, command := range payload.Commands {
 		if command.ID == "workspace" {
 			workspaceFound = true
@@ -79,9 +83,18 @@ func TestBotCommandCatalogPolicyAndAuditAPI(t *testing.T) {
 				t.Fatalf("/workspace 必须默认仅全局管理员: %s", command.Permission)
 			}
 		}
+		if command.ID == "subagent" {
+			subAgentFound = true
+			if command.Permission != bot.PermissionPrivateUser {
+				t.Fatalf("/subagent 私聊应允许普通用户使用: %s", command.Permission)
+			}
+		}
 	}
 	if !workspaceFound {
 		t.Fatal("目录缺少 /workspace")
+	}
+	if !subAgentFound {
+		t.Fatal("目录缺少 /subagent")
 	}
 
 	// 停用 /id，并把 /new 放宽给所有人。

@@ -65,6 +65,39 @@ func TestRuntimeConfigSnapshotIsBoundedAndMetadataOnly(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigSnapshotPreservesExplicitSubAgentSwitch(t *testing.T) {
+	disabled := false
+	runtime := RuntimeOptions{AIEnabled: true, SubAgentEnabled: &disabled, Instruction: "stable"}
+	resolved := provider.ResolvedModel{
+		Provider: provider.Provider{ID: "demo", Protocol: provider.ProtocolOpenAICompatible},
+		Model:    provider.Model{ID: "model", Enabled: true},
+	}
+	_, encoded, err := BuildRuntimeConfigSnapshot("abot", runtime, resolved, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseRuntimeConfigSnapshot(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Options.SubAgentEnabled == nil || *parsed.Options.SubAgentEnabled {
+		t.Fatalf("显式停用未进入配置快照: %#v", parsed.Options)
+	}
+	// A snapshot written before this field existed must still compare equal to
+	// the explicit enabled value, without rewriting its original JSON/digest.
+	legacyEncoded := strings.Replace(encoded, `,"subagent_enabled":false`, "", 1)
+	legacy, err := ParseRuntimeConfigSnapshot(legacyEncoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	current := legacy
+	current.Options.SubAgentEnabled = &enabled
+	if err := ValidateRuntimeConfigSnapshot(legacyEncoded, current); err != nil {
+		t.Fatalf("旧快照缺少开关字段时应按启用兼容: %v", err)
+	}
+}
+
 func TestParseRuntimeConfigSnapshotRejectsUnknownTrailingAndOversizedJSON(t *testing.T) {
 	base := RuntimeConfigSnapshot{
 		Version: RuntimeConfigSnapshotVersion, AgentDefinitionVersion: "kernel-runtime-v2", AppName: "abot",

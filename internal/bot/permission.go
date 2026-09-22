@@ -52,6 +52,7 @@ const (
 	AuditGroupAdminLeave  = "group_admin_leave"
 	AuditModelSwitch      = "model_switch"
 	AuditPersonaSwitch    = "persona_switch"
+	AuditSubAgentSwitch   = "subagent_switch"
 	AuditWorkspaceBinding = "workspace_binding"
 	AuditSourceName       = "source_name_update"
 	AuditDashboardUpdate  = "dashboard_update"

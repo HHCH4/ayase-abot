@@ -61,7 +61,10 @@ type RuntimeConfigSnapshot struct {
 // RuntimeOptionsSnapshot contains only scalar policy and budget values. Text
 // fields from RuntimeOptions are represented by the digests above.
 type RuntimeOptionsSnapshot struct {
-	AIEnabled                     bool                                      `json:"ai_enabled"`
+	AIEnabled bool `json:"ai_enabled"`
+	// Pointer distinguishes an explicit false from snapshots written before
+	// the master switch existed. Missing values mean enabled for compatibility.
+	SubAgentEnabled               *bool                                     `json:"subagent_enabled,omitempty"`
 	AITemperature                 float64                                   `json:"ai_temperature"`
 	AIReasoningEffort             string                                    `json:"ai_reasoning_effort,omitempty"`
 	AITopP                        float64                                   `json:"ai_top_p"`
@@ -146,6 +149,7 @@ func BuildRuntimeConfigSnapshot(appName string, runtime RuntimeOptions, resolved
 }
 
 func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
+	subAgentEnabled := runtime.SubAgentsEnabled()
 	profiles := make(map[string]SubAgentProfileOptionsSnapshot, len(runtime.SubAgentProfiles))
 	for profile, value := range runtime.SubAgentProfiles {
 		item := SubAgentProfileOptionsSnapshot{
@@ -169,6 +173,7 @@ func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
 	}
 	return RuntimeOptionsSnapshot{
 		AIEnabled:                     runtime.AIEnabled,
+		SubAgentEnabled:               &subAgentEnabled,
 		AITemperature:                 runtime.AITemperature,
 		AIReasoningEffort:             runtime.AIReasoningEffort,
 		AITopP:                        runtime.AITopP,
@@ -415,6 +420,8 @@ func ValidateRuntimeConfigSnapshot(stored string, current RuntimeConfigSnapshot)
 	if err != nil {
 		return err
 	}
+	parsed = effectiveRuntimeConfigSnapshot(parsed)
+	normalized = effectiveRuntimeConfigSnapshot(normalized)
 	left, marshalErr := json.Marshal(parsed)
 	if marshalErr != nil {
 		return fmt.Errorf("%w: 无法规范化已保存快照", ErrInvalidRuntimeConfigSnapshot)
@@ -427,4 +434,15 @@ func ValidateRuntimeConfigSnapshot(stored string, current RuntimeConfigSnapshot)
 		return nil
 	}
 	return fmt.Errorf("%w: stored=%s current=%s", ErrRuntimeConfigSnapshotMismatch, RuntimeConfigSnapshotDigest(string(left)), RuntimeConfigSnapshotDigest(string(right)))
+}
+
+// effectiveRuntimeConfigSnapshot applies compatibility defaults only when two
+// snapshots are compared. Persisted old snapshots keep their original JSON
+// and digest, while a missing master switch still means enabled at runtime.
+func effectiveRuntimeConfigSnapshot(snapshot RuntimeConfigSnapshot) RuntimeConfigSnapshot {
+	if snapshot.Options.SubAgentEnabled == nil {
+		enabled := true
+		snapshot.Options.SubAgentEnabled = &enabled
+	}
+	return snapshot
 }

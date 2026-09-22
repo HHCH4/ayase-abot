@@ -29,10 +29,12 @@ type commandRuntimeBridge struct {
 }
 
 var (
-	_ bot.CommandRuntimeInfo      = (*commandRuntimeBridge)(nil)
-	_ bot.CommandRuntimeAdmin     = (*commandRuntimeBridge)(nil)
-	_ bot.CommandRuntimeStats     = (*commandRuntimeBridge)(nil)
-	_ bot.CommandDashboardUpdater = (*commandRuntimeBridge)(nil)
+	_ bot.CommandRuntimeInfo          = (*commandRuntimeBridge)(nil)
+	_ bot.CommandRuntimeSubAgentInfo  = (*commandRuntimeBridge)(nil)
+	_ bot.CommandRuntimeAdmin         = (*commandRuntimeBridge)(nil)
+	_ bot.CommandRuntimeSubAgentAdmin = (*commandRuntimeBridge)(nil)
+	_ bot.CommandRuntimeStats         = (*commandRuntimeBridge)(nil)
+	_ bot.CommandDashboardUpdater     = (*commandRuntimeBridge)(nil)
 )
 
 // CurrentModel reports the model that is actually in effect for the chat, which
@@ -79,6 +81,24 @@ func (b *commandRuntimeBridge) CurrentWorkspace(ctx context.Context, userID, con
 		name = resolved.Name
 	}
 	return workspaceID, name, nil
+}
+
+// SubAgentStatus returns both the effective value and the source of the value,
+// so chat commands can distinguish an explicit session override from the
+// global system default.
+func (b *commandRuntimeBridge) SubAgentStatus(ctx context.Context, _, userID, conversationID string) (bool, *bool, bool, error) {
+	settings, err := b.config.GetSystemSettings(ctx)
+	if err != nil {
+		return false, nil, false, err
+	}
+	defaultEnabled := settings.IsSubAgentEnabled()
+	if item, getErr := b.conversations.Get(ctx, userID, conversationID); getErr == nil {
+		if item.SubAgentEnabled != nil {
+			override := *item.SubAgentEnabled
+			return override, &override, defaultEnabled, nil
+		}
+	}
+	return defaultEnabled, nil, defaultEnabled, nil
 }
 
 func (b *commandRuntimeBridge) AvailableModels(context.Context) ([]bot.CommandOption, error) {
@@ -152,6 +172,11 @@ func (b *commandRuntimeBridge) SetModel(ctx context.Context, _, userID, conversa
 // the conversation service so both the chat and the WebUI share one rule.
 func (b *commandRuntimeBridge) SetWorkspace(ctx context.Context, userID, conversationID, workspaceID string) error {
 	_, err := b.conversations.SetWorkspace(ctx, userID, conversationID, strings.TrimSpace(workspaceID))
+	return err
+}
+
+func (b *commandRuntimeBridge) SetSubAgentEnabled(ctx context.Context, _, userID, conversationID string, enabled *bool) error {
+	_, err := b.conversations.SetSubAgentEnabled(ctx, userID, conversationID, enabled)
 	return err
 }
 

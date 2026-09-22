@@ -291,3 +291,44 @@ func TestSetRuntimeOverrideAndArchiveGuard(t *testing.T) {
 		t.Fatalf("归档会话不应接受工作区绑定, got %v", err)
 	}
 }
+
+func TestSetSubAgentEnabledAndInheritance(t *testing.T) {
+	ctx := context.Background()
+	repository := newMemoryRepository()
+	service, err := NewService(repository, session.InMemoryService(), "abot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := service.Create(ctx, CreateRequest{UserID: "user-1", Title: "会话"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	disabled := false
+	updated, err := service.SetSubAgentEnabled(ctx, "user-1", item.ID, &disabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.SubAgentEnabled == nil || *updated.SubAgentEnabled {
+		t.Fatalf("停用覆盖未写入: %+v", updated)
+	}
+	again, err := service.SetSubAgentEnabled(ctx, "user-1", item.ID, &disabled)
+	if err != nil || !again.UpdatedAt.Equal(updated.UpdatedAt) {
+		t.Fatalf("重复设置应幂等: %+v err=%v", again, err)
+	}
+	enabled := true
+	cleared, err := service.SetSubAgentEnabled(ctx, "user-1", item.ID, &enabled)
+	if err != nil || cleared.SubAgentEnabled == nil || !*cleared.SubAgentEnabled {
+		t.Fatalf("启用覆盖未写入: %+v err=%v", cleared, err)
+	}
+	inherited, err := service.SetSubAgentEnabled(ctx, "user-1", item.ID, nil)
+	if err != nil || inherited.SubAgentEnabled != nil {
+		t.Fatalf("清除覆盖失败: %+v err=%v", inherited, err)
+	}
+	if _, err := service.Archive(ctx, "user-1", item.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetSubAgentEnabled(ctx, "user-1", item.ID, &disabled); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("归档会话不应接受子 Agent 覆盖: %v", err)
+	}
+}

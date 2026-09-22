@@ -169,9 +169,18 @@ type SystemSettings struct {
 	ModalFallbackProviderID  string `json:"modal_fallback_provider_id"`
 	ModalFallbackVisionModel string `json:"modal_fallback_vision_model"`
 	ModalFallbackAudioModel  string `json:"modal_fallback_audio_model"`
+	// SubAgentEnabled is a system-wide default. A nil value is only used while
+	// reading old records that predate this setting and is normalized to true.
+	SubAgentEnabled *bool `json:"subagent_enabled,omitempty"`
 	// SubAgentProfiles 是每种受控子 Agent 的独立路由、思考强度和预算设置。
 	// 未配置的 profile 继承当前主 Agent 配置；配置只允许使用上面的稳定目录。
 	SubAgentProfiles map[string]SubAgentProfileSettings `json:"subagent_profiles"`
+}
+
+// IsSubAgentEnabled returns the effective system default, preserving the
+// historical enabled behavior for configurations written before the switch.
+func (settings SystemSettings) IsSubAgentEnabled() bool {
+	return settings.SubAgentEnabled == nil || *settings.SubAgentEnabled
 }
 
 // Artifact 存储约束的默认值与边界。这些数值同时用于 Schema 校验和运行时维护
@@ -201,6 +210,7 @@ func SystemSchema() Schema {
 		{Key: "modal_fallback_provider_id", Group: "system", Label: "多模态降级供应商", Type: "string", Default: "", Help: "WebUI 会从已配置供应商目录提供选择；留空表示沿用主模型供应商。"},
 		{Key: "modal_fallback_vision_model", Group: "system", Label: "图片降级模型", Type: "string", Default: "", Help: "从所选供应商的模型目录选择；留空表示不对图片执行模型转述。"},
 		{Key: "modal_fallback_audio_model", Group: "system", Label: "音频降级模型", Type: "string", Default: "", Help: "从所选供应商的模型目录选择；留空表示不对音频执行模型转述。"},
+		{Key: "subagent_enabled", Group: "system", Label: "启用子 Agent", Type: "boolean", Default: true, Help: "主 Agent 是否允许启动通用子 Agent；关闭后所有子 Agent 类型都不会启动，但主 Agent 仍可继续回答。当前会话可用 /subagent 覆盖。"},
 	}}
 }
 
@@ -1071,6 +1081,10 @@ func normalizeSystemSettings(settings SystemSettings) SystemSettings {
 	settings.ModalFallbackProviderID = strings.TrimSpace(settings.ModalFallbackProviderID)
 	settings.ModalFallbackVisionModel = strings.TrimSpace(settings.ModalFallbackVisionModel)
 	settings.ModalFallbackAudioModel = strings.TrimSpace(settings.ModalFallbackAudioModel)
+	if settings.SubAgentEnabled == nil {
+		enabled := true
+		settings.SubAgentEnabled = &enabled
+	}
 	settings.SubAgentProfiles = normalizeSubAgentProfiles(settings.SubAgentProfiles)
 	if settings.RequestTimeoutSeconds == 0 {
 		settings.RequestTimeoutSeconds = 300

@@ -100,6 +100,12 @@ func TestSystemSettingsArtifactLifecycleBounds(t *testing.T) {
 	if err := validateSystemSettings(defaulted); err != nil {
 		t.Fatalf("默认 Artifact 边界必须合法: %v", err)
 	}
+	if !defaulted.IsSubAgentEnabled() || defaulted.SubAgentEnabled == nil {
+		t.Fatalf("旧系统设置的子 Agent 默认值必须为启用: %+v", defaulted)
+	}
+	if field, ok := fields["subagent_enabled"]; !ok || field.Default != true {
+		t.Fatalf("Schema 缺少子 Agent 总开关: %+v", field)
+	}
 	for _, key := range []string{"modal_fallback_enabled", "modal_fallback_provider_id", "modal_fallback_vision_model", "modal_fallback_audio_model"} {
 		if _, ok := fields[key]; !ok {
 			t.Fatalf("Schema 缺少多模态降级设置 %q", key)
@@ -123,6 +129,10 @@ func TestSystemSettingsArtifactLifecycleBounds(t *testing.T) {
 	}
 	if err := validateSystemSettings(disabled); err != nil {
 		t.Fatalf("关闭配额必须合法: %v", err)
+	}
+	falseValue := false
+	if got := normalizeSystemSettings(SystemSettings{SubAgentEnabled: &falseValue}); got.IsSubAgentEnabled() {
+		t.Fatalf("显式关闭的子 Agent 开关被规范化为启用: %+v", got)
 	}
 
 	invalid := []SystemSettings{

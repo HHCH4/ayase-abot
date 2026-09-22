@@ -462,9 +462,56 @@ func TestCommandConfigurationRequiresAdaptersAndAuditsSwitches(t *testing.T) {
 	}
 }
 
+func TestSubAgentCommandUsesConversationOverride(t *testing.T) {
+	manager, repository, platform := newCommandManager(t, Bot{Name: "子 Agent"})
+	info := &commandTestRuntimeInfo{modelID: "model-a"}
+	admin := &commandTestRuntimeAdmin{info: info}
+	manager.SetCommandRuntimeInfo(info)
+	manager.SetCommandRuntimeAdmin(admin)
+	ctx := context.Background()
+
+	if err := manager.handleMessage(ctx, privateMessage("member", "/subagent")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(platform.lastSent(), "当前会话子 Agent：已启用") || !strings.Contains(platform.lastSent(), "跟随全局默认") {
+		t.Fatalf("默认状态展示错误: %q", platform.lastSent())
+	}
+	if err := manager.handleMessage(ctx, privateMessage("member", "/subagent off")); err != nil {
+		t.Fatal(err)
+	}
+	if info.subAgentOverride == nil || *info.subAgentOverride {
+		t.Fatalf("off 应写入当前会话停用覆盖: %#v", info.subAgentOverride)
+	}
+	if !strings.Contains(platform.lastSent(), "已停用") || !strings.Contains(platform.lastSent(), "当前会话覆盖") {
+		t.Fatalf("停用回执错误: %q", platform.lastSent())
+	}
+	if err := manager.handleMessage(ctx, privateMessage("member", "/subagent inherit")); err != nil {
+		t.Fatal(err)
+	}
+	if info.subAgentOverride != nil {
+		t.Fatalf("inherit 应清除会话覆盖: %#v", info.subAgentOverride)
+	}
+	audits, err := repository.ListCommandAudits(ctx, "bot-1", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, entry := range audits {
+		if entry.Action == AuditSubAgentSwitch {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("子 Agent 开关应写入两条审计: %+v", audits)
+	}
+}
+
 type commandTestRuntimeInfo struct {
-	modelID string
-	models  []CommandOption
+	modelID                string
+	models                 []CommandOption
+	subAgentDefaultEnabled bool
+	subAgentDefaultSet     bool
+	subAgentOverride       *bool
 }
 
 func (i *commandTestRuntimeInfo) CurrentModel(context.Context, string, string, string) (string, string, error) {
@@ -475,6 +522,17 @@ func (i *commandTestRuntimeInfo) CurrentPersona(context.Context, string, string,
 }
 func (i *commandTestRuntimeInfo) CurrentWorkspace(context.Context, string, string) (string, string, error) {
 	return "", "", nil
+}
+func (i *commandTestRuntimeInfo) SubAgentStatus(context.Context, string, string, string) (bool, *bool, bool, error) {
+	defaultEnabled := i.subAgentDefaultEnabled
+	if !i.subAgentDefaultSet {
+		defaultEnabled = true
+	}
+	if i.subAgentOverride == nil {
+		return defaultEnabled, nil, defaultEnabled, nil
+	}
+	override := *i.subAgentOverride
+	return override, &override, defaultEnabled, nil
 }
 func (i *commandTestRuntimeInfo) AvailableModels(context.Context) ([]CommandOption, error) {
 	return i.models, nil
@@ -488,6 +546,7 @@ func (i *commandTestRuntimeInfo) AvailableWorkspaces(context.Context) ([]Command
 
 type commandTestRuntimeAdmin struct {
 	modelID string
+	info    *commandTestRuntimeInfo
 }
 
 func (a *commandTestRuntimeAdmin) SetModel(_ context.Context, _, _, _, modelID string) error {
@@ -498,6 +557,19 @@ func (a *commandTestRuntimeAdmin) SetPersona(context.Context, string, string, st
 	return nil
 }
 func (a *commandTestRuntimeAdmin) SetWorkspace(context.Context, string, string, string) error {
+	return nil
+}
+
+func (a *commandTestRuntimeAdmin) SetSubAgentEnabled(_ context.Context, _, _, _ string, enabled *bool) error {
+	if a.info == nil {
+		return nil
+	}
+	if enabled == nil {
+		a.info.subAgentOverride = nil
+		return nil
+	}
+	value := *enabled
+	a.info.subAgentOverride = &value
 	return nil
 }
 

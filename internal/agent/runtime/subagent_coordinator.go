@@ -10,6 +10,10 @@ import (
 	"Abot/internal/agent"
 )
 
+// ErrSubAgentsDisabled is returned when the current conversation explicitly
+// disables the main Agent's child-Agent execution.
+var ErrSubAgentsDisabled = agent.ErrSubAgentsDisabled
+
 // SetRetrievalAdapter 将领域检索服务装配到通用 Runtime。适配器只负责只读检索，
 // 子 Agent 的预算、证据边界和持久化仍由 Coordinator 统一管理。
 func (c *Coordinator) SetRetrievalAdapter(adapter RetrievalAdapter) error {
@@ -24,7 +28,55 @@ func (c *Coordinator) RunRetrieval(ctx context.Context, request RetrievalRequest
 	if c == nil || c.subagents == nil {
 		return RetrievalSummary{}, errors.New("子 Agent 管理器未装配")
 	}
+	request, err := c.prepareRetrievalRequest(ctx, request)
+	if err != nil {
+		return RetrievalSummary{}, err
+	}
+	if !request.Runtime.SubAgentsEnabled() {
+		return RetrievalSummary{}, ErrSubAgentsDisabled
+	}
 	return c.subagents.RunRetrieval(ctx, request)
+}
+
+func (c *Coordinator) prepareRetrievalRequest(ctx context.Context, request RetrievalRequest) (RetrievalRequest, error) {
+	if c == nil || c.kernel == nil {
+		if request.Runtime.SubAgentEnabled == nil {
+			request.Runtime = agent.RuntimeOptions{}
+		}
+		return request, nil
+	}
+	if request.InvocationID != "" {
+		invocation, err := c.repo.GetInvocation(ctx, strings.TrimSpace(request.InvocationID))
+		if err != nil {
+			return request, err
+		}
+		if request.UserID != "" && strings.TrimSpace(request.UserID) != strings.TrimSpace(invocation.UserID) {
+			return request, fmt.Errorf("检索无权访问该 invocation")
+		}
+		if request.UserID == "" {
+			request.UserID = invocation.UserID
+		}
+		if request.ConversationID == "" {
+			request.ConversationID = invocation.ConversationID
+		}
+		if request.SessionID == "" {
+			request.SessionID = invocation.SessionID
+		}
+	}
+	if strings.TrimSpace(request.ConversationID) == "" && strings.TrimSpace(request.SessionID) == "" {
+		if request.Runtime.SubAgentEnabled == nil {
+			request.Runtime = agent.RuntimeOptions{}
+		}
+		return request, nil
+	}
+	resolved, err := c.kernel.ResolveRuntimeOptions(ctx, agent.ChatRequest{
+		UserID: request.UserID, ConversationID: request.ConversationID, SessionID: request.SessionID,
+	})
+	if err != nil {
+		return request, fmt.Errorf("解析检索子 Agent 配置失败: %w", err)
+	}
+	request.Runtime = resolved
+	return request, nil
 }
 
 // RunBuiltInSubAgentGroup 在应用侧启动受限的通用文本子 Agent 组。执行只
@@ -36,6 +88,9 @@ func (c *Coordinator) RunBuiltInSubAgentGroup(ctx context.Context, request Built
 	request, err := c.prepareBuiltInSubAgentRequest(ctx, request)
 	if err != nil {
 		return nil, err
+	}
+	if !request.Runtime.SubAgentsEnabled() {
+		return nil, ErrSubAgentsDisabled
 	}
 	return c.subagents.RunBuiltInSubAgentGroup(ctx, request)
 }
@@ -81,11 +136,14 @@ func (c *Coordinator) prepareBuiltInSubAgentRequest(ctx context.Context, request
 		}
 		request.Runtime = resolved
 	}
+	if !request.Runtime.SubAgentsEnabled() {
+		return request, ErrSubAgentsDisabled
+	}
 	return request, nil
 }
 
 func runtimeOptionsSpecified(runtime agent.RuntimeOptions) bool {
-	return runtime.AIEnabled || strings.TrimSpace(runtime.ProviderID) != "" || strings.TrimSpace(runtime.ModelID) != "" ||
+	return runtime.SubAgentEnabled != nil || runtime.AIEnabled || strings.TrimSpace(runtime.ProviderID) != "" || strings.TrimSpace(runtime.ModelID) != "" ||
 		runtime.AIMaxOutputTokens != 0 || runtime.AITemperature != 0 || runtime.AITopP != 0 || strings.TrimSpace(runtime.AIReasoningEffort) != "" || len(runtime.SubAgentProfiles) > 0
 }
 

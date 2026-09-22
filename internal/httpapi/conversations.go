@@ -18,6 +18,11 @@ type conversationPayload struct {
 	Title       string `json:"title"`
 }
 
+type conversationSubAgentPayload struct {
+	// nil restores inheritance from the system default.
+	Enabled *bool `json:"enabled"`
+}
+
 func (s *Server) requireConversations() (*conversation.Service, error) {
 	if s.conversations == nil {
 		return nil, errors.New("对话服务尚未装配")
@@ -163,6 +168,25 @@ func (s *Server) getConversationContext(writer http.ResponseWriter, request *htt
 		return
 	}
 	writeJSON(writer, http.StatusOK, status)
+}
+
+func (s *Server) setConversationSubAgent(writer http.ResponseWriter, request *http.Request) {
+	service, err := s.requireConversations()
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	var payload conversationSubAgentPayload
+	if err := decodeJSON(writer, request, &payload); err != nil {
+		writeError(writer, fmt.Errorf("请求体无效: %w", err))
+		return
+	}
+	item, err := service.SetSubAgentEnabled(request.Context(), conversationUserID(request), request.PathValue("id"), payload.Enabled)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, item)
 }
 
 func (s *Server) archiveConversation(writer http.ResponseWriter, request *http.Request) {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { NButton, NCard, NEmpty, NInput, NSelect, NSpace, NTabPane, NTabs, NTag, useMessage } from 'naive-ui'
+import { NButton, NCard, NEmpty, NInput, NPagination, NSelect, NSpace, NTabPane, NTabs, NTag, useMessage } from 'naive-ui'
 import { request } from '@/api'
 import { useAppStore } from '@/stores/app'
 import type { BotCommand, BotCommandAudit } from '@/types'
@@ -16,6 +16,9 @@ const categoryFilter = ref<string | null>(null)
 const permissionFilter = ref<string | null>(null)
 const stateFilter = ref<string | null>(null)
 const search = ref('')
+const page = ref(1)
+const pageSize = ref(10)
+const pageSizeOptions = [10, 20, 50]
 
 const permissionOptions = [
   { label: '所有人', value: 'everyone' },
@@ -42,6 +45,11 @@ const visibleCommands = computed(() => commands.value.filter((item) => {
   return true
 }))
 const disabledCount = computed(() => commands.value.filter((item) => !item.effective_enabled).length)
+const pageCount = computed(() => Math.max(1, Math.ceil(visibleCommands.value.length / pageSize.value)))
+const pagedCommands = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return visibleCommands.value.slice(start, start + pageSize.value)
+})
 
 function formatTime(value: string) {
   if (!value) return '—'
@@ -77,6 +85,11 @@ async function loadCommands() {
   } finally {
     loading.value = false
   }
+}
+
+async function refreshCommandCatalog(showMessage = true) {
+  await Promise.all([loadCommands(), loadAudits()])
+  if (showMessage && selectedID.value) message.success('指令目录已刷新')
 }
 
 async function loadAudits() {
@@ -116,8 +129,16 @@ async function updatePolicy(command: BotCommand, patch: { permission?: string; e
 }
 
 watch(selectedID, async () => {
-  await loadCommands()
-  await loadAudits()
+  page.value = 1
+  await refreshCommandCatalog(false)
+})
+
+watch([categoryFilter, permissionFilter, stateFilter, search], () => {
+  page.value = 1
+})
+
+watch([() => visibleCommands.value.length, pageSize], () => {
+  if (page.value > pageCount.value) page.value = pageCount.value
 })
 
 onMounted(async () => {
@@ -143,6 +164,7 @@ onMounted(async () => {
           <NSpace align="center">
             <NSelect v-model:value="selectedID" :options="botOptions" placeholder="选择机器人" style="width: 220px" />
             <NTag size="small">共 {{ commands.length }} 条 · 已停用 {{ disabledCount }}</NTag>
+            <NButton secondary :loading="loading" @click="refreshCommandCatalog()">刷新目录</NButton>
           </NSpace>
         </div>
       </template>
@@ -159,7 +181,7 @@ onMounted(async () => {
         <div class="command-head">
           <span>指令</span><span>来源</span><span>分类</span><span>描述</span><span>权限</span><span>操作</span>
         </div>
-        <div v-for="command in visibleCommands" :key="command.id" class="command-row">
+        <div v-for="command in pagedCommands" :key="command.id" class="command-row">
           <code>/{{ command.name }}</code>
           <NTag size="small" :type="sourceTagType(command)">{{ command.source_name }}</NTag>
           <span class="muted">{{ categoryLabels[command.category] || command.category }}</span>
@@ -183,6 +205,10 @@ onMounted(async () => {
           >
             {{ command.effective_enabled ? '停用' : '启用' }}
           </NButton>
+        </div>
+        <div class="command-pagination">
+          <span class="muted">筛选后 {{ visibleCommands.length }} 条</span>
+          <NPagination v-model:page="page" v-model:page-size="pageSize" :page-count="pageCount" :page-sizes="pageSizeOptions" show-size-picker />
         </div>
       </div>
     </NCard>
@@ -222,6 +248,7 @@ onMounted(async () => {
 .command-row { padding: 9px 10px; border: 1px solid #eef0f2; border-radius: 10px; }
 .command-row code { color: var(--brand); font-size: 12px; }
 .command-desc { color: #5b6472; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.command-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 2px 0; }
 .audit-list { display: grid; gap: 6px; }
 .audit-row { display: grid; grid-template-columns: 170px 130px 130px 110px minmax(0, 1fr) 90px; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid #eef0f2; border-radius: 10px; font-size: 12px; }
 </style>

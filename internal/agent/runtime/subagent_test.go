@@ -68,6 +68,25 @@ func TestSubAgentManagerImageFanoutAndParentLifecycle(t *testing.T) {
 	}
 }
 
+func TestSubAgentManagerMasterSwitchBlocksEverySubAgentEntryPoint(t *testing.T) {
+	manager, err := NewSubAgentManager(NewMemoryRepository(), nil)
+	if err != nil {
+		t.Fatalf("创建子 Agent 管理器失败: %v", err)
+	}
+	disabled := false
+	runtime := agent.RuntimeOptions{SubAgentEnabled: &disabled}
+
+	if _, err := manager.AnalyzeDocumentImages(context.Background(), agent.DocumentImageAnalysisRequest{Runtime: runtime}); !errors.Is(err, agent.ErrSubAgentsDisabled) {
+		t.Fatalf("视觉子 Agent 未被总开关拦截: %v", err)
+	}
+	if _, err := manager.RunBuiltInSubAgentGroup(context.Background(), BuiltInSubAgentGroupRequest{Runtime: runtime}); !errors.Is(err, agent.ErrSubAgentsDisabled) {
+		t.Fatalf("通用文本子 Agent 未被总开关拦截: %v", err)
+	}
+	if _, err := manager.RunRetrieval(context.Background(), RetrievalRequest{Runtime: runtime}); !errors.Is(err, agent.ErrSubAgentsDisabled) {
+		t.Fatalf("检索子 Agent 未被总开关拦截: %v", err)
+	}
+}
+
 func TestSubAgentManagerRetrievalDeduplicatesAndPersistsEvidence(t *testing.T) {
 	repo := NewMemoryRepository()
 	manager, err := NewSubAgentManager(repo, nil)

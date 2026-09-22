@@ -514,6 +514,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/conversations/{id}", s.getConversation)
 	mux.HandleFunc("GET /api/v1/conversations/{id}/messages", s.listConversationMessages)
 	mux.HandleFunc("GET /api/v1/conversations/{id}/context", s.getConversationContext)
+	mux.HandleFunc("PUT /api/v1/conversations/{id}/subagent", s.setConversationSubAgent)
 	mux.HandleFunc("POST /api/v1/conversations/{id}/archive", s.archiveConversation)
 	mux.HandleFunc("POST /api/v1/conversations/{id}/unarchive", s.unarchiveConversation)
 	mux.HandleFunc("DELETE /api/v1/conversations/{id}", s.deleteConversation)

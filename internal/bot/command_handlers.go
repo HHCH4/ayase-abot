@@ -22,6 +22,12 @@ type CommandRuntimeInfo interface {
 	AvailableWorkspaces(context.Context) ([]CommandOption, error)
 }
 
+// CommandRuntimeSubAgentInfo is an optional extension for deployments that
+// expose the main Agent's sub-agent master switch.
+type CommandRuntimeSubAgentInfo interface {
+	SubAgentStatus(context.Context, string, string, string) (enabled bool, override *bool, defaultEnabled bool, err error)
+}
+
 // CommandUsageValue 表示一项可选的 Token 用量；Known=false 时说明供应商没有返回该字段。
 type CommandUsageValue struct {
 	Value int
@@ -69,6 +75,12 @@ type CommandRuntimeAdmin interface {
 	SetWorkspace(context.Context, string, string, string) error
 }
 
+// CommandRuntimeSubAgentAdmin is the optional write side of the sub-agent
+// switch. It is deliberately separate so old command bridges remain valid.
+type CommandRuntimeSubAgentAdmin interface {
+	SetSubAgentEnabled(context.Context, string, string, string, *bool) error
+}
+
 // CommandOption is one selectable value for a configuration command.
 type CommandOption struct {
 	ID   string `json:"id"`
@@ -93,6 +105,24 @@ func (m *Manager) runtimeAdminProvider() (CommandRuntimeAdmin, bool) {
 	admin := m.commandRuntimeAdmin
 	m.mu.RUnlock()
 	return admin, admin != nil
+}
+
+func (m *Manager) subAgentInfoProvider() (CommandRuntimeSubAgentInfo, bool) {
+	info, ok := m.runtimeInfoProvider()
+	if !ok {
+		return nil, false
+	}
+	extension, ok := info.(CommandRuntimeSubAgentInfo)
+	return extension, ok
+}
+
+func (m *Manager) subAgentAdminProvider() (CommandRuntimeSubAgentAdmin, bool) {
+	admin, ok := m.runtimeAdminProvider()
+	if !ok {
+		return nil, false
+	}
+	extension, ok := admin.(CommandRuntimeSubAgentAdmin)
+	return extension, ok
 }
 
 func (m *Manager) runtimeStatsProvider() (CommandRuntimeStats, bool) {
@@ -184,6 +214,8 @@ func (m *Manager) dispatchBotCommand(ctx context.Context, bot Bot, message Messa
 		return m.commandModel(ctx, bot, message, authorization)
 	case "persona":
 		return m.commandPersona(ctx, bot, message, authorization)
+	case "subagent":
+		return m.commandSubAgent(ctx, bot, message, authorization)
 	case "workspace":
 		return m.commandWorkspace(ctx, bot, message, authorization)
 	case "admin list":
@@ -363,6 +395,15 @@ func (m *Manager) commandConfig(ctx context.Context, bot Bot, message Message, a
 		if _, personaName, personaErr := info.CurrentPersona(ctx, bot.ID, userID, conversationID); personaErr == nil && strings.TrimSpace(personaName) != "" {
 			lines = append(lines, "人格："+personaName)
 		}
+		if subAgentInfo, subAgentInfoOK := m.subAgentInfoProvider(); subAgentInfoOK {
+			if enabled, override, defaultEnabled, subAgentErr := subAgentInfo.SubAgentStatus(ctx, bot.ID, userID, conversationID); subAgentErr == nil {
+				mode := "跟随全局默认"
+				if override != nil {
+					mode = "当前会话覆盖"
+				}
+				lines = append(lines, "子 Agent："+commandBooleanLabel(enabled)+"（"+mode+"，全局默认"+commandBooleanLabel(defaultEnabled)+"）")
+			}
+		}
 		// Workspace details describe server paths, so they stay behind the
 		// global administrator boundary.
 		if authorization.GlobalAdmin {
@@ -381,6 +422,78 @@ func (m *Manager) commandConfig(ctx context.Context, bot Bot, message Message, a
 		lines = append(lines, "（当前部署未提供配置查询）")
 	}
 	return m.send(ctx, message, strings.Join(lines, "\n"))
+}
+
+func (m *Manager) commandSubAgent(ctx context.Context, bot Bot, message Message, authorization commandAuthorization) error {
+	info, ok := m.subAgentInfoProvider()
+	if !ok {
+		return m.send(ctx, message, "当前部署未提供子 Agent 开关查询。")
+	}
+	userID, conversationID, err := m.conversationForMessage(ctx, message)
+	if err != nil {
+		return err
+	}
+	enabled, override, defaultEnabled, err := info.SubAgentStatus(ctx, bot.ID, userID, conversationID)
+	if err != nil {
+		return m.send(ctx, message, "读取子 Agent 开关失败："+trimError(err))
+	}
+	argument := strings.ToLower(strings.TrimSpace(authorization.Arg))
+	if argument == "" {
+		mode := "跟随全局默认"
+		if override != nil {
+			mode = "当前会话覆盖"
+		}
+		return m.send(ctx, message, strings.Join([]string{
+			"当前会话子 Agent：" + commandBooleanLabel(enabled),
+			"模式：" + mode,
+			"全局默认：" + commandBooleanLabel(defaultEnabled),
+			"用法：/subagent on|off|inherit",
+		}, "\n"))
+	}
+	var next *bool
+	switch argument {
+	case "on", "enable", "enabled", "true", "1", "开启", "启用":
+		value := true
+		next = &value
+	case "off", "disable", "disabled", "false", "0", "关闭", "停用":
+		value := false
+		next = &value
+	case "inherit", "default", "follow", "auto", "继承", "默认", "跟随":
+		// nil clears the conversation override.
+	default:
+		return m.send(ctx, message, "参数无效。用法：/subagent on|off|inherit")
+	}
+	admin, ok := m.subAgentAdminProvider()
+	if !ok {
+		return m.send(ctx, message, "当前部署不允许在聊天中切换子 Agent。")
+	}
+	if err := admin.SetSubAgentEnabled(ctx, bot.ID, userID, conversationID, next); err != nil {
+		return m.send(ctx, message, "切换子 Agent 失败："+trimError(err))
+	}
+	effective := defaultEnabled
+	mode := "跟随全局默认"
+	target := "inherit"
+	if next != nil {
+		effective = *next
+		mode = "当前会话覆盖"
+		if effective {
+			target = "on"
+		} else {
+			target = "off"
+		}
+	}
+	m.recordAudit(ctx, CommandAudit{
+		AdapterID: bot.ID, ChatID: message.ChatID, UserID: message.UserID, Command: "subagent",
+		Action: AuditSubAgentSwitch, Target: target, Result: "ok",
+	})
+	return m.send(ctx, message, "已设置当前会话子 Agent："+commandBooleanLabel(effective)+"（"+mode+"）。")
+}
+
+func commandBooleanLabel(value bool) string {
+	if value {
+		return "已启用"
+	}
+	return "已停用"
 }
 
 func (m *Manager) commandModel(ctx context.Context, bot Bot, message Message, authorization commandAuthorization) error {

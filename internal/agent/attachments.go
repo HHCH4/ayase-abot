@@ -245,7 +245,7 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 				"truncated", truncated,
 				"warnings", parsed.Warnings,
 			)
-			if len(parsed.Images) > 0 && m.documentImageSubagentRunner != nil {
+			if len(parsed.Images) > 0 && m.runtime.SubAgentsEnabled() && m.documentImageSubagentRunner != nil {
 				results, analyzeErr := m.documentImageSubagentRunner.AnalyzeDocumentImages(ctx, DocumentImageAnalysisRequest{
 					InvocationID: m.invocationID,
 					UserID:       m.userID,

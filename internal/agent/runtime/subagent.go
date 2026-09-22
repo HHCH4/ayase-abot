@@ -210,6 +210,9 @@ type RetrievalRequest struct {
 	MaxQueryCount  int               `json:"max_query_count,omitempty"`
 	MaxResultBytes int               `json:"max_result_bytes,omitempty"`
 	Deadline       time.Time         `json:"deadline,omitempty"`
+	// Runtime is resolved by Coordinator from the current conversation. It is
+	// deliberately excluded from HTTP JSON so callers cannot inject a policy.
+	Runtime agent.RuntimeOptions `json:"-"`
 }
 
 // RetrievalFailure 保留失败来源的可展示摘要，不暴露内部调用栈或请求正文。
@@ -786,6 +789,9 @@ func cloneSubAgentEvidence(item EvidenceItem) EvidenceItem {
 func (m *SubAgentManager) AnalyzeDocumentImages(ctx context.Context, request agent.DocumentImageAnalysisRequest) ([]agent.DocumentImageAnalysisResult, error) {
 	if m == nil {
 		return nil, errors.New("子 Agent 管理器不能为空")
+	}
+	if !request.Runtime.SubAgentsEnabled() {
+		return nil, agent.ErrSubAgentsDisabled
 	}
 	m.mu.Lock()
 	closed := m.closed

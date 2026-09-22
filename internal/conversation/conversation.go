@@ -46,13 +46,16 @@ type Conversation struct {
 	// ProviderID and ModelID are an optional per-conversation model override.
 	// Empty means "inherit whatever the configuration bindings resolve", so a
 	// chat can switch models without touching the bot or the global default.
-	ProviderID string     `json:"provider_id,omitempty"`
-	ModelID    string     `json:"model_id,omitempty"`
-	Title      string     `json:"title"`
-	Status     Status     `json:"status"`
-	ArchivedAt *time.Time `json:"archived_at,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+	ProviderID string `json:"provider_id,omitempty"`
+	ModelID    string `json:"model_id,omitempty"`
+	// SubAgentEnabled is an optional per-conversation override. Nil inherits
+	// the system default; true or false is an explicit session choice.
+	SubAgentEnabled *bool      `json:"subagent_enabled,omitempty"`
+	Title           string     `json:"title"`
+	Status          Status     `json:"status"`
+	ArchivedAt      *time.Time `json:"archived_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 // Message 是聊天历史的公开视图；附件正文仍由 ADK 事件存储，列表只返回数量和元信息。
@@ -487,6 +490,41 @@ func (s *Service) SetRuntimeOverride(ctx context.Context, userID, id, providerID
 		return Conversation{}, err
 	}
 	return item, nil
+}
+
+// SetSubAgentEnabled stores or clears the per-conversation sub-agent master
+// switch. A nil value restores inheritance from the system setting.
+func (s *Service) SetSubAgentEnabled(ctx context.Context, userID, id string, enabled *bool) (Conversation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, err := s.Get(ctx, userID, id)
+	if err != nil {
+		return Conversation{}, err
+	}
+	if item.Status != StatusActive {
+		return Conversation{}, fmt.Errorf("%w: 当前状态为 %s", ErrInvalidRequest, item.Status)
+	}
+	var next *bool
+	if enabled != nil {
+		value := *enabled
+		next = &value
+	}
+	if boolPointersEqual(item.SubAgentEnabled, next) {
+		return item, nil
+	}
+	item.SubAgentEnabled = next
+	item.UpdatedAt = time.Now().UTC()
+	if err := s.repository.Save(ctx, item); err != nil {
+		return Conversation{}, err
+	}
+	return item, nil
+}
+
+func boolPointersEqual(left, right *bool) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 // Archive 将活跃对话归档；归档保留全部信息，但停止聊天和工作区操作。

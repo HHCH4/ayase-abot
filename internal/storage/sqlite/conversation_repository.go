@@ -22,11 +22,13 @@ type conversationRow struct {
 	// Per-conversation model override; empty inherits the resolved default.
 	ProviderID string `gorm:"size:100"`
 	ModelID    string `gorm:"size:200"`
-	Title      string `gorm:"size:500;not null"`
-	Status     string `gorm:"index;size:32;not null"`
-	ArchivedAt *time.Time
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// Nullable so old rows inherit the system sub-agent default.
+	SubAgentEnabled *bool
+	Title           string `gorm:"size:500;not null"`
+	Status          string `gorm:"index;size:32;not null"`
+	ArchivedAt      *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 func (conversationRow) TableName() string { return "abot_conversations" }
@@ -129,7 +131,7 @@ func (r *conversationRepository) Save(ctx context.Context, item conversation.Con
 	row := conversationRow{
 		ID: item.ID, AppName: item.AppName, UserID: item.UserID, Source: item.Source,
 		Platform: item.Platform, ChatType: item.ChatType, ChatID: item.ChatID, WorkspaceID: item.WorkspaceID,
-		ProviderID: item.ProviderID, ModelID: item.ModelID,
+		ProviderID: item.ProviderID, ModelID: item.ModelID, SubAgentEnabled: item.SubAgentEnabled,
 		Title: item.Title, Status: string(item.Status), ArchivedAt: item.ArchivedAt,
 		CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 	}
@@ -236,10 +238,15 @@ func (r *conversationRepository) Delete(ctx context.Context, userID, id string) 
 }
 
 func conversationFromRow(row conversationRow) conversation.Conversation {
+	var subAgentEnabled *bool
+	if row.SubAgentEnabled != nil {
+		value := *row.SubAgentEnabled
+		subAgentEnabled = &value
+	}
 	return conversation.Conversation{
 		ID: row.ID, AppName: row.AppName, UserID: row.UserID, Source: row.Source,
 		Platform: row.Platform, ChatType: row.ChatType, ChatID: row.ChatID, WorkspaceID: row.WorkspaceID,
-		ProviderID: row.ProviderID, ModelID: row.ModelID,
+		ProviderID: row.ProviderID, ModelID: row.ModelID, SubAgentEnabled: subAgentEnabled,
 		Title: row.Title, Status: conversation.Status(row.Status), ArchivedAt: row.ArchivedAt,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}

@@ -193,6 +193,7 @@ export interface Conversation {
   chat_type?: 'private' | 'group' | 'other' | string
   chat_id?: string
   workspace_id?: string
+  subagent_enabled?: boolean | null
   title: string
   status: 'active' | 'archived' | string
   archived_at?: string
@@ -675,6 +676,7 @@ export interface SystemSettings {
   modal_fallback_provider_id: string
   modal_fallback_vision_model: string
   modal_fallback_audio_model: string
+  subagent_enabled: boolean
   subagent_profiles: Record<string, SubAgentProfileSettings>
 }
 

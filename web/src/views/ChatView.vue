@@ -93,6 +93,20 @@ const messagePanel = ref<HTMLElement | null>(null)
 
 const selectedConversation = computed(() => store.conversations.find((item) => item.id === conversationID.value))
 const activeConversations = computed(() => store.conversations)
+const subAgentEffectiveEnabled = computed(() => {
+  const override = selectedConversation.value?.subagent_enabled
+  return typeof override === 'boolean' ? override : store.systemSettings.subagent_enabled !== false
+})
+const subAgentMode = computed(() => {
+  const override = selectedConversation.value?.subagent_enabled
+  if (typeof override !== 'boolean') return 'inherit'
+  return override ? 'on' : 'off'
+})
+const subAgentModeOptions = [
+  { label: '跟随系统默认', value: 'inherit' },
+  { label: '当前会话启用', value: 'on' },
+  { label: '当前会话停用', value: 'off' },
+]
 const profileOptions = computed(() => [{ label: '使用系统默认配置', value: '' }, ...store.configProfiles.map((item) => ({ label: `${item.name}${item.is_default ? ' · 默认' : ''}`, value: item.id }))])
 const providerOptions = computed(() => store.providers.map((item) => ({ label: item.name, value: item.id })))
 const modelOptions = computed(() => {
@@ -401,6 +415,20 @@ async function bindProfile() {
     message.success('当前对话配置已更新')
   } catch (error) {
     message.error(error instanceof Error ? error.message : '绑定配置失败')
+  }
+}
+
+async function setSubAgentMode(value: string) {
+  if (!conversationID.value || selectedConversation.value?.status !== 'active') return
+  const enabled = value === 'inherit' ? null : value === 'on'
+  try {
+    await request(`/api/v1/conversations/${encodeURIComponent(conversationID.value)}/subagent?user_id=${encodeURIComponent(userID.value)}`, {
+      method: 'PUT', body: JSON.stringify({ enabled }),
+    })
+    await store.reloadConversations(userID.value)
+    message.success(enabled === null ? '当前会话已恢复跟随系统默认' : `当前会话子 Agent 已${enabled ? '启用' : '停用'}`)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '更新子 Agent 开关失败')
   }
 }
 
@@ -1019,6 +1047,7 @@ onMounted(async () => {
           <NSpace wrap><NButton type="primary" @click="createConversation">＋ 新建对话</NButton><NButton secondary :disabled="selectedConversation?.status !== 'active'" @click="archiveConversation()">归档</NButton><NButton secondary :disabled="selectedConversation?.status !== 'archived'" @click="unarchiveConversation()">恢复</NButton><NButton tertiary type="error" :disabled="selectedConversation?.status !== 'archived'" @click="deleteConversation()">删除</NButton></NSpace>
           <div class="chat-settings-divider" />
           <NFormItem label="配置文件"><NSelect v-model:value="profileID" :options="profileOptions" @update:value="bindProfile" /><small>系统默认 → 机器人 → 当前对话。</small></NFormItem>
+          <NFormItem label="子 Agent"><NSelect :value="subAgentMode" :options="subAgentModeOptions" :disabled="selectedConversation?.status !== 'active'" @update:value="setSubAgentMode" /><small>当前：{{ subAgentEffectiveEnabled ? '已启用' : '已停用' }}。也可以在聊天中使用 /subagent on、/subagent off 或 /subagent inherit。</small></NFormItem>
           <NFormItem label="供应商"><NSelect v-model:value="providerID" :options="providerOptions" placeholder="选择供应商" /></NFormItem>
           <div class="settings-provider-list">
             <div v-for="item in store.providers" :key="item.id" class="settings-provider-row">

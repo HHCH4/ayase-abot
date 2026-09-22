@@ -24,6 +24,7 @@ type groupAdminPayload struct {
 }
 
 func (s *Server) listBotCommands(writer http.ResponseWriter, request *http.Request) {
+	writer.Header().Set("Cache-Control", "no-store")
 	service, err := s.requireBots()
 	if err != nil {
 		writeError(writer, err)
@@ -38,6 +39,7 @@ func (s *Server) listBotCommands(writer http.ResponseWriter, request *http.Reque
 }
 
 func (s *Server) updateBotCommandPolicy(writer http.ResponseWriter, request *http.Request) {
+	writer.Header().Set("Cache-Control", "no-store")
 	service, err := s.requireBots()
 	if err != nil {
 		writeError(writer, err)
