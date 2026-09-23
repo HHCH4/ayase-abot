@@ -24,6 +24,7 @@ type PlatformConfig struct {
 	ReplyPrefix            string
 	ReplyMention           bool
 	ReplyQuote             bool
+	PrivateReplyQuote      bool
 	WhitelistEnabled       bool
 	WhitelistIDs           []string
 	WhitelistLog           bool

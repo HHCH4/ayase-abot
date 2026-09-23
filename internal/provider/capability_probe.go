@@ -311,7 +311,8 @@ func probeToolRequest(modelID string, maxOutput int) *adkmodel.LLMRequest {
 	request := probeTextRequest(modelID, maxOutput)
 	request.Contents = []*genai.Content{genai.NewContentFromText("Call the declared no-op function exactly once; do not describe it.", genai.RoleUser)}
 	request.Config.Tools = []*genai.Tool{{FunctionDeclarations: []*genai.FunctionDeclaration{{Name: "abot_capability_probe_noop", Description: "No-op capability probe. Never execute.", Parameters: &genai.Schema{Type: genai.TypeObject}}}}}
-	request.Config.ToolConfig = &genai.ToolConfig{FunctionCallingConfig: &genai.FunctionCallingConfig{Mode: genai.FunctionCallingConfigModeAny, AllowedFunctionNames: []string{"abot_capability_probe_noop"}}}
+	// 用实际对话相同的自动模式探测，避免不支持强制调用的模型被误判为完全不能调用工具。
+	request.Config.ToolConfig = &genai.ToolConfig{FunctionCallingConfig: &genai.FunctionCallingConfig{Mode: genai.FunctionCallingConfigModeAuto}}
 	return request
 }
 

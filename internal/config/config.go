@@ -228,6 +228,7 @@ type PlatformSettings struct {
 	ReplyPrefix            string
 	ReplyMention           bool
 	ReplyQuote             bool
+	PrivateReplyQuote      bool
 	WhitelistEnabled       bool
 	WhitelistIDs           []string
 	WhitelistLog           bool
@@ -882,7 +883,9 @@ func buildSchema() Schema {
 		{Key: "platform.reply_mention", Group: "platform", Label: "回复时 @ 发送人", Type: "boolean", Default: false, Help: "OneBot 使用 @ 消息段；Telegram 使用用户提及链接。"},
 		// 仅列出当前适配器具备实际执行路径的平台选项。
 		{Key: "platform.unique_session", Group: "platform", Label: "隔离群成员会话", Type: "boolean", Default: false, Help: "开启后同群不同成员使用独立的对话与任务队列。"},
-		{Key: "platform.reply_quote", Group: "platform", Label: "回复时引用发送人消息", Type: "boolean", Default: false, Help: "平台支持引用时关联原消息。"},
+		{Key: "platform.reply_quote", Group: "platform", Label: "群聊回复时引用发送人消息", Type: "boolean", Default: false, Help: "仅在群聊引用原消息；私聊由独立开关控制。"},
+		// 私聊默认直接回复正文，避免每条分段消息都附带相同的引用卡片。
+		{Key: "platform.private_reply_quote", Group: "platform", Label: "私聊回复时引用发送人消息", Type: "boolean", Default: false, Help: "默认关闭；开启后私聊回复会引用原消息。"},
 		{Key: "platform.empty_mention_waiting", Group: "platform", Label: "仅 @ 时等待下一条消息", Type: "boolean", Default: true, Help: "群成员只 @ 机器人而没有正文时，在一分钟内接收其下一条消息。"},
 		{Key: "platform.empty_mention_need_reply", Group: "platform", Label: "等待时发送提示", Type: "boolean", Default: true, DisplayIf: map[string]any{"platform.empty_mention_waiting": true}},
 		{Key: "platform.whitelist_enabled", Group: "platform", Label: "启用 ID 白名单", Type: "boolean", Default: true, Help: "名单为空时不限制；按会话来源、群 ID 或用户 ID 匹配。"},
@@ -910,7 +913,7 @@ func buildSchema() Schema {
 		{Key: "extensions.segment_words_threshold", Group: "extensions", Label: "分段字数阈值", Type: "integer", Default: 150, Min: floatPtr(1), Max: floatPtr(5000), DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}, Help: "超过阈值的长回复直接发送，不拆段。"},
 		{Key: "extensions.segment_split_mode", Group: "extensions", Label: "分段模式", Type: "select", Default: "regex", Options: []SchemaOption{{Value: "regex", Label: "正则表达式"}, {Value: "words", Label: "分段词列表"}}, DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}},
 		{Key: "extensions.segment_regex", Group: "extensions", Label: "分段正则表达式", Type: "string", Default: ".*?[。？！~…]+|.+$", DisplayIf: map[string]any{"extensions.segment_split_mode": "regex", "extensions.segmented_reply_enabled": true}, Help: "按正则匹配片段，使用 Go/RE2 语法。"},
-		{Key: "extensions.segment_split_words", Group: "extensions", Label: "分段词列表", Type: "list", Default: []string{"。", "？", "！", "~", "…"}, DisplayIf: map[string]any{"extensions.segment_split_mode": "words", "extensions.segmented_reply_enabled": true}, Help: "逐项添加分隔词；发送时移除命中的分隔词。"},
+		{Key: "extensions.segment_split_words", Group: "extensions", Label: "分段词列表", Type: "list", Default: []string{"。", "？", "！", "~", "…"}, DisplayIf: map[string]any{"extensions.segment_split_mode": "words", "extensions.segmented_reply_enabled": true}, Help: "逐项添加分隔词；发送时保留命中的分隔词。"},
 		{Key: "extensions.segment_cleanup_regex", Group: "extensions", Label: "内容过滤正则表达式", Type: "string", Default: "", DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}, Help: "在拆分后移除匹配文本。"},
 		// 群聊历史记录所有入站群消息，包括未唤醒消息；仅在触发 AI 时注入同一 UMO 的有界历史。
 		{Key: "extensions.group_context_enabled", Group: "extensions", Label: "群聊上下文感知", Type: "boolean", Default: false, Help: "记录同一群来源的近期消息，并在触发 AI 时提供给模型。"},
@@ -964,7 +967,8 @@ func runtimeFromValues(values Values) Runtime {
 		Platform: PlatformSettings{
 			UniqueSession: boolOr(values["platform.unique_session"], false), ReplyPrefix: stringOr(values["platform.reply_prefix"]),
 			ReplyMention: boolOr(values["platform.reply_mention"], false), ReplyQuote: boolOr(values["platform.reply_quote"], false),
-			WhitelistEnabled: boolOr(values["platform.whitelist_enabled"], true), WhitelistIDs: stringListOr(values["platform.whitelist_ids"]),
+			PrivateReplyQuote: boolOr(values["platform.private_reply_quote"], false),
+			WhitelistEnabled:  boolOr(values["platform.whitelist_enabled"], true), WhitelistIDs: stringListOr(values["platform.whitelist_ids"]),
 			WhitelistLog: boolOr(values["platform.whitelist_log"], true), WhitelistAdminGroup: boolOr(values["platform.whitelist_admin_group"], true),
 			WhitelistAdminPrivate: boolOr(values["platform.whitelist_admin_private"], true), RateLimitSeconds: intOr(values["platform.rate_limit_seconds"], 60),
 			RateLimitCount: intOr(values["platform.rate_limit_count"], 30), RateLimitStrategy: stringOrDefault(values["platform.rate_limit_strategy"], "stall"),

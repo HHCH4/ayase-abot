@@ -687,7 +687,8 @@ func Run(opts bootstrap.Options) error {
 			Platform: bot.PlatformConfig{
 				UniqueSession: runtime.Platform.UniqueSession, ReplyPrefix: runtime.Platform.ReplyPrefix,
 				ReplyMention: runtime.Platform.ReplyMention, ReplyQuote: runtime.Platform.ReplyQuote,
-				WhitelistEnabled: runtime.Platform.WhitelistEnabled, WhitelistIDs: append([]string(nil), runtime.Platform.WhitelistIDs...),
+				PrivateReplyQuote: runtime.Platform.PrivateReplyQuote,
+				WhitelistEnabled:  runtime.Platform.WhitelistEnabled, WhitelistIDs: append([]string(nil), runtime.Platform.WhitelistIDs...),
 				WhitelistLog: runtime.Platform.WhitelistLog, WhitelistAdminGroup: runtime.Platform.WhitelistAdminGroup,
 				WhitelistAdminPrivate: runtime.Platform.WhitelistAdminPrivate, RateLimitSeconds: runtime.Platform.RateLimitSeconds,
 				RateLimitCount: runtime.Platform.RateLimitCount, RateLimitStrategy: runtime.Platform.RateLimitStrategy,

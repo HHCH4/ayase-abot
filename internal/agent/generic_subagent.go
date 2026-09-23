@@ -102,6 +102,8 @@ func (k *Kernel) RunSubAgent(ctx context.Context, request SubAgentRequest) (stri
 	if resolved.Model.Capabilities != nil {
 		profile = provider.NormalizeCapabilityProfile(*resolved.Model.Capabilities)
 	}
+	// 子 Agent 同样把工具执行权交给本地 ADK，避免历史探测结果屏蔽只读工具。
+	profile = agentToolProfile(profile, resolved.Provider, resolved.Model)
 	requirements := provider.ModelRequirements{
 		RequiresTools:            len(childTools) > 0,
 		RequiresImages:           len(request.Images) > 0,
@@ -287,7 +289,7 @@ func safeSubAgentToolName(name string) bool {
 			return false
 		}
 	}
-	for _, allowed := range []string{"read", "list", "search", "inspect", "get", "load", "parse", "attachment", "memory", "retrieval", "status", "stat"} {
+	for _, allowed := range []string{"read", "list", "search", "inspect", "get", "load", "parse", "attachment", "memory", "retrieval", "status", "stat", "current_time"} {
 		if strings.Contains(name, allowed) {
 			return true
 		}

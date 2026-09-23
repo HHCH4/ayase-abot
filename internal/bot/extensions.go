@@ -66,6 +66,10 @@ func splitReply(text string, settings ExtensionConfig) []string {
 	if utf8.RuneCountInString(text) > threshold || strings.TrimSpace(text) == "" {
 		return []string{text}
 	}
+	// Markdown 的强调、代码、链接和块结构跨消息后会失去配对，整条投递更安全。
+	if hasMarkdownStructure(text) {
+		return []string{text}
+	}
 	var parts []string
 	if settings.SegmentSplitMode == "words" {
 		parts = splitByWords(text, settings.SegmentSplitWords)
@@ -87,6 +91,10 @@ func splitReply(text string, settings ExtensionConfig) []string {
 	if len(parts) <= 1 || len(parts) > maxSegmentParts {
 		return []string{text}
 	}
+	// 分段词和自定义正则都不能悄悄丢掉正文或标点。
+	if strings.Join(parts, "") != text {
+		return []string{text}
+	}
 	if settings.SegmentCleanupRegex != "" {
 		cleanup, err := regexp.Compile(settings.SegmentCleanupRegex)
 		if err != nil {
@@ -105,10 +113,56 @@ func splitReply(text string, settings ExtensionConfig) []string {
 	if len(result) == 0 {
 		return []string{text}
 	}
-	return result
+	// 将过短片段并入相邻内容，再去掉跨消息边界的空白行。
+	merged := mergeShortSegments(result)
+	for index := range merged {
+		merged[index] = strings.TrimSpace(merged[index])
+	}
+	return merged
 }
 
-// splitByWords 从左到右选择最长分隔词，片段本身不携带分隔词，与词表模式一致。
+// hasMarkdownStructure 识别会因跨消息拆分而失效的常见 Markdown 结构。
+func hasMarkdownStructure(text string) bool {
+	for _, marker := range []string{"**", "__", "~~", "`", "]("} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimLeft(line, " \t")
+		for _, marker := range []string{"# ", "## ", "### ", "#### ", "- ", "* ", "+ ", "> ", "|"} {
+			if strings.HasPrefix(trimmed, marker) {
+				return true
+			}
+		}
+		// 编号列表也需要整条发送，否则序号与正文会散落到多条消息。
+		if numberedListMarker.MatchString(trimmed) {
+			return true
+		}
+	}
+	return false
+}
+
+var numberedListMarker = regexp.MustCompile(`^[0-9]+[.)][ \t]`)
+
+// mergeShortSegments 保留原始顺序，并避免极短片段成为独立聊天消息。
+func mergeShortSegments(parts []string) []string {
+	merged := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if len(merged) > 0 && utf8.RuneCountInString(strings.TrimSpace(part)) < 8 {
+			merged[len(merged)-1] += part
+			continue
+		}
+		if len(merged) > 0 && utf8.RuneCountInString(strings.TrimSpace(merged[len(merged)-1])) < 8 {
+			merged[len(merged)-1] += part
+			continue
+		}
+		merged = append(merged, part)
+	}
+	return merged
+}
+
+// splitByWords 从左到右选择最长分隔词，并把它保留在前一个片段末尾。
 func splitByWords(text string, words []string) []string {
 	if len(words) == 0 {
 		return []string{text}
@@ -123,8 +177,8 @@ func splitByWords(text string, words []string) []string {
 			}
 		}
 		if longest != "" {
-			parts = append(parts, text[start:index])
 			index += len(longest)
+			parts = append(parts, text[start:index])
 			start = index
 		} else {
 			_, size := utf8.DecodeRuneInString(text[index:])
@@ -134,7 +188,9 @@ func splitByWords(text string, words []string) []string {
 			return []string{text}
 		}
 	}
-	parts = append(parts, text[start:])
+	if start < len(text) {
+		parts = append(parts, text[start:])
+	}
 	return parts
 }
 

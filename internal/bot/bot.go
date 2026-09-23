@@ -47,9 +47,6 @@ const (
 	DefaultOneBotListenHost = "0.0.0.0"
 	DefaultOneBotListenPort = 6199
 	DefaultOneBotListenPath = "/ws"
-	// defaultBotProgressInterval 控制平台侧“任务仍在处理中”提示的最短间隔，
-	// 避免模型或文档解析只运行几十秒就向聊天窗口重复发等待消息。
-	defaultBotProgressInterval = 5 * time.Minute
 )
 
 // Status 是机器人连接实例状态。
@@ -333,7 +330,6 @@ type Manager struct {
 	observedOrder       []string
 	pendingApprovals    map[string][]approvalTicket
 	pendingUserInputs   map[string][]userInputTicket
-	progressInterval    time.Duration
 	// 群历史只保留有界的近期文本，避免机器人长期运行耗尽树莓派内存。
 	groupHistory      map[string][]string
 	groupHistoryOrder []string
@@ -390,12 +386,11 @@ func NewManager(ctx context.Context, repository Repository, kernel *agent.Kernel
 		bus: eventbus.New(), bots: make(map[string]Bot), runtimes: make(map[string]runtimeEntry),
 		locks: make(map[string]*sync.Mutex), baseCtx: ctx,
 		activeConversations: make(map[string]string), activeInvocations: make(map[string]string), observedInvocations: make(map[string]struct{}), pendingApprovals: make(map[string][]approvalTicket), pendingUserInputs: make(map[string][]userInputTicket),
-		progressInterval: defaultBotProgressInterval,
-		commands:         commands,
-		sourceNames:      make(map[string]string),
-		groupHistory:     make(map[string][]string),
-		rateWindows:      make(map[string][]time.Time),
-		mentionWait:      make(map[string]time.Time),
+		commands:     commands,
+		sourceNames:  make(map[string]string),
+		groupHistory: make(map[string][]string),
+		rateWindows:  make(map[string][]time.Time),
+		mentionWait:  make(map[string]time.Time),
 	}
 	for _, item := range items {
 		if item.Status == "" {
@@ -442,15 +437,6 @@ func (m *Manager) SetRuntimeCoordinator(coordinator RuntimeCoordinator) {
 func (m *Manager) SetAttachmentStorer(storer AttachmentStorer) {
 	m.mu.Lock()
 	m.attachmentStorer = storer
-	m.mu.Unlock()
-}
-
-// SetProgressInterval 主要供嵌入方和确定性测试调整进度提示；生产默认至少等待五分钟。
-func (m *Manager) SetProgressInterval(interval time.Duration) {
-	m.mu.Lock()
-	if interval > 0 {
-		m.progressInterval = interval
-	}
 	m.mu.Unlock()
 }
 
@@ -857,6 +843,10 @@ func (m *Manager) sendRaw(ctx context.Context, message Message, text string) err
 		text = config.Platform.ReplyPrefix + text
 		message.ReplyMention = config.Platform.ReplyMention
 		message.ReplyQuote = config.Platform.ReplyQuote
+		// 私聊使用独立开关；群聊仍遵循原有引用设置。
+		if !isGroupChat(message.ChatType) {
+			message.ReplyQuote = config.Platform.PrivateReplyQuote
+		}
 	} else {
 		slog.Warn("读取平台回复配置失败", "adapter_id", message.AdapterID, "error", configErr)
 	}

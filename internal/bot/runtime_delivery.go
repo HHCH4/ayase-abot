@@ -268,14 +268,11 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	}
 	// 启动成功后记录 Durable Runtime 返回的任务标识，后续事件和响应都用它关联。
 	slog.Info("机器人请求已启动", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "invocation_id", invocation.ID, "status", invocation.Status)
-	chatKey := chatBindingKey(message)
-	// 后续消息已进入持久化队列，当前任务的控制指令仍须指向正在执行的任务。
-	if invocation.QueuedBehind {
-		_ = m.send(ctx, message, "消息已加入队列，前一条处理完成后会继续。")
-	} else {
+	// 排队状态只保存在 Runtime 中，平台聊天等待最终答复即可。
+	if !invocation.QueuedBehind {
 		m.setActiveInvocation(message, invocation.ID)
 	}
-	m.observeInvocation(message, chatKey, invocation.ID, timeout)
+	m.observeInvocation(message, invocation.ID)
 	return nil
 }
 
@@ -291,7 +288,7 @@ func (m *Manager) handleLegacyMessage(ctx context.Context, message Message, grou
 			_ = m.send(requestCtx, message, "处理失败："+trimError(runErr))
 			return fmt.Errorf("Agent 处理机器人消息失败: %w", runErr)
 		}
-		if event == nil || event.Partial || event.Content == nil || event.Author == "user" {
+		if event == nil || !event.IsFinalResponse() || event.Content == nil || event.Author == "user" {
 			continue
 		}
 		if text := agent.TextFromContent(event.Content); text != "" {
@@ -526,7 +523,7 @@ func (m *Manager) statusText(ctx context.Context, message Message) string {
 		// A fresh Manager has no in-memory subscription map. Attaching here makes
 		// /status the recovery point for progress and terminal delivery after a
 		// process restart, while the Runtime remains the durable source of truth.
-		m.observeInvocation(message, chatBindingKey(message), item.ID, 0)
+		m.observeInvocation(message, item.ID)
 		// 队列数量从 Runtime 持久化状态读取，重启后也能准确显示。
 		pending, pendingErr := coordinator.ListInvocations(ctx, bindingUserID(message), []agentruntime.InvocationStatus{agentruntime.InvocationQueued})
 		queued := 0
@@ -571,7 +568,7 @@ func (m *Manager) controlChatInvocation(ctx context.Context, message Message, ac
 	if !found {
 		return m.send(ctx, message, "当前没有"+available+"的任务。")
 	}
-	m.observeInvocation(message, chatBindingKey(message), item.ID, 0)
+	m.observeInvocation(message, item.ID)
 	if _, err := coordinator.CancelInvocation(ctx, item.ID); err != nil {
 		return m.send(ctx, message, action+"任务失败："+trimError(err))
 	}
@@ -715,7 +712,7 @@ func validateBotAttachmentSizes(items []agent.Attachment) error {
 	return nil
 }
 
-func (m *Manager) observeInvocation(message Message, chatKey, invocationID string, timeout time.Duration) {
+func (m *Manager) observeInvocation(message Message, invocationID string) {
 	m.mu.Lock()
 	if _, exists := m.observedInvocations[invocationID]; exists {
 		m.mu.Unlock()
@@ -730,7 +727,6 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 	}
 	coordinator := m.runtimeCoordinator
 	baseCtx := m.baseCtx
-	interval := m.progressInterval
 	m.mu.Unlock()
 	if coordinator == nil {
 		return
@@ -738,12 +734,7 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
-	if interval <= 0 {
-		interval = defaultBotProgressInterval
-	}
 	go func() {
-		var lastProgressAt time.Time
-		var executionStartedAt time.Time
 		backlog, live, unsubscribe, err := coordinator.Subscribe(baseCtx, invocationID, 0)
 		if err != nil {
 			m.clearActiveInvocation(message, invocationID)
@@ -751,7 +742,9 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 			return
 		}
 		defer unsubscribe()
-		sentResponse := false
+		// 在终态前暂存主 Agent 的最终正文；工具轮次和恢复订阅都不得向平台刷过程消息。
+		var finalResponse strings.Builder
+		finalEventID := ""
 		var streamedText strings.Builder
 		streamedDeltaCount := 0
 		lastStreamedFinalText := ""
@@ -814,34 +807,37 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 			switch event.Type {
 			case agentruntime.EventInvocationStarted:
 				m.setActiveInvocation(message, invocationID)
+			case agentruntime.EventToolRequested, agentruntime.EventToolStarted, agentruntime.EventCommandStarted:
+				// 后续仍有工作步骤时，前一轮文字只是过程，不能成为终态答复。
+				finalResponse.Reset()
+				finalEventID = ""
 			case agentruntime.EventAssistantMessage:
-				if text := eventString(event.Data, "text"); text != "" {
-					sentResponse = true
-					_ = m.sendLLM(baseCtx, message, text)
+				if text := eventString(event.Data, "text"); text != "" && event.Data["final"] == true && eventString(event.Data, "scope") != "modal_fallback" {
+					if author := eventString(event.Data, "author"); author != "" && author != "abot_assistant" {
+						break
+					}
+					// 同一 ADK 事件的多个文本部分属于一条答复；新事件则替换旧轮次。
+					id := eventString(event.Data, "adk_event_id")
+					if id == "" || id != finalEventID {
+						finalResponse.Reset()
+						finalEventID = id
+					}
+					finalResponse.WriteString(text)
 				}
 			case agentruntime.EventApprovalRequested:
+				finalResponse.Reset()
+				finalEventID = ""
 				m.deliverApproval(baseCtx, message, event)
 			case agentruntime.EventUserInputRequested:
+				finalResponse.Reset()
+				finalEventID = ""
 				m.deliverUserInput(baseCtx, message, event)
-			case agentruntime.EventApprovalExpired:
-				_ = m.send(baseCtx, message, "审批已过期，任务不会继续执行。")
-			case agentruntime.EventApprovalResolved:
-				_ = m.send(baseCtx, message, "审批决定已记录。")
-			case agentruntime.EventInvocationWaiting:
-				reason := eventString(event.Data, "reason")
-				if reason != "approval" && reason != "user" {
-					_ = m.send(baseCtx, message, "任务正在等待外部操作完成。")
-				}
-			case agentruntime.EventToolStarted, agentruntime.EventCommandStarted:
-				name := eventString(event.Data, "name")
-				if name == "" {
-					name = "工作步骤"
-				}
-				_ = m.send(baseCtx, message, "正在执行："+safeProgressText(name))
 			case agentruntime.EventInvocationCompleted:
 				flushStreamLog("completed", "")
-				if !sentResponse {
+				if strings.TrimSpace(finalResponse.String()) == "" {
 					_ = m.send(baseCtx, message, "任务已完成，但没有返回文字结果。")
+				} else if sendErr := m.sendLLM(baseCtx, message, finalResponse.String()); sendErr != nil {
+					slog.Error("机器人最终答复发送失败", "adapter_id", message.AdapterID, "invocation_id", invocationID, "error", sendErr)
 				}
 				m.clearActiveInvocation(message, invocationID)
 				return true
@@ -872,14 +868,6 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 				return
 			}
 		}
-		// 用较短的检查周期配合运行时长判断，避免任务刚从队列开始就因为
-		// 订阅已经存在了五分钟而立即发送“处理中”；实际提示仍按 interval 间隔。
-		progressCheckInterval := 30 * time.Second
-		if interval < progressCheckInterval {
-			progressCheckInterval = interval
-		}
-		ticker := time.NewTicker(progressCheckInterval)
-		defer ticker.Stop()
 		for {
 			select {
 			case <-baseCtx.Done():
@@ -887,18 +875,6 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 			case event, ok := <-live:
 				if !ok || process(event) {
 					return
-				}
-			case now := <-ticker.C:
-				// 队列中未开始的消息不刷屏；若恢复订阅时已经错过 Started 事件，
-				// 从首次确认运行的时刻计时，宁可晚提示也不能过早提示。
-				if current, getErr := coordinator.GetInvocation(baseCtx, invocationID); getErr == nil && current.Status != agentruntime.InvocationQueued {
-					if executionStartedAt.IsZero() {
-						executionStartedAt = now
-					}
-					if now.Sub(executionStartedAt) >= interval && (lastProgressAt.IsZero() || now.Sub(lastProgressAt) >= interval) {
-						_ = m.send(baseCtx, message, "任务仍在处理中，请稍候。")
-						lastProgressAt = now
-					}
 				}
 			}
 		}
@@ -918,11 +894,6 @@ func (m *Manager) restoreBotObservers(ctx context.Context) {
 		slog.Warn("恢复机器人任务订阅失败", "error", err)
 		return
 	}
-	timeout, timeoutErr := m.resolveRequestTimeout(ctx)
-	if timeoutErr != nil {
-		slog.Warn("恢复机器人任务超时配置失败", "error", timeoutErr)
-		timeout = 5 * time.Minute
-	}
 	for _, item := range items {
 		target := item.BotDelivery
 		if target == nil || item.BotID == "" || target.ChatID == "" {
@@ -936,7 +907,7 @@ func (m *Manager) restoreBotObservers(ctx context.Context) {
 		if item.Status != agentruntime.InvocationQueued {
 			m.setActiveInvocation(message, item.ID)
 		}
-		m.observeInvocation(message, chatBindingKey(message), item.ID, timeout)
+		m.observeInvocation(message, item.ID)
 	}
 }
 

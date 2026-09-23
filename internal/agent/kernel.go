@@ -316,6 +316,19 @@ func modelRequirements(contract *TaskContractProjection, attachments []Attachmen
 	return requirements
 }
 
+// agentToolProfile 按适配器实际可发送的协议声明工具能力；探测结果只记录证据，
+// 不再作为本地工具是否交给 ADK 执行的许可。用户手动禁用的能力仍然生效。
+func agentToolProfile(profile provider.ModelCapabilityProfile, configured provider.Provider, model provider.Model) provider.ModelCapabilityProfile {
+	if profile.ToolCalling.Source == "user_override" {
+		return profile
+	}
+	adapter := provider.DefaultCapabilities(configured, model)
+	if adapter.ToolCalling.State == provider.SupportSupported {
+		profile.ToolCalling = adapter.ToolCalling
+	}
+	return profile
+}
+
 type ToolBudgetObserver func(context.Context, string, int, int)
 
 // ContextRecoveryNotice is the metadata-only result of one provider
@@ -1320,6 +1333,8 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 		if resolved.Model.Capabilities != nil {
 			profile = provider.NormalizeCapabilityProfile(*resolved.Model.Capabilities)
 		}
+		// 工具由 ADK 在本地执行；供应商探测失败不应提前移除工具声明。
+		profile = agentToolProfile(profile, resolved.Provider, resolved.Model)
 		// 子 Agent 只能由主 Agent 显式调用；只有主模型确认支持工具调用时
 		// 才公开入口，避免启用子 Agent 后让纯文本模型整轮请求失败。
 		if !request.Proactive && runtime.SubAgentsEnabled() && (profile.ToolCalling.State == provider.SupportSupported || profile.ToolCalling.State == provider.SupportDegraded) {
@@ -2235,10 +2250,11 @@ func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedMode
 	// model call could therefore receive an earlier call's prompt count.
 	model = &modelCallMetadataLLM{inner: model, idFor: modelCallIDFor}
 	agentConfig := llmagent.Config{
-		Name:                  "abot_assistant",
-		Description:           "Abot 的通用中文对话 Agent",
-		Model:                 model,
-		Instruction:           effectiveInstructionWithWorkingSet(runtime.Instruction, projectInstructions, taskContract, runtimeSnapshot, workingSet),
+		Name:        "abot_assistant",
+		Description: "Abot 的通用中文对话 Agent",
+		Model:       model,
+		// 在每轮开始时提供服务器当前时间，时间问题无需等待模型主动选择工具。
+		Instruction:           effectiveInstructionWithWorkingSet(runtime.Instruction, projectInstructions, taskContract, runtimeSnapshot, workingSet) + "\n\n当前服务器时间：" + time.Now().In(time.Local).Format(time.RFC3339) + "（" + time.Local.String() + "）。涉及其他时区或要求精确刷新时调用 current_time。",
 		Tools:                 tools,
 		GenerateContentConfig: generationConfig,
 	}

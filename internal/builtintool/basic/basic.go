@@ -20,7 +20,7 @@ import (
 const maxExpressionLength = 512
 
 type timeArgs struct {
-	Timezone string `json:"timezone,omitempty" jsonschema:"IANA 时区名称，例如 Asia/Shanghai、Europe/London；省略时使用 UTC"`
+	Timezone string `json:"timezone,omitempty" jsonschema:"IANA 时区名称，例如 Asia/Shanghai、Europe/London；省略时使用服务器本地时区"`
 }
 
 type timeResult struct {
@@ -53,7 +53,8 @@ func toolsWithClock(now func() time.Time) ([]tool.Tool, error) {
 	}, func(_ adkagent.Context, args timeArgs) (timeResult, error) {
 		zone := strings.TrimSpace(args.Timezone)
 		if zone == "" {
-			zone = "UTC"
+			// 未指定时区时遵循部署机器的本地时区，避免国内部署默认返回 UTC。
+			zone = time.Local.String()
 		}
 		location, loadErr := time.LoadLocation(zone)
 		if loadErr != nil {
