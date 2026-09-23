@@ -15,6 +15,7 @@ const navGroups = [
       { name: 'bots', label: '机器人', icon: 'bot' },
       { name: 'bot-commands', label: '指令', icon: 'terminal' },
       { name: 'providers', label: '模型供应商', icon: 'sparkles' },
+      { name: 'web-search', label: '网页搜索', icon: 'search' },
       { name: 'config', label: '配置文件', icon: 'settings' },
     ],
   },

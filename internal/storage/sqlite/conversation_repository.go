@@ -141,6 +141,12 @@ func (r *conversationRepository) Save(ctx context.Context, item conversation.Con
 func (r *conversationRepository) Delete(ctx context.Context, userID, id string) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 待审批记录、命令输出和 diff 属于对话关联信息，随对话一并物理删除。
+		// 删除会话时清除查询和会话关联，但保留不含内容的用量记录，避免删除聊天记录退还当日搜索额度或抹去服务商用量统计。
+		if err := tx.Model(&webSearchUsageRow{}).Where("conversation_id = ?", id).Updates(map[string]any{
+			"conversation_id": "", "invocation_id": "", "query": "", "error": "", "request_id": "",
+		}).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("conversation_id = ?", id).Delete(&workspaceOperationRow{}).Error; err != nil {
 			return err
 		}

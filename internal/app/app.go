@@ -32,6 +32,7 @@ import (
 	"Abot/internal/schedule"
 	"Abot/internal/sessionrule"
 	"Abot/internal/storage/sqlite"
+	"Abot/internal/websearch"
 	"Abot/internal/workspace"
 	adkmemory "google.golang.org/adk/v2/memory"
 	"google.golang.org/adk/v2/tool"
@@ -82,6 +83,10 @@ func Run(opts bootstrap.Options) error {
 		provider.ProtocolGemini:           gemini.NewAdapter(nil),
 	}
 	registry, err := provider.NewRegistry(context.Background(), store.ProviderRepository(), adapters)
+	if err != nil {
+		return err
+	}
+	webSearchManager, err := websearch.NewManager(store.WebSearchRepository(), nil)
 	if err != nil {
 		return err
 	}
@@ -286,7 +291,13 @@ func Run(opts bootstrap.Options) error {
 		Conversations:  conversationService,
 		Instruction:    "你是 Abot，一个可靠、简洁、遵守用户意图的中文 AI 助手。",
 		Tools:          basicTools,
-		ToolRegistry:   toolRegistry,
+		WebSearchToolFactory: func(_ context.Context, runtime agent.RuntimeOptions, invocationID, conversationID string) (tool.Tool, error) {
+			return webSearchManager.NewTool(runtime.WebSearchServiceIDs, invocationID, conversationID, websearch.Budget{
+				DailyCallLimit: int64(runtime.WebSearchDailyCallLimit), MaxCallsPerInvocation: runtime.WebSearchMaxCallsPerInvocation,
+				AlertPercent: runtime.WebSearchAlertPercent,
+			})
+		},
+		ToolRegistry: toolRegistry,
 		WorkspaceTools: func(ctx context.Context, workspaceID string) ([]tool.Tool, error) {
 			return workspaceService.Tools(ctx, workspaceID)
 		},
@@ -505,7 +516,10 @@ func Run(opts bootstrap.Options) error {
 				WorkspaceGitEnabled: runtime.WorkspaceGitEnabled, WorkspaceCommandTimeoutSecs: runtime.WorkspaceCommandTimeoutSecs,
 				MessageStreamingEnabled: runtime.MessageStreamingEnabled, MessagePromptPrefix: runtime.MessagePromptPrefix,
 				MemoryEnabled: runtime.MemoryEnabled, MemoryAutoRetrieve: runtime.MemoryAutoRetrieve, MemoryMaxResults: runtime.MemoryMaxResults,
-				ModalFallbackEnabled: settings.ModalFallbackEnabled, ModalFallbackProviderID: settings.ModalFallbackProviderID,
+				WebSearchEnabled: runtime.WebSearchEnabled, WebSearchServiceIDs: append([]string(nil), runtime.WebSearchServiceIDs...),
+				WebSearchDailyCallLimit: settings.WebSearchDailyCallLimit, WebSearchMaxCallsPerInvocation: settings.WebSearchMaxCallsPerInvocation,
+				WebSearchAlertPercent: settings.WebSearchAlertPercent,
+				ModalFallbackEnabled:  settings.ModalFallbackEnabled, ModalFallbackProviderID: settings.ModalFallbackProviderID,
 				ModalFallbackVisionModel: settings.ModalFallbackVisionModel, ModalFallbackAudioModel: settings.ModalFallbackAudioModel,
 				SubAgentEnabled: &subAgentEnabledValue,
 				SubAgent:        subAgentRuntimeSettings(settings),
@@ -778,6 +792,7 @@ func Run(opts bootstrap.Options) error {
 		server.SetMessageSourceRegistry(sourceRegistry)
 	}
 	server.SetScheduleService(scheduleService)
+	server.SetWebSearchManager(webSearchManager)
 	server.SetLogStore(logStore)
 	httpServer := &http.Server{
 		Addr:              opts.HTTPAddr,

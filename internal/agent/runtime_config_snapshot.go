@@ -65,35 +65,40 @@ type RuntimeOptionsSnapshot struct {
 	AIEnabled bool `json:"ai_enabled"`
 	// Pointer distinguishes an explicit false from a malformed/incomplete snapshot;
 	// runtime validation requires the switch to be present and match current settings.
-	SubAgentEnabled               *bool   `json:"subagent_enabled,omitempty"`
-	AITemperature                 float64 `json:"ai_temperature"`
-	AIReasoningEffort             string  `json:"ai_reasoning_effort,omitempty"`
-	AITopP                        float64 `json:"ai_top_p"`
-	AIMaxOutputTokens             int     `json:"ai_max_output_tokens"`
-	AIRequestRetries              int     `json:"ai_request_retries"`
-	CompactionEnabled             bool    `json:"compaction_enabled"`
-	CompactionRatio               float64 `json:"compaction_ratio"`
-	CompactionSafetyTokens        int     `json:"compaction_safety_tokens"`
-	CompactionRetentionEvents     int     `json:"compaction_retention_events"`
-	CompactionInterval            int     `json:"compaction_interval"`
-	CompactionOverlap             int     `json:"compaction_overlap"`
-	CompactionUnknownWindowTokens int     `json:"compaction_unknown_window_tokens"`
-	AgentMaxToolCalls             int     `json:"agent_max_tool_calls"`
-	ToolSchemaBudgetTokens        int     `json:"tool_schema_budget_tokens"`
-	WorkspaceEnabled              bool    `json:"workspace_enabled"`
-	WorkspaceReadEnabled          bool    `json:"workspace_read_enabled"`
-	WorkspaceWriteEnabled         bool    `json:"workspace_write_enabled"`
-	WorkspaceExecEnabled          bool    `json:"workspace_exec_enabled"`
-	WorkspaceGitEnabled           bool    `json:"workspace_git_enabled"`
-	WorkspaceCommandTimeoutSecs   int     `json:"workspace_command_timeout_secs"`
-	MessageStreamingEnabled       bool    `json:"message_streaming_enabled"`
-	MemoryEnabled                 bool    `json:"memory_enabled"`
-	MemoryAutoRetrieve            bool    `json:"memory_auto_retrieve"`
-	MemoryMaxResults              int     `json:"memory_max_results"`
-	ModalFallbackEnabled          bool    `json:"modal_fallback_enabled"`
-	ModalFallbackProviderID       string  `json:"modal_fallback_provider_id,omitempty"`
-	ModalFallbackVisionModel      string  `json:"modal_fallback_vision_model,omitempty"`
-	ModalFallbackAudioModel       string  `json:"modal_fallback_audio_model,omitempty"`
+	SubAgentEnabled                *bool    `json:"subagent_enabled,omitempty"`
+	AITemperature                  float64  `json:"ai_temperature"`
+	AIReasoningEffort              string   `json:"ai_reasoning_effort,omitempty"`
+	AITopP                         float64  `json:"ai_top_p"`
+	AIMaxOutputTokens              int      `json:"ai_max_output_tokens"`
+	AIRequestRetries               int      `json:"ai_request_retries"`
+	CompactionEnabled              bool     `json:"compaction_enabled"`
+	CompactionRatio                float64  `json:"compaction_ratio"`
+	CompactionSafetyTokens         int      `json:"compaction_safety_tokens"`
+	CompactionRetentionEvents      int      `json:"compaction_retention_events"`
+	CompactionInterval             int      `json:"compaction_interval"`
+	CompactionOverlap              int      `json:"compaction_overlap"`
+	CompactionUnknownWindowTokens  int      `json:"compaction_unknown_window_tokens"`
+	AgentMaxToolCalls              int      `json:"agent_max_tool_calls"`
+	ToolSchemaBudgetTokens         int      `json:"tool_schema_budget_tokens"`
+	WorkspaceEnabled               bool     `json:"workspace_enabled"`
+	WorkspaceReadEnabled           bool     `json:"workspace_read_enabled"`
+	WorkspaceWriteEnabled          bool     `json:"workspace_write_enabled"`
+	WorkspaceExecEnabled           bool     `json:"workspace_exec_enabled"`
+	WorkspaceGitEnabled            bool     `json:"workspace_git_enabled"`
+	WorkspaceCommandTimeoutSecs    int      `json:"workspace_command_timeout_secs"`
+	MessageStreamingEnabled        bool     `json:"message_streaming_enabled"`
+	MemoryEnabled                  bool     `json:"memory_enabled"`
+	MemoryAutoRetrieve             bool     `json:"memory_auto_retrieve"`
+	MemoryMaxResults               int      `json:"memory_max_results"`
+	ModalFallbackEnabled           bool     `json:"modal_fallback_enabled"`
+	ModalFallbackProviderID        string   `json:"modal_fallback_provider_id,omitempty"`
+	ModalFallbackVisionModel       string   `json:"modal_fallback_vision_model,omitempty"`
+	ModalFallbackAudioModel        string   `json:"modal_fallback_audio_model,omitempty"`
+	WebSearchEnabled               bool     `json:"web_search_enabled,omitempty"`
+	WebSearchServiceIDs            []string `json:"web_search_service_ids,omitempty"`
+	WebSearchDailyCallLimit        int      `json:"web_search_daily_call_limit,omitempty"`
+	WebSearchMaxCallsPerInvocation int      `json:"web_search_max_calls_per_invocation,omitempty"`
+	WebSearchAlertPercent          int      `json:"web_search_alert_percent,omitempty"`
 	// SubAgent 是唯一通用子 Agent 的无秘密配置快照。
 	SubAgent *SubAgentOptionsSnapshot `json:"subagent,omitempty"`
 }
@@ -152,6 +157,14 @@ func BuildRuntimeConfigSnapshot(appName string, runtime RuntimeOptions, resolved
 
 func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
 	subAgentEnabled := runtime.SubAgentsEnabled()
+	var webSearchServiceIDs []string
+	var webSearchDailyCallLimit, webSearchMaxCallsPerInvocation, webSearchAlertPercent int
+	if runtime.WebSearchEnabled {
+		webSearchServiceIDs = append([]string(nil), runtime.WebSearchServiceIDs...)
+		webSearchDailyCallLimit = runtime.WebSearchDailyCallLimit
+		webSearchMaxCallsPerInvocation = runtime.WebSearchMaxCallsPerInvocation
+		webSearchAlertPercent = runtime.WebSearchAlertPercent
+	}
 	var subAgent *SubAgentOptionsSnapshot
 	if runtime.SubAgent.ProviderID != "" || runtime.SubAgent.ModelID != "" || runtime.SubAgent.ReasoningEffort != "" || runtime.SubAgent.Temperature != nil || runtime.SubAgent.TopP != nil || runtime.SubAgent.MaxOutputTokens != 0 || runtime.SubAgent.MaxConcurrency != 0 || runtime.SubAgent.InputBudgetBytes != 0 || runtime.SubAgent.OutputBudgetBytes != 0 || len(runtime.SubAgent.AllowedTools) > 0 {
 		value := &SubAgentOptionsSnapshot{
@@ -172,37 +185,42 @@ func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
 		subAgent = value
 	}
 	return RuntimeOptionsSnapshot{
-		AIEnabled:                     runtime.AIEnabled,
-		SubAgentEnabled:               &subAgentEnabled,
-		AITemperature:                 runtime.AITemperature,
-		AIReasoningEffort:             runtime.AIReasoningEffort,
-		AITopP:                        runtime.AITopP,
-		AIMaxOutputTokens:             runtime.AIMaxOutputTokens,
-		AIRequestRetries:              runtime.AIRequestRetries,
-		CompactionEnabled:             runtime.CompactionEnabled,
-		CompactionRatio:               runtime.CompactionRatio,
-		CompactionSafetyTokens:        runtime.CompactionSafetyTokens,
-		CompactionRetentionEvents:     runtime.CompactionRetentionEvents,
-		CompactionInterval:            runtime.CompactionInterval,
-		CompactionOverlap:             runtime.CompactionOverlap,
-		CompactionUnknownWindowTokens: runtime.CompactionUnknownWindowTokens,
-		AgentMaxToolCalls:             runtime.AgentMaxToolCalls,
-		ToolSchemaBudgetTokens:        runtime.ToolSchemaBudgetTokens,
-		WorkspaceEnabled:              runtime.WorkspaceEnabled,
-		WorkspaceReadEnabled:          runtime.WorkspaceReadEnabled,
-		WorkspaceWriteEnabled:         runtime.WorkspaceWriteEnabled,
-		WorkspaceExecEnabled:          runtime.WorkspaceExecEnabled,
-		WorkspaceGitEnabled:           runtime.WorkspaceGitEnabled,
-		WorkspaceCommandTimeoutSecs:   runtime.WorkspaceCommandTimeoutSecs,
-		MessageStreamingEnabled:       runtime.MessageStreamingEnabled,
-		MemoryEnabled:                 runtime.MemoryEnabled,
-		MemoryAutoRetrieve:            runtime.MemoryAutoRetrieve,
-		MemoryMaxResults:              runtime.MemoryMaxResults,
-		ModalFallbackEnabled:          runtime.ModalFallbackEnabled,
-		ModalFallbackProviderID:       strings.TrimSpace(runtime.ModalFallbackProviderID),
-		ModalFallbackVisionModel:      strings.TrimSpace(runtime.ModalFallbackVisionModel),
-		ModalFallbackAudioModel:       strings.TrimSpace(runtime.ModalFallbackAudioModel),
-		SubAgent:                      subAgent,
+		AIEnabled:                      runtime.AIEnabled,
+		SubAgentEnabled:                &subAgentEnabled,
+		AITemperature:                  runtime.AITemperature,
+		AIReasoningEffort:              runtime.AIReasoningEffort,
+		AITopP:                         runtime.AITopP,
+		AIMaxOutputTokens:              runtime.AIMaxOutputTokens,
+		AIRequestRetries:               runtime.AIRequestRetries,
+		CompactionEnabled:              runtime.CompactionEnabled,
+		CompactionRatio:                runtime.CompactionRatio,
+		CompactionSafetyTokens:         runtime.CompactionSafetyTokens,
+		CompactionRetentionEvents:      runtime.CompactionRetentionEvents,
+		CompactionInterval:             runtime.CompactionInterval,
+		CompactionOverlap:              runtime.CompactionOverlap,
+		CompactionUnknownWindowTokens:  runtime.CompactionUnknownWindowTokens,
+		AgentMaxToolCalls:              runtime.AgentMaxToolCalls,
+		ToolSchemaBudgetTokens:         runtime.ToolSchemaBudgetTokens,
+		WorkspaceEnabled:               runtime.WorkspaceEnabled,
+		WorkspaceReadEnabled:           runtime.WorkspaceReadEnabled,
+		WorkspaceWriteEnabled:          runtime.WorkspaceWriteEnabled,
+		WorkspaceExecEnabled:           runtime.WorkspaceExecEnabled,
+		WorkspaceGitEnabled:            runtime.WorkspaceGitEnabled,
+		WorkspaceCommandTimeoutSecs:    runtime.WorkspaceCommandTimeoutSecs,
+		MessageStreamingEnabled:        runtime.MessageStreamingEnabled,
+		MemoryEnabled:                  runtime.MemoryEnabled,
+		MemoryAutoRetrieve:             runtime.MemoryAutoRetrieve,
+		MemoryMaxResults:               runtime.MemoryMaxResults,
+		ModalFallbackEnabled:           runtime.ModalFallbackEnabled,
+		ModalFallbackProviderID:        strings.TrimSpace(runtime.ModalFallbackProviderID),
+		ModalFallbackVisionModel:       strings.TrimSpace(runtime.ModalFallbackVisionModel),
+		ModalFallbackAudioModel:        strings.TrimSpace(runtime.ModalFallbackAudioModel),
+		WebSearchEnabled:               runtime.WebSearchEnabled,
+		WebSearchServiceIDs:            webSearchServiceIDs,
+		WebSearchDailyCallLimit:        webSearchDailyCallLimit,
+		WebSearchMaxCallsPerInvocation: webSearchMaxCallsPerInvocation,
+		WebSearchAlertPercent:          webSearchAlertPercent,
+		SubAgent:                       subAgent,
 	}
 }
 
@@ -285,21 +303,35 @@ func validateRuntimeOptionsSnapshot(options RuntimeOptionsSnapshot) error {
 		}
 	}
 	for name, value := range map[string]int{
-		"ai_max_output_tokens":             options.AIMaxOutputTokens,
-		"ai_request_retries":               options.AIRequestRetries,
-		"compaction_safety_tokens":         options.CompactionSafetyTokens,
-		"compaction_retention_events":      options.CompactionRetentionEvents,
-		"compaction_interval":              options.CompactionInterval,
-		"compaction_overlap":               options.CompactionOverlap,
-		"compaction_unknown_window_tokens": options.CompactionUnknownWindowTokens,
-		"agent_max_tool_calls":             options.AgentMaxToolCalls,
-		"tool_schema_budget_tokens":        options.ToolSchemaBudgetTokens,
-		"workspace_command_timeout_secs":   options.WorkspaceCommandTimeoutSecs,
-		"memory_max_results":               options.MemoryMaxResults,
+		"ai_max_output_tokens":                options.AIMaxOutputTokens,
+		"ai_request_retries":                  options.AIRequestRetries,
+		"compaction_safety_tokens":            options.CompactionSafetyTokens,
+		"compaction_retention_events":         options.CompactionRetentionEvents,
+		"compaction_interval":                 options.CompactionInterval,
+		"compaction_overlap":                  options.CompactionOverlap,
+		"compaction_unknown_window_tokens":    options.CompactionUnknownWindowTokens,
+		"agent_max_tool_calls":                options.AgentMaxToolCalls,
+		"tool_schema_budget_tokens":           options.ToolSchemaBudgetTokens,
+		"workspace_command_timeout_secs":      options.WorkspaceCommandTimeoutSecs,
+		"memory_max_results":                  options.MemoryMaxResults,
+		"web_search_daily_call_limit":         options.WebSearchDailyCallLimit,
+		"web_search_max_calls_per_invocation": options.WebSearchMaxCallsPerInvocation,
+		"web_search_alert_percent":            options.WebSearchAlertPercent,
 	} {
 		if value < 0 {
 			return fmt.Errorf("%w: %s 不能为负数", ErrInvalidRuntimeConfigSnapshot, name)
 		}
+	}
+	if len(options.WebSearchServiceIDs) > 64 {
+		return fmt.Errorf("%w: 网页搜索服务选择数量超出限制", ErrInvalidRuntimeConfigSnapshot)
+	}
+	for _, id := range options.WebSearchServiceIDs {
+		if len(strings.TrimSpace(id)) == 0 || len(id) > 128 {
+			return fmt.Errorf("%w: 网页搜索服务 ID 无效", ErrInvalidRuntimeConfigSnapshot)
+		}
+	}
+	if options.WebSearchEnabled && (options.WebSearchDailyCallLimit < 1 || options.WebSearchMaxCallsPerInvocation < 1 || options.WebSearchAlertPercent < 1 || options.WebSearchAlertPercent > 100) {
+		return fmt.Errorf("%w: 网页搜索预算无效", ErrInvalidRuntimeConfigSnapshot)
 	}
 	if options.CompactionInterval == 0 && options.CompactionOverlap != 0 {
 		return fmt.Errorf("%w: compaction overlap 不能脱离 interval", ErrInvalidRuntimeConfigSnapshot)

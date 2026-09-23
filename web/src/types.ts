@@ -614,12 +614,112 @@ export interface SystemSettings {
   artifact_quota_bytes: number
   artifact_stale_upload_seconds: number
   artifact_input_retention_seconds: number
+  web_search_daily_call_limit: number
+  web_search_max_calls_per_invocation: number
+  web_search_alert_percent: number
   modal_fallback_enabled: boolean
   modal_fallback_provider_id: string
   modal_fallback_vision_model: string
   modal_fallback_audio_model: string
   subagent_enabled: boolean
   subagent: SubAgentSettings
+}
+
+export interface WebSearchService {
+  id: string
+  name: string
+  provider: 'tavily' | 'langsearch' | string
+  account_group: string
+  api_key_configured: boolean
+  enabled: boolean
+  priority: number
+  created_at?: string
+  updated_at?: string
+}
+
+export interface WebSearchServiceInput {
+  id?: string
+  name: string
+  provider: 'tavily' | 'langsearch' | string
+  account_group?: string
+  api_key?: string
+  enabled: boolean
+  priority: number
+}
+
+export interface WebSearchServiceUsage {
+  service_id: string
+  service_name: string
+  provider: string
+  account_group: string
+  calls: number
+  successes: number
+  failures: number
+  credits: number
+  input_tokens: number
+  output_tokens: number
+  unknown_usage: number
+}
+
+export interface WebSearchAccountUsage {
+  provider: string
+  account_group: string
+  calls: number
+  successes: number
+  failures: number
+  credits: number
+  input_tokens: number
+  output_tokens: number
+  unknown_usage: number
+}
+
+export interface WebSearchUsageRecord {
+  id: string
+  invocation_id?: string
+  conversation_id?: string
+  service_id: string
+  service_name: string
+  provider: string
+  account_group: string
+  query: string
+  status: string
+  usage: { credits: number; input_tokens: number; output_tokens: number; known: boolean }
+  result_count: number
+  http_status?: number
+  request_id?: string
+  error?: string
+  duration_ms: number
+  created_at: string
+}
+
+export interface WebSearchUsageSummary {
+  period_start: string
+  period_end: string
+  daily_calls: number
+  daily_call_limit: number
+  alert_percent: number
+  alert: boolean
+  by_account: WebSearchAccountUsage[]
+  by_service: WebSearchServiceUsage[]
+  recent: WebSearchUsageRecord[]
+}
+
+export interface WebSearchResult {
+  title: string
+  url: string
+  snippet?: string
+  text?: string
+  score?: number
+  published_at?: string
+}
+
+export interface WebSearchTestResult {
+  provider: string
+  service_id: string
+  results: WebSearchResult[]
+  usage: { credits: number; input_tokens: number; output_tokens: number; known: boolean }
+  request_id?: string
+  fallbacks: number
 }
 
 export interface SubAgentSettings {

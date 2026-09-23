@@ -7,6 +7,7 @@ export const router = createRouter({
     { path: '/bots', name: 'bots', component: () => import('@/views/BotsView.vue'), meta: { title: '机器人平台', eyebrow: 'PLATFORM ADAPTERS' } },
     { path: '/bot-commands', name: 'bot-commands', component: () => import('@/views/BotCommandsView.vue'), meta: { title: '指令', eyebrow: 'COMMAND CENTER' } },
     { path: '/providers', name: 'providers', component: () => import('@/views/ProvidersView.vue'), meta: { title: '模型供应商', eyebrow: 'MODEL POOL' } },
+    { path: '/web-search', name: 'web-search', component: () => import('@/views/WebSearchView.vue'), meta: { title: '网页搜索', eyebrow: 'WEB SEARCH' } },
     { path: '/config', name: 'config', component: () => import('@/views/ConfigView.vue'), meta: { title: '配置文件', eyebrow: 'CONFIG CENTER' } },
     { path: '/personas', name: 'personas', component: () => import('@/views/PersonasView.vue'), meta: { title: '人格设定', eyebrow: 'PERSONA CATALOG' } },
     { path: '/persona', redirect: '/personas' },

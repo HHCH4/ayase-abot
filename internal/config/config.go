@@ -121,7 +121,10 @@ type SystemSettings struct {
 	ArtifactStaleUploadSeconds int   `json:"artifact_stale_upload_seconds"`
 	// ArtifactInputRetentionSeconds 控制图片、音频和文档等输入附件的定时
 	// 清理周期；会话物理删除时仍会立即级联清理，不受该周期影响。
-	ArtifactInputRetentionSeconds int `json:"artifact_input_retention_seconds"`
+	ArtifactInputRetentionSeconds  int `json:"artifact_input_retention_seconds"`
+	WebSearchDailyCallLimit        int `json:"web_search_daily_call_limit"`
+	WebSearchMaxCallsPerInvocation int `json:"web_search_max_calls_per_invocation"`
+	WebSearchAlertPercent          int `json:"web_search_alert_percent"`
 	// Modal fallback is a system-wide safety valve. Empty provider means the
 	// primary provider; empty per-modality model means that modality is not
 	// downgraded through another model.
@@ -163,6 +166,9 @@ func SystemSchema() Schema {
 		{Key: "artifact_quota_bytes", Group: "system", Label: "Artifact 存储配额（字节）", Type: "integer", Default: DefaultArtifactQuotaBytes, Min: floatPtr(0), Max: floatPtr(float64(MaxArtifactQuotaBytes)), Help: "本地内容寻址存储去重后的总占用上限，0 表示不限制。超过上限时新的上传会被拒绝，已有内容不受影响。"},
 		{Key: "artifact_stale_upload_seconds", Group: "system", Label: "未完成上传保留时长（秒）", Type: "integer", Default: DefaultArtifactStaleUploadSeconds, Min: floatPtr(MinArtifactStaleUploadSeconds), Max: floatPtr(MaxArtifactStaleUploadSeconds), Help: "超过该时长仍未完成的 Artifact 上传会被标记为失败，遗留的临时文件一并回收。"},
 		{Key: "artifact_input_retention_seconds", Group: "system", Label: "输入附件保留时长（秒）", Type: "integer", Default: DefaultArtifactInputRetentionSeconds, Min: floatPtr(MinArtifactInputRetentionSeconds), Max: floatPtr(MaxArtifactInputRetentionSeconds), Help: "图片、音频、PDF、Word、Excel 等输入附件超过该时长后由定时维护删除；删除会话时会立即删除其关联附件。"},
+		{Key: "web_search_daily_call_limit", Group: "system", Label: "网页搜索每日请求上限", Type: "integer", Default: 100, Min: floatPtr(1), Max: floatPtr(100000), Help: "Abot 本地硬限制，按 UTC 日统计实际发起的服务请求；达到上限后不再调用搜索 API。"},
+		{Key: "web_search_max_calls_per_invocation", Group: "system", Label: "单任务网页搜索上限", Type: "integer", Default: 8, Min: floatPtr(1), Max: floatPtr(100), Help: "限制一次 Agent 任务（包含回退尝试）实际发起的搜索请求数量。"},
+		{Key: "web_search_alert_percent", Group: "system", Label: "网页搜索用量告警比例（%）", Type: "integer", Default: 80, Min: floatPtr(1), Max: floatPtr(100), Help: "达到每日请求上限的该比例时在日志和用量页提示。"},
 		{Key: "modal_fallback_enabled", Group: "system", Label: "启用多模态降级", Type: "boolean", Default: false, Help: "主模型不支持图片或音频时，使用配置的模型生成文字转述；失败时仍会以说明文字完成本轮。"},
 		{Key: "modal_fallback_provider_id", Group: "system", Label: "多模态降级供应商", Type: "string", Default: "", Help: "WebUI 会从已配置供应商目录提供选择；留空表示沿用主模型供应商。"},
 		{Key: "modal_fallback_vision_model", Group: "system", Label: "图片降级模型", Type: "string", Default: "", Help: "从所选供应商的模型目录选择；留空表示不对图片执行模型转述。"},
@@ -208,10 +214,12 @@ type Runtime struct {
 	// 平台策略由消息入口与平台发送器共同执行，不把无效开关暴露为已实现能力。
 	Platform PlatformSettings
 	// 扩展配置由 Bot 入口消费；按配置文件解析，避免界面开关只停留在数据库。
-	Extensions         ExtensionSettings
-	MemoryEnabled      bool
-	MemoryAutoRetrieve bool
-	MemoryMaxResults   int
+	Extensions          ExtensionSettings
+	MemoryEnabled       bool
+	MemoryAutoRetrieve  bool
+	MemoryMaxResults    int
+	WebSearchEnabled    bool
+	WebSearchServiceIDs []string
 }
 
 // PlatformSettings 对齐当前 Telegram/OneBot 能执行的平台通用配置。
@@ -541,6 +549,15 @@ func (s *Service) ValidateValues(ctx context.Context, values Values) error {
 	if boolOr(values["extensions.group_image_caption"], false) && strings.TrimSpace(stringOr(values["extensions.group_image_caption_model"])) == "" {
 		return fmt.Errorf("%w: 自动理解群图片需要选择群图片转述模型", ErrInvalidRequest)
 	}
+	webSearchServices := stringListOr(values["ai.web_search.service_ids"])
+	if len(webSearchServices) > 64 {
+		return fmt.Errorf("%w: 网页搜索服务优先级最多配置 64 项", ErrInvalidRequest)
+	}
+	for _, id := range webSearchServices {
+		if len(id) > 128 {
+			return fmt.Errorf("%w: 网页搜索服务 ID 不能超过 128 个字符", ErrInvalidRequest)
+		}
+	}
 	// 用户自定义屏蔽规则必须有界且可编译，避免保存后在消息路径上反复失败。
 	patterns := stringListOr(values["platform.block_patterns"])
 	if len(patterns) > 50 {
@@ -809,7 +826,8 @@ func buildSchema() Schema {
 		{Key: "ai.knowledge_bases", Group: "capabilities", Label: "知识库", Type: "list", Default: []string{}, Help: "逐项添加知识库 ID；当前版本保留配置入口，未接入外部知识库服务。"},
 		{Key: "ai.knowledge_top_k", Group: "capabilities", Label: "知识库返回数量", Type: "integer", Default: 5, Min: floatPtr(1), Max: floatPtr(100), Help: "知识库检索的最大返回条数。"},
 		{Key: "ai.agentic_retrieval", Group: "capabilities", Label: "Agentic 知识库检索", Type: "boolean", Default: false, Help: "允许知识库作为 Agent 工具；未配置知识库时不会添加工具。"},
-		{Key: "ai.web_search.enabled", Group: "capabilities", Label: "网页搜索", Type: "boolean", Default: false, Help: "内置 Agent 的网页搜索开关；当前发行版不代管第三方搜索密钥。"},
+		{Key: "ai.web_search.enabled", Group: "capabilities", Label: "启用网页搜索", Type: "boolean", Default: false, Help: "启用后内置 Agent 和允许使用搜索工具的通用子 Agent 可以按需检索互联网。"},
+		{Key: "ai.web_search.service_ids", Group: "capabilities", Label: "网页搜索服务优先级", Type: "list", Default: []string{}, DisplayIf: map[string]any{"ai.web_search.enabled": true}, Help: "从网页搜索服务页添加已配置服务并调整调用顺序；留空时按服务优先级自动选择所有启用项。"},
 		{Key: "ai.computer_use.environment", Group: "capabilities", Label: "电脑使用环境", Type: "select", Default: "none", Options: []SchemaOption{{Value: "none", Label: "不启用"}, {Value: "local", Label: "本机"}, {Value: "sandbox", Label: "沙箱"}}, Help: "电脑使用能力仍受工作区工具和人工审批约束。"},
 		{Key: "ai.proactive_enabled", Group: "capabilities", Label: "主动型能力", Type: "boolean", Default: true, Help: "允许未来任务唤醒内置 Agent；任务仍由本地调度器执行。"},
 		{Key: "persona.id", Group: "persona", Label: "人格 ID", Type: "select", Default: "", OptionSource: "personas", Help: "选择人格目录中的稳定 ID；为空时继续使用当前配置中的系统提示词。"},
@@ -967,9 +985,11 @@ func runtimeFromValues(values Values) Runtime {
 			ProactiveReplyEnabled: boolOr(values["extensions.proactive_reply_enabled"], false), ProactiveReplyMethod: stringOrDefault(values["extensions.proactive_reply_method"], "possibility_reply"),
 			ProactiveReplyProbability: numberOr(values["extensions.proactive_reply_probability"], 0.1), ProactiveReplyWhitelist: stringListOr(values["extensions.proactive_reply_whitelist"]),
 		},
-		MemoryEnabled:      boolOr(values["memory.enabled"], false),
-		MemoryAutoRetrieve: boolOr(values["memory.auto_retrieve"], false),
-		MemoryMaxResults:   intOr(values["memory.max_results"], 8),
+		MemoryEnabled:       boolOr(values["memory.enabled"], false),
+		MemoryAutoRetrieve:  boolOr(values["memory.auto_retrieve"], false),
+		MemoryMaxResults:    intOr(values["memory.max_results"], 8),
+		WebSearchEnabled:    boolOr(values["ai.web_search.enabled"], false),
+		WebSearchServiceIDs: stringListOr(values["ai.web_search.service_ids"]),
 	}
 }
 
@@ -1056,6 +1076,15 @@ func normalizeSystemSettings(settings SystemSettings) SystemSettings {
 	if settings.ArtifactInputRetentionSeconds == 0 {
 		settings.ArtifactInputRetentionSeconds = DefaultArtifactInputRetentionSeconds
 	}
+	if settings.WebSearchDailyCallLimit == 0 {
+		settings.WebSearchDailyCallLimit = 100
+	}
+	if settings.WebSearchMaxCallsPerInvocation == 0 {
+		settings.WebSearchMaxCallsPerInvocation = 8
+	}
+	if settings.WebSearchAlertPercent == 0 {
+		settings.WebSearchAlertPercent = 80
+	}
 	return settings
 }
 
@@ -1106,6 +1135,15 @@ func validateSystemSettings(settings SystemSettings) error {
 	}
 	if settings.RequestTimeoutSeconds < 30 || settings.RequestTimeoutSeconds > 3600 {
 		return fmt.Errorf("%w: 全局请求超时必须在 30-3600 秒之间", ErrInvalidRequest)
+	}
+	if settings.WebSearchDailyCallLimit < 1 || settings.WebSearchDailyCallLimit > 100000 {
+		return fmt.Errorf("%w: 网页搜索每日请求上限必须在 1-100000 之间", ErrInvalidRequest)
+	}
+	if settings.WebSearchMaxCallsPerInvocation < 1 || settings.WebSearchMaxCallsPerInvocation > 100 {
+		return fmt.Errorf("%w: 单任务网页搜索上限必须在 1-100 之间", ErrInvalidRequest)
+	}
+	if settings.WebSearchAlertPercent < 1 || settings.WebSearchAlertPercent > 100 {
+		return fmt.Errorf("%w: 网页搜索用量告警比例必须在 1-100 之间", ErrInvalidRequest)
 	}
 	if settings.ArtifactQuotaBytes < 0 || settings.ArtifactQuotaBytes > MaxArtifactQuotaBytes {
 		return fmt.Errorf("%w: Artifact 存储配额必须在 0 到 %d 字节之间", ErrInvalidRequest, MaxArtifactQuotaBytes)

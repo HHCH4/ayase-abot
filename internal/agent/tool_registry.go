@@ -464,6 +464,9 @@ func stableRuntimeToolID(source ToolSource, name string) string {
 func inferToolCapabilities(source ToolSource, name string) []ToolCapability {
 	name = strings.ToLower(name)
 	result := make([]ToolCapability, 0, 3)
+	if strings.Contains(name, "search") {
+		result = append(result, ToolCapabilityNetwork)
+	}
 	if source == ToolSourceWorkspace {
 		switch {
 		case strings.Contains(name, "request_write"), strings.Contains(name, "patch"), strings.Contains(name, "delete"), strings.Contains(name, "mkdir"):

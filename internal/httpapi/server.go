@@ -28,6 +28,7 @@ import (
 	"Abot/internal/provider"
 	"Abot/internal/schedule"
 	"Abot/internal/sessionrule"
+	"Abot/internal/websearch"
 	"Abot/internal/webui"
 	"Abot/internal/workspace"
 	"google.golang.org/adk/v2/session"
@@ -48,6 +49,7 @@ type Server struct {
 	artifacts                  *artifact.Service
 	sessionRules               *sessionrule.Service
 	schedules                  *schedule.Service
+	webSearch                  *websearch.Manager
 	logs                       *logging.Store
 	runtime                    *agentruntime.Coordinator
 	toolRegistry               *agent.ToolRegistry
@@ -144,6 +146,11 @@ func (s *Server) SetMessageSourceRegistry(registry bot.MessageSourceRegistry) {
 // SetScheduleService 装配未来任务和本地调度服务。
 func (s *Server) SetScheduleService(service *schedule.Service) {
 	s.schedules = service
+}
+
+// SetWebSearchManager 设置网页搜索管理器；管理接口不会返回密钥明文。
+func (s *Server) SetWebSearchManager(manager *websearch.Manager) {
+	s.webSearch = manager
 }
 
 // SetLogStore 装配管理台日志的有界内存快照。
@@ -411,6 +418,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/config-profiles/{id}/default", s.setDefaultConfigProfile)
 	mux.HandleFunc("GET /api/v1/system-settings", s.getSystemSettings)
 	mux.HandleFunc("PUT /api/v1/system-settings", s.setSystemSettings)
+	mux.HandleFunc("GET /api/v1/web-search/services", s.listWebSearchServices)
+	mux.HandleFunc("POST /api/v1/web-search/services", s.saveWebSearchService)
+	mux.HandleFunc("PUT /api/v1/web-search/services/{id}", s.saveWebSearchService)
+	mux.HandleFunc("DELETE /api/v1/web-search/services/{id}", s.deleteWebSearchService)
+	mux.HandleFunc("POST /api/v1/web-search/services/{id}/test", s.testWebSearchService)
+	mux.HandleFunc("GET /api/v1/web-search/usage", s.getWebSearchUsage)
 	mux.HandleFunc("GET /api/v1/memories", s.listMemories)
 	mux.HandleFunc("POST /api/v1/memories", s.createMemory)
 	mux.HandleFunc("DELETE /api/v1/memories", s.clearMemories)
@@ -1716,11 +1729,20 @@ func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		startedAt := time.Now()
 		body, truncated, readErr := replayRequestBody(request)
+		if isWebSearchCredentialRequest(request) {
+			body = redactWebSearchCredentialBody(body, truncated)
+		}
+		query := request.URL.RawQuery
+		requestURI := request.URL.RequestURI()
+		if isWebSearchCredentialRequest(request) && query != "" {
+			query = "[REDACTED]"
+			requestURI = request.URL.Path + "?[REDACTED]"
+		}
 		requestAttrs := []any{
 			"method", request.Method,
 			"path", request.URL.Path,
-			"query", request.URL.RawQuery,
-			"url", request.URL.RequestURI(),
+			"query", query,
+			"url", requestURI,
 			"content_type", request.Header.Get("Content-Type"),
 			"content_length", request.ContentLength,
 		}
@@ -1740,6 +1762,41 @@ func requestLogger(next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(recorder, request)
 	})
+}
+
+func isWebSearchCredentialRequest(request *http.Request) bool {
+	if request == nil || request.URL == nil {
+		return false
+	}
+	if request.Method == http.MethodPost && request.URL.Path == "/api/v1/web-search/services" {
+		return true
+	}
+	if request.Method != http.MethodPut {
+		return false
+	}
+	const prefix = "/api/v1/web-search/services/"
+	path := strings.TrimPrefix(request.URL.Path, prefix)
+	return request.URL.Path != path && path != "" && !strings.Contains(path, "/")
+}
+
+func redactWebSearchCredentialBody(body string, truncated bool) string {
+	if truncated {
+		return "[REDACTED: truncated web search service body]"
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &fields); err != nil {
+		return "[REDACTED: invalid web search service body]"
+	}
+	for key := range fields {
+		if strings.EqualFold(strings.TrimSpace(key), "api_key") {
+			fields[key] = json.RawMessage(`"[REDACTED]"`)
+		}
+	}
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return "[REDACTED: web search service body]"
+	}
+	return string(encoded)
 }
 
 // replayRequestBody 读取请求正文用于日志后再拼回原 Body，保证业务解码逻辑看到的内容完全不变。

@@ -51,6 +51,8 @@ type Config struct {
 	Conversations  *conversation.Service
 	Instruction    string
 	Tools          []tool.Tool
+	// WebSearchToolFactory 仅在有效配置明确启用网页搜索时，为当前运行创建搜索工具。
+	WebSearchToolFactory func(context.Context, RuntimeOptions, string, string) (tool.Tool, error)
 	// WorkspaceTools 是旧版兼容回调；新代码应使用 WorkspaceToolsForConversation。
 	WorkspaceTools func(context.Context, string) ([]tool.Tool, error)
 	// WorkspaceToolsForConversation 根据对话固定的工作区创建工具，并把操作绑定到对话。
@@ -375,40 +377,45 @@ type RuntimeOptions struct {
 	// SubAgentEnabled controls whether the main Agent may launch any child Agent.
 	// nil preserves the historical enabled behavior for callers that construct
 	// partial RuntimeOptions values.
-	SubAgentEnabled               *bool
-	ProviderID                    string
-	ModelID                       string
-	AITemperature                 float64
-	AIReasoningEffort             string
-	AITopP                        float64
-	AIMaxOutputTokens             int
-	AIRequestRetries              int
-	PersonaID                     string
-	Instruction                   string
-	CompactionEnabled             bool
-	CompactionRatio               float64
-	CompactionSafetyTokens        int
-	CompactionRetentionEvents     int
-	CompactionInterval            int
-	CompactionOverlap             int
-	CompactionUnknownWindowTokens int
-	AgentMaxToolCalls             int
-	ToolSchemaBudgetTokens        int
-	WorkspaceEnabled              bool
-	WorkspaceReadEnabled          bool
-	WorkspaceWriteEnabled         bool
-	WorkspaceExecEnabled          bool
-	WorkspaceGitEnabled           bool
-	WorkspaceCommandTimeoutSecs   int
-	MessageStreamingEnabled       bool
-	MessagePromptPrefix           string
-	MemoryEnabled                 bool
-	MemoryAutoRetrieve            bool
-	MemoryMaxResults              int
-	ModalFallbackEnabled          bool
-	ModalFallbackProviderID       string
-	ModalFallbackVisionModel      string
-	ModalFallbackAudioModel       string
+	SubAgentEnabled                *bool
+	ProviderID                     string
+	ModelID                        string
+	AITemperature                  float64
+	AIReasoningEffort              string
+	AITopP                         float64
+	AIMaxOutputTokens              int
+	AIRequestRetries               int
+	PersonaID                      string
+	Instruction                    string
+	CompactionEnabled              bool
+	CompactionRatio                float64
+	CompactionSafetyTokens         int
+	CompactionRetentionEvents      int
+	CompactionInterval             int
+	CompactionOverlap              int
+	CompactionUnknownWindowTokens  int
+	AgentMaxToolCalls              int
+	ToolSchemaBudgetTokens         int
+	WorkspaceEnabled               bool
+	WorkspaceReadEnabled           bool
+	WorkspaceWriteEnabled          bool
+	WorkspaceExecEnabled           bool
+	WorkspaceGitEnabled            bool
+	WorkspaceCommandTimeoutSecs    int
+	MessageStreamingEnabled        bool
+	MessagePromptPrefix            string
+	MemoryEnabled                  bool
+	MemoryAutoRetrieve             bool
+	MemoryMaxResults               int
+	WebSearchEnabled               bool
+	WebSearchServiceIDs            []string
+	WebSearchDailyCallLimit        int
+	WebSearchMaxCallsPerInvocation int
+	WebSearchAlertPercent          int
+	ModalFallbackEnabled           bool
+	ModalFallbackProviderID        string
+	ModalFallbackVisionModel       string
+	ModalFallbackAudioModel        string
 	// SubAgent 是所有子任务共享的通用运行配置，不按职责定义不同子 Agent 类型。
 	SubAgent SubAgentOptions
 }
@@ -468,6 +475,7 @@ type Kernel struct {
 	conversations                 *conversation.Service
 	instruction                   string
 	tools                         []tool.Tool
+	webSearchToolFactory          func(context.Context, RuntimeOptions, string, string) (tool.Tool, error)
 	workspaceTools                func(context.Context, string) ([]tool.Tool, error)
 	workspaceToolsForConversation func(context.Context, string, string) ([]tool.Tool, error)
 	workspaceToolsWithPolicy      func(context.Context, string, string, WorkspacePolicy) ([]tool.Tool, error)
@@ -793,6 +801,7 @@ func NewKernel(config Config) (*Kernel, error) {
 		CompactionInterval: interval, CompactionOverlap: overlap,
 		AITemperature: 0.7, AITopP: 1.0, CompactionUnknownWindowTokens: 8192, AIRequestRetries: 2,
 		AgentMaxToolCalls: 20, ToolSchemaBudgetTokens: 4096,
+		WebSearchDailyCallLimit: 100, WebSearchMaxCallsPerInvocation: 8, WebSearchAlertPercent: 80,
 		WorkspaceEnabled: true, WorkspaceReadEnabled: true, WorkspaceWriteEnabled: true,
 		WorkspaceExecEnabled: true, WorkspaceGitEnabled: true, WorkspaceCommandTimeoutSecs: 60,
 		MessageStreamingEnabled: true,
@@ -805,6 +814,7 @@ func NewKernel(config Config) (*Kernel, error) {
 		conversations:                 config.Conversations,
 		instruction:                   config.Instruction,
 		tools:                         append([]tool.Tool(nil), config.Tools...),
+		webSearchToolFactory:          config.WebSearchToolFactory,
 		workspaceTools:                config.WorkspaceTools,
 		workspaceToolsForConversation: config.WorkspaceToolsForConversation,
 		workspaceToolsWithPolicy:      config.WorkspaceToolsForConversationWithPolicy,
@@ -1207,7 +1217,19 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 		var workspaceToolsForRegistry []tool.Tool
 		var memoryToolsForRegistry []tool.Tool
 		var sessionAttachmentToolsForRegistry []tool.Tool
+		var webSearchToolsForRegistry []tool.Tool
 		var subAgentToolsForRegistry []tool.Tool
+		if runtime.WebSearchEnabled && !request.Proactive && k.webSearchToolFactory != nil {
+			webSearchTool, toolErr := k.webSearchToolFactory(ctx, runtime, request.InvocationID, request.ConversationID)
+			if toolErr != nil {
+				yield(nil, fmt.Errorf("创建网页搜索工具失败: %w", toolErr))
+				return
+			}
+			if webSearchTool != nil {
+				webSearchToolsForRegistry = append(webSearchToolsForRegistry, webSearchTool)
+				tools = append(tools, webSearchTool)
+			}
+		}
 		if workspaceID != "" {
 			if !runtime.WorkspaceEnabled {
 				yield(nil, errors.New("当前配置已停用项目能力"))
@@ -1361,6 +1383,10 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 			}
 			if err := toolRegistry.RegisterRuntimeTools(sessionAttachmentToolsForRegistry, ToolSourceBuiltin); err != nil {
 				yield(nil, fmt.Errorf("注册会话附件工具失败: %w", err))
+				return
+			}
+			if err := toolRegistry.RegisterRuntimeTools(webSearchToolsForRegistry, ToolSourceBuiltin); err != nil {
+				yield(nil, fmt.Errorf("注册网页搜索工具失败: %w", err))
 				return
 			}
 			if err := toolRegistry.RegisterRuntimeTools(subAgentToolsForRegistry, ToolSourceBuiltin); err != nil {
@@ -1760,6 +1786,26 @@ func (k *Kernel) resolveRuntimeOptions(ctx context.Context, request ChatRequest,
 	if runtime.MemoryMaxResults > 50 {
 		runtime.MemoryMaxResults = 50
 	}
+	if runtime.WebSearchDailyCallLimit < 1 {
+		runtime.WebSearchDailyCallLimit = k.defaultRuntime.WebSearchDailyCallLimit
+	}
+	if runtime.WebSearchDailyCallLimit > 100000 {
+		runtime.WebSearchDailyCallLimit = 100000
+	}
+	if runtime.WebSearchMaxCallsPerInvocation < 1 {
+		runtime.WebSearchMaxCallsPerInvocation = k.defaultRuntime.WebSearchMaxCallsPerInvocation
+	}
+	if runtime.WebSearchMaxCallsPerInvocation > 100 {
+		runtime.WebSearchMaxCallsPerInvocation = 100
+	}
+	if runtime.WebSearchAlertPercent < 1 || runtime.WebSearchAlertPercent > 100 {
+		runtime.WebSearchAlertPercent = k.defaultRuntime.WebSearchAlertPercent
+	}
+	if len(runtime.WebSearchServiceIDs) > 64 {
+		runtime.WebSearchServiceIDs = append([]string(nil), runtime.WebSearchServiceIDs[:64]...)
+	} else {
+		runtime.WebSearchServiceIDs = append([]string(nil), runtime.WebSearchServiceIDs...)
+	}
 	if runtime.WorkspaceCommandTimeoutSecs <= 0 {
 		runtime.WorkspaceCommandTimeoutSecs = k.defaultRuntime.WorkspaceCommandTimeoutSecs
 	}
@@ -1783,7 +1829,7 @@ func (k *Kernel) resolveRuntimeOptions(ctx context.Context, request ChatRequest,
 // constructed ToolRegistry is empty until the first Runner is built, and an
 // empty catalog revision would otherwise make every persisted invocation look
 // changed before the registry has had a chance to warm up.
-func (k *Kernel) warmRuntimeToolCatalog(ctx context.Context, runtime RuntimeOptions, workspaceID, conversationID, userID, invocationID string) error {
+func (k *Kernel) warmRuntimeToolCatalog(ctx context.Context, runtime RuntimeOptions, workspaceID, conversationID, userID, invocationID string, proactive bool) error {
 	if k == nil || k.toolRegistry == nil {
 		return nil
 	}
@@ -1851,6 +1897,17 @@ func (k *Kernel) warmRuntimeToolCatalog(ctx context.Context, runtime RuntimeOpti
 		}
 		if err := registry.RegisterRuntimeTools([]tool.Tool{attachmentTool}, ToolSourceBuiltin); err != nil {
 			return fmt.Errorf("注册会话附件工具失败: %w", err)
+		}
+	}
+	if runtime.WebSearchEnabled && !proactive && k.webSearchToolFactory != nil {
+		webSearchTool, err := k.webSearchToolFactory(ctx, runtime, invocationID, conversationID)
+		if err != nil {
+			return fmt.Errorf("创建网页搜索工具失败: %w", err)
+		}
+		if webSearchTool != nil {
+			if err := registry.RegisterRuntimeTools([]tool.Tool{webSearchTool}, ToolSourceBuiltin); err != nil {
+				return fmt.Errorf("注册网页搜索工具失败: %w", err)
+			}
 		}
 	}
 	// Resume 前的 Runtime 快照必须看到和真实 Run 相同的子 Agent 工具目录，
@@ -2001,7 +2058,7 @@ func (k *Kernel) ResolveRuntimeConfigSnapshot(ctx context.Context, request ChatR
 	if err != nil {
 		return RuntimeConfigSnapshot{}, "", err
 	}
-	if err := k.warmRuntimeToolCatalog(ctx, runtime, workspaceID, request.ConversationID, request.UserID, request.InvocationID); err != nil {
+	if err := k.warmRuntimeToolCatalog(ctx, runtime, workspaceID, request.ConversationID, request.UserID, request.InvocationID, request.Proactive); err != nil {
 		return RuntimeConfigSnapshot{}, "", err
 	}
 	return BuildRuntimeConfigSnapshot(k.appName, runtime, resolved, workspaceID, request.TargetPath, k.CurrentToolCatalogRevision())

@@ -34,6 +34,10 @@ import type {
   ScheduledTask,
   DashboardStats,
   DataLogEntry,
+  WebSearchService,
+  WebSearchServiceInput,
+  WebSearchUsageSummary,
+  WebSearchTestResult,
 } from './types'
 
 export class ApiError extends Error {
@@ -236,6 +240,28 @@ export async function readDataLogs(level = ''): Promise<DataLogEntry[]> {
   const query = level ? `?level=${encodeURIComponent(level)}` : ''
   const result = await request<{ logs: DataLogEntry[] }>(`/api/v1/data/logs${query}`)
   return result.logs || []
+}
+
+export async function readWebSearchServices(): Promise<WebSearchService[]> {
+  const result = await request<{ services: WebSearchService[] }>('/api/v1/web-search/services')
+  return result.services || []
+}
+
+export async function saveWebSearchService(value: WebSearchServiceInput): Promise<WebSearchService> {
+  const path = value.id ? `/api/v1/web-search/services/${encodeURIComponent(value.id)}` : '/api/v1/web-search/services'
+  return request<WebSearchService>(path, { method: value.id ? 'PUT' : 'POST', body: JSON.stringify(value) })
+}
+
+export async function deleteWebSearchService(id: string): Promise<void> {
+  await request<void>(`/api/v1/web-search/services/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+export async function testWebSearchService(id: string): Promise<WebSearchTestResult> {
+  return request<WebSearchTestResult>(`/api/v1/web-search/services/${encodeURIComponent(id)}/test`, { method: 'POST', body: '{}' })
+}
+
+export async function readWebSearchUsage(): Promise<WebSearchUsageSummary> {
+  return request<WebSearchUsageSummary>('/api/v1/web-search/usage')
 }
 
 // 打开日志页时建立 SSE 连接，关闭页面或切换筛选条件时由调用方关闭连接。

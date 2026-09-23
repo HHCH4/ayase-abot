@@ -14,6 +14,7 @@ func TestSchemaRuntimeSettingsAreWired(t *testing.T) {
 		"context.compaction.unknown_window_tokens", "context.compaction.sliding_interval", "context.compaction.sliding_overlap", "agent.max_tool_calls", "agent.tool_schema_budget_tokens",
 		"workspace.git_enabled", "message.streaming_enabled", "message.prompt_prefix",
 		"memory.enabled", "memory.auto_retrieve", "memory.max_results",
+		"ai.web_search.enabled", "ai.web_search.service_ids",
 	} {
 		if _, ok := keys[key]; !ok {
 			t.Fatalf("Schema 缺少实际运行配置项 %q", key)
@@ -38,6 +39,8 @@ func TestSchemaRuntimeSettingsAreWired(t *testing.T) {
 		"memory.enabled":                           true,
 		"memory.auto_retrieve":                     true,
 		"memory.max_results":                       12,
+		"ai.web_search.enabled":                    true,
+		"ai.web_search.service_ids":                []string{"search-b", "search-a"},
 	})
 	if runtime.AITemperature != 0.25 || runtime.AITopP != 0.9 || runtime.AIMaxOutputTokens != 2048 || runtime.AIRequestRetries != 3 {
 		t.Fatalf("AI 生成参数没有从配置解析: %#v", runtime)
@@ -59,6 +62,9 @@ func TestSchemaRuntimeSettingsAreWired(t *testing.T) {
 	}
 	if !runtime.MemoryEnabled || !runtime.MemoryAutoRetrieve || runtime.MemoryMaxResults != 12 {
 		t.Fatalf("长期记忆运行配置没有从配置解析: %#v", runtime)
+	}
+	if !runtime.WebSearchEnabled || len(runtime.WebSearchServiceIDs) != 2 || runtime.WebSearchServiceIDs[0] != "search-b" || runtime.WebSearchServiceIDs[1] != "search-a" {
+		t.Fatalf("网页搜索开关或优先顺序没有从配置解析: %#v", runtime)
 	}
 }
 
@@ -99,6 +105,9 @@ func TestSystemSettingsArtifactLifecycleBounds(t *testing.T) {
 	}
 	if err := validateSystemSettings(defaulted); err != nil {
 		t.Fatalf("默认 Artifact 边界必须合法: %v", err)
+	}
+	if defaulted.WebSearchDailyCallLimit != 100 || defaulted.WebSearchMaxCallsPerInvocation != 8 || defaulted.WebSearchAlertPercent != 80 {
+		t.Fatalf("网页搜索预算未补入安全默认值: %+v", defaulted)
 	}
 	if !defaulted.IsSubAgentEnabled() || defaulted.SubAgentEnabled == nil {
 		t.Fatalf("旧系统设置的子 Agent 默认值必须为启用: %+v", defaulted)
@@ -144,6 +153,32 @@ func TestSystemSettingsArtifactLifecycleBounds(t *testing.T) {
 	for index, settings := range invalid {
 		if err := validateSystemSettings(settings); err == nil {
 			t.Fatalf("非法 Artifact 设置 #%d 必须被拒绝: %+v", index, settings)
+		}
+	}
+}
+
+func TestWebSearchProfileAndSystemBounds(t *testing.T) {
+	schema := buildSchema()
+	fields := make(map[string]Field, len(schema.Fields))
+	for _, field := range schema.Fields {
+		fields[field.Key] = field
+	}
+	if field, ok := fields["ai.web_search.service_ids"]; !ok || field.Type != "list" {
+		t.Fatalf("网页搜索服务优先级必须是可选择的列表字段: %+v", field)
+	}
+
+	settings := normalizeSystemSettings(SystemSettings{})
+	if err := validateSystemSettings(settings); err != nil {
+		t.Fatalf("默认网页搜索预算设置必须有效: %v", err)
+	}
+	invalid := []SystemSettings{
+		{RequestTimeoutSeconds: 300, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds, WebSearchDailyCallLimit: -1},
+		{RequestTimeoutSeconds: 300, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds, WebSearchMaxCallsPerInvocation: 101},
+		{RequestTimeoutSeconds: 300, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds, WebSearchAlertPercent: 101},
+	}
+	for index, value := range invalid {
+		if err := validateSystemSettings(normalizeSystemSettings(value)); err == nil {
+			t.Fatalf("非法网页搜索预算 #%d 未被拒绝: %+v", index, value)
 		}
 	}
 }

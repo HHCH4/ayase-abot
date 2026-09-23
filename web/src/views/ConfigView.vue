@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { NButton, NCard, NCheckbox, NDynamicTags, NEmpty, NInput, NInputNumber, NSelect, NSpace, NTabPane, NTag, NTabs, useMessage } from 'naive-ui'
-import { readConfigRevisions, readPersonas, request } from '@/api'
+import { readConfigRevisions, readPersonas, readWebSearchServices, request } from '@/api'
 import { configuredModelOptions, makeModelReference, parseModelReference } from '@/model-catalog'
 import { useAppStore } from '@/stores/app'
-import type { ConfigField, ConfigProfile, ConfigRevision, SubAgentSettings } from '@/types'
+import AppIcon from '@/components/AppIcon.vue'
+import type { ConfigField, ConfigProfile, ConfigRevision, SubAgentSettings, WebSearchService } from '@/types'
 
 const store = useAppStore()
 const message = useMessage()
@@ -18,6 +20,7 @@ const draft = reactive<Record<string, unknown>>({})
 const systemDraft = reactive<Record<string, unknown>>({
   log_level: 'info', request_timeout_seconds: 300,
   artifact_quota_bytes: 4 * 1024 * 1024 * 1024, artifact_stale_upload_seconds: 86400, artifact_input_retention_seconds: 7 * 86400,
+  web_search_daily_call_limit: 100, web_search_max_calls_per_invocation: 8, web_search_alert_percent: 80,
   modal_fallback_enabled: false, modal_fallback_provider_id: '', modal_fallback_vision_model: '', modal_fallback_audio_model: '',
   subagent_enabled: true,
   subagent: {},
@@ -29,6 +32,9 @@ const saving = ref(false)
 const showHistory = ref(false)
 const importInput = ref<HTMLInputElement | null>(null)
 const personas = ref<{ id: string; name: string; enabled: boolean }[]>([])
+const webSearchServices = ref<WebSearchService[]>([])
+const webSearchAddID = ref<string | null>(null)
+const router = useRouter()
 
 const groupItems = [
   { key: 'ai', label: 'AI 与模型' },
@@ -46,6 +52,13 @@ const groupItems = [
 
 const currentProfile = computed(() => store.configProfiles.find((item) => item.id === selectedID.value) || store.defaultProfile)
 const profileOptions = computed(() => store.configProfiles.map((item) => ({ label: `${item.name}${item.is_default ? ' · 默认' : ''}`, value: item.id })))
+const webSearchServiceOptions = computed(() => {
+  const selected = new Set(Array.isArray(draft['ai.web_search.service_ids']) ? draft['ai.web_search.service_ids'] as string[] : [])
+  return webSearchServices.value.filter((item) => item.enabled && !selected.has(item.id)).map((item) => ({
+    label: `${item.name} · ${item.provider} · ${item.account_group || '独立额度组'}`,
+    value: item.id,
+  }))
+})
 const currentFields = computed(() => (store.configSchema.fields || []).filter((field) => {
   if (!search.value.trim() && field.group !== group.value) return false
   if (!displayMatches(field)) return false
@@ -110,6 +123,50 @@ function setListValue(field: ConfigField, value: unknown) {
   const values = Array.isArray(value) ? value.map((item) => String(item).trim()).filter(Boolean) : []
   draft[field.key] = [...new Set(values)]
   dirty.value = true
+}
+
+function webSearchPriorityIDs(): string[] {
+  const value = draft['ai.web_search.service_ids']
+  return Array.isArray(value) ? value.map((item) => String(item).trim()).filter(Boolean) : []
+}
+
+function webSearchServiceName(id: string) {
+  return webSearchServices.value.find((item) => item.id === id)?.name || '已删除的服务'
+}
+
+function webSearchServiceDetails(id: string) {
+  const item = webSearchServices.value.find((service) => service.id === id)
+  return item ? `${item.provider} · ${item.account_group || '独立额度组'}${item.enabled ? '' : ' · 已停用'}` : `服务 ID：${id}`
+}
+
+function addWebSearchPriority() {
+  const id = String(webSearchAddID.value || '').trim()
+  if (!id) return
+  const current = webSearchPriorityIDs()
+  if (!current.includes(id)) {
+    draft['ai.web_search.service_ids'] = [...current, id]
+    dirty.value = true
+  }
+  webSearchAddID.value = null
+}
+
+function moveWebSearchPriority(id: string, direction: -1 | 1) {
+  const current = webSearchPriorityIDs()
+  const index = current.indexOf(id)
+  const nextIndex = index + direction
+  if (index < 0 || nextIndex < 0 || nextIndex >= current.length) return
+  ;[current[index], current[nextIndex]] = [current[nextIndex], current[index]]
+  draft['ai.web_search.service_ids'] = current
+  dirty.value = true
+}
+
+function removeWebSearchPriority(id: string) {
+  draft['ai.web_search.service_ids'] = webSearchPriorityIDs().filter((item) => item !== id)
+  dirty.value = true
+}
+
+function openWebSearchSettings() {
+  void router.push({ name: 'web-search' })
 }
 
 // normalizeListDraft 让旧配置在第一次打开或保存其他字段时自动升级为数组。
@@ -338,6 +395,7 @@ function syncSystemDraft() {
   Object.assign(systemDraft, {
     log_level: value.log_level, request_timeout_seconds: value.request_timeout_seconds,
     artifact_quota_bytes: value.artifact_quota_bytes, artifact_stale_upload_seconds: value.artifact_stale_upload_seconds, artifact_input_retention_seconds: value.artifact_input_retention_seconds,
+    web_search_daily_call_limit: value.web_search_daily_call_limit, web_search_max_calls_per_invocation: value.web_search_max_calls_per_invocation, web_search_alert_percent: value.web_search_alert_percent,
     modal_fallback_enabled: value.modal_fallback_enabled, modal_fallback_provider_id: value.modal_fallback_provider_id,
     modal_fallback_vision_model: value.modal_fallback_vision_model, modal_fallback_audio_model: value.modal_fallback_audio_model,
     subagent_enabled: value.subagent_enabled !== false,
@@ -530,6 +588,11 @@ onMounted(async () => {
   } catch {
     personas.value = []
   }
+  try {
+    webSearchServices.value = await readWebSearchServices()
+  } catch {
+    webSearchServices.value = []
+  }
   selectedID.value = store.defaultProfileID || store.configProfiles[0]?.id || ''
   resetDraft(currentProfile.value)
   syncSystemDraft()
@@ -568,6 +631,25 @@ onMounted(async () => {
                     <NSelect v-else-if="isModelField(field)" :value="profileModelControlValue(field)" :options="profileModelOptions(field)" filterable clearable @update:value="setProfileModelValue(field, $event)" />
                     <NSelect v-else-if="field.type === 'select'" :value="String(fieldValue(field) ?? '')" :options="fieldOptions(field)" @update:value="setValue(field, $event)" />
                     <NInputNumber v-else-if="field.type === 'integer' || field.type === 'number'" :value="numberValue(field)" :min="field.min" :max="field.max" :step="field.type === 'number' ? 0.01 : 1" :show-button="false" @update:value="setValue(field, $event)" />
+                    <div v-else-if="field.key === 'ai.web_search.service_ids'" class="web-search-priority-editor">
+                      <div v-if="webSearchPriorityIDs().length" class="web-search-priority-list">
+                        <div v-for="(id, index) in webSearchPriorityIDs()" :key="id" class="web-search-priority-row">
+                          <span class="web-search-priority-number">{{ index + 1 }}</span>
+                          <span class="web-search-priority-copy"><strong>{{ webSearchServiceName(id) }}</strong><small>{{ webSearchServiceDetails(id) }}</small></span>
+                          <NSpace :size="4">
+                            <NButton size="tiny" quaternary :disabled="index === 0" :aria-label="`上移 ${webSearchServiceName(id)}`" @click="moveWebSearchPriority(id, -1)"><AppIcon name="arrow-up" :size="14" /></NButton>
+                            <NButton size="tiny" quaternary :disabled="index === webSearchPriorityIDs().length - 1" :aria-label="`下移 ${webSearchServiceName(id)}`" @click="moveWebSearchPriority(id, 1)"><AppIcon name="chevron-down" :size="14" /></NButton>
+                            <NButton size="tiny" quaternary type="error" :aria-label="`移除 ${webSearchServiceName(id)}`" @click="removeWebSearchPriority(id)"><AppIcon name="trash" :size="14" /></NButton>
+                          </NSpace>
+                        </div>
+                      </div>
+                      <div v-else class="web-search-priority-empty">未指定时会按服务页面的优先级自动尝试所有已启用服务。</div>
+                      <div class="web-search-priority-add">
+                        <NSelect v-model:value="webSearchAddID" :options="webSearchServiceOptions" filterable clearable placeholder="选择一个已启用的搜索服务" />
+                        <NButton secondary :disabled="!webSearchAddID" @click="addWebSearchPriority">添加服务</NButton>
+                      </div>
+                      <NButton text type="primary" @click="openWebSearchSettings">管理搜索服务与 API Key</NButton>
+                    </div>
                     <NDynamicTags v-else-if="field.type === 'list'" :value="listValue(field)" :closable="true" :input-props="{ placeholder: '输入后按 Enter 添加' }" @update:value="setListValue(field, $event)" />
                     <NInput v-else-if="field.type === 'textarea'" type="textarea" :value="textValue(field)" :autosize="{ minRows: 3, maxRows: 8 }" @update:value="setValue(field, $event)" />
                     <NInput v-else :value="textValue(field)" :type="field.secret ? 'password' : 'text'" @update:value="setValue(field, $event)" />
@@ -583,7 +665,7 @@ onMounted(async () => {
         </NTabPane>
         <NTabPane name="system" tab="系统设置">
           <div class="system-settings-panel">
-            <div class="section-heading-row"><div><h3>系统设置</h3><p>日志等级、全局请求超时、Artifact 维护和多模态降级保存后立即生效。</p></div></div>
+            <div class="section-heading-row"><div><h3>系统设置</h3><p>日志等级、全局请求超时、网页搜索预算、Artifact 维护和多模态降级保存后立即生效。</p></div></div>
             <div v-for="field in (store.systemSettings.schema || [])" :key="field.key" class="config-field-row">
               <div class="field-copy"><strong>{{ field.label }}</strong><code>system.{{ field.key }}</code><span>{{ field.help }}</span><NTag v-if="field.restart_required" size="small" type="warning">需重启</NTag></div>
               <div class="field-control">
