@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strings"
 
 	"Abot/internal/provider"
@@ -94,6 +95,9 @@ type RuntimeOptionsSnapshot struct {
 	ModalFallbackVisionModel      string                                    `json:"modal_fallback_vision_model,omitempty"`
 	ModalFallbackAudioModel       string                                    `json:"modal_fallback_audio_model,omitempty"`
 	SubAgentProfiles              map[string]SubAgentProfileOptionsSnapshot `json:"subagent_profiles,omitempty"`
+	// SubAgent 是新执行链路的通用子 Agent 快照。使用指针保持旧 Invocation
+	// 的 JSON 形状不变；只有显式配置过通用子 Agent 时才写入该字段。
+	SubAgent *SubAgentOptionsSnapshot `json:"subagent,omitempty"`
 }
 
 // SubAgentProfileOptionsSnapshot 是子 Agent 配置的无秘密快照。它只包含模型
@@ -109,6 +113,21 @@ type SubAgentProfileOptionsSnapshot struct {
 	MaxConcurrency    int      `json:"max_concurrency,omitempty"`
 	OutputBudgetBytes int      `json:"output_budget_bytes,omitempty"`
 	FailurePolicy     string   `json:"failure_policy,omitempty"`
+}
+
+// SubAgentOptionsSnapshot 是通用子 Agent 的无秘密快照。它不包含超时，
+// 因为子 Agent 的总生命周期由父 Invocation 的 Context 管理。
+type SubAgentOptionsSnapshot struct {
+	ProviderID        string   `json:"provider_id,omitempty"`
+	ModelID           string   `json:"model_id,omitempty"`
+	ReasoningEffort   string   `json:"reasoning_effort,omitempty"`
+	Temperature       *float64 `json:"temperature,omitempty"`
+	TopP              *float64 `json:"top_p,omitempty"`
+	MaxOutputTokens   int      `json:"max_output_tokens,omitempty"`
+	MaxConcurrency    int      `json:"max_concurrency,omitempty"`
+	InputBudgetBytes  int      `json:"input_budget_bytes,omitempty"`
+	OutputBudgetBytes int      `json:"output_budget_bytes,omitempty"`
+	AllowedTools      []string `json:"allowed_tools,omitempty"`
 }
 
 // BuildRuntimeConfigSnapshot creates a deterministic projection from the
@@ -171,6 +190,25 @@ func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
 	if len(profiles) == 0 {
 		profiles = nil
 	}
+	var subAgent *SubAgentOptionsSnapshot
+	if runtime.SubAgent.ProviderID != "" || runtime.SubAgent.ModelID != "" || runtime.SubAgent.ReasoningEffort != "" || runtime.SubAgent.Temperature != nil || runtime.SubAgent.TopP != nil || runtime.SubAgent.MaxOutputTokens != 0 || runtime.SubAgent.MaxConcurrency != 0 || runtime.SubAgent.InputBudgetBytes != 0 || runtime.SubAgent.OutputBudgetBytes != 0 || len(runtime.SubAgent.AllowedTools) > 0 {
+		value := &SubAgentOptionsSnapshot{
+			ProviderID: runtime.SubAgent.ProviderID, ModelID: runtime.SubAgent.ModelID, ReasoningEffort: runtime.SubAgent.ReasoningEffort,
+			MaxOutputTokens: runtime.SubAgent.MaxOutputTokens, MaxConcurrency: runtime.SubAgent.MaxConcurrency,
+			InputBudgetBytes: runtime.SubAgent.InputBudgetBytes, OutputBudgetBytes: runtime.SubAgent.OutputBudgetBytes,
+			AllowedTools: append([]string(nil), runtime.SubAgent.AllowedTools...),
+		}
+		if runtime.SubAgent.Temperature != nil {
+			number := *runtime.SubAgent.Temperature
+			value.Temperature = &number
+		}
+		if runtime.SubAgent.TopP != nil {
+			number := *runtime.SubAgent.TopP
+			value.TopP = &number
+		}
+		sort.Strings(value.AllowedTools)
+		subAgent = value
+	}
 	return RuntimeOptionsSnapshot{
 		AIEnabled:                     runtime.AIEnabled,
 		SubAgentEnabled:               &subAgentEnabled,
@@ -203,6 +241,7 @@ func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
 		ModalFallbackVisionModel:      strings.TrimSpace(runtime.ModalFallbackVisionModel),
 		ModalFallbackAudioModel:       strings.TrimSpace(runtime.ModalFallbackAudioModel),
 		SubAgentProfiles:              profiles,
+		SubAgent:                      subAgent,
 	}
 }
 
@@ -355,6 +394,44 @@ func validateRuntimeOptionsSnapshot(options RuntimeOptionsSnapshot) error {
 		case "", "continue", "abort":
 		default:
 			return fmt.Errorf("%w: 子 Agent %s 的失败策略无效", ErrInvalidRuntimeConfigSnapshot, profile)
+		}
+	}
+	if value := options.SubAgent; value != nil {
+		for name, text := range map[string]string{
+			"provider_id":      value.ProviderID,
+			"model_id":         value.ModelID,
+			"reasoning_effort": value.ReasoningEffort,
+		} {
+			if len(text) > 128 {
+				return fmt.Errorf("%w: 通用子 Agent %s 超出长度限制", ErrInvalidRuntimeConfigSnapshot, name)
+			}
+		}
+		for name, number := range map[string]float64{
+			"temperature": pointerFloat64(value.Temperature),
+			"top_p":       pointerFloat64(value.TopP),
+		} {
+			if math.IsNaN(number) || math.IsInf(number, 0) {
+				return fmt.Errorf("%w: 通用子 Agent %s 不是有限数值", ErrInvalidRuntimeConfigSnapshot, name)
+			}
+		}
+		if value.Temperature != nil && (*value.Temperature < 0 || *value.Temperature > 2) || value.TopP != nil && (*value.TopP < 0.01 || *value.TopP > 1) {
+			return fmt.Errorf("%w: 通用子 Agent 的采样参数超出范围", ErrInvalidRuntimeConfigSnapshot)
+		}
+		if value.MaxOutputTokens < 0 || value.MaxOutputTokens > 32768 || value.MaxConcurrency < 0 || value.MaxConcurrency > 4 || value.InputBudgetBytes < 0 || value.InputBudgetBytes > 512<<10 || value.OutputBudgetBytes < 0 || value.OutputBudgetBytes > 32<<10 {
+			return fmt.Errorf("%w: 通用子 Agent 的预算超出范围", ErrInvalidRuntimeConfigSnapshot)
+		}
+		switch strings.ToLower(strings.TrimSpace(value.ReasoningEffort)) {
+		case "", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+		default:
+			return fmt.Errorf("%w: 通用子 Agent 的思考强度无效", ErrInvalidRuntimeConfigSnapshot)
+		}
+		if len(value.AllowedTools) > 64 {
+			return fmt.Errorf("%w: 通用子 Agent 工具白名单过长", ErrInvalidRuntimeConfigSnapshot)
+		}
+		for _, name := range value.AllowedTools {
+			if len(strings.TrimSpace(name)) > 128 {
+				return fmt.Errorf("%w: 通用子 Agent 工具名称过长", ErrInvalidRuntimeConfigSnapshot)
+			}
 		}
 	}
 	return nil

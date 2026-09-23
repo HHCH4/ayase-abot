@@ -144,7 +144,8 @@ func (c *Coordinator) prepareBuiltInSubAgentRequest(ctx context.Context, request
 
 func runtimeOptionsSpecified(runtime agent.RuntimeOptions) bool {
 	return runtime.SubAgentEnabled != nil || runtime.AIEnabled || strings.TrimSpace(runtime.ProviderID) != "" || strings.TrimSpace(runtime.ModelID) != "" ||
-		runtime.AIMaxOutputTokens != 0 || runtime.AITemperature != 0 || runtime.AITopP != 0 || strings.TrimSpace(runtime.AIReasoningEffort) != "" || len(runtime.SubAgentProfiles) > 0
+		runtime.AIMaxOutputTokens != 0 || runtime.AITemperature != 0 || runtime.AITopP != 0 || strings.TrimSpace(runtime.AIReasoningEffort) != "" || len(runtime.SubAgentProfiles) > 0 ||
+		strings.TrimSpace(runtime.SubAgent.ProviderID) != "" || strings.TrimSpace(runtime.SubAgent.ModelID) != "" || strings.TrimSpace(runtime.SubAgent.ReasoningEffort) != "" || runtime.SubAgent.Temperature != nil || runtime.SubAgent.TopP != nil || runtime.SubAgent.MaxOutputTokens != 0 || runtime.SubAgent.MaxConcurrency != 0 || runtime.SubAgent.InputBudgetBytes != 0 || runtime.SubAgent.OutputBudgetBytes != 0 || len(runtime.SubAgent.AllowedTools) > 0
 }
 
 // ListSubAgentGroups 返回指定 Invocation 的子 Agent 组，供管理台展示生命周期。
@@ -191,4 +192,17 @@ func (c *Coordinator) PruneSubAgentRecords(ctx context.Context, before time.Time
 		return 0, errors.New("子 Agent 管理器未装配")
 	}
 	return c.subagents.Prune(ctx, before, limit)
+}
+
+// PurgeLegacySubAgentRecords 在新执行模型启用时清理旧 profile 历史，避免旧的
+// 超时、职责标签和结果继续出现在管理台；仓储不支持时保持兼容并返回 0。
+func (c *Coordinator) PurgeLegacySubAgentRecords(ctx context.Context) (int, error) {
+	if c == nil || c.repo == nil {
+		return 0, nil
+	}
+	cleaner, ok := c.repo.(SubAgentLegacyCleanupRepository)
+	if !ok {
+		return 0, nil
+	}
+	return cleaner.PurgeLegacySubAgentRecords(ctx)
 }

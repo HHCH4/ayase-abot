@@ -509,6 +509,7 @@ func Run(opts bootstrap.Options) error {
 				ModalFallbackVisionModel: settings.ModalFallbackVisionModel, ModalFallbackAudioModel: settings.ModalFallbackAudioModel,
 				SubAgentEnabled:  &subAgentEnabledValue,
 				SubAgentProfiles: subAgentRuntimeProfiles(settings),
+				SubAgent:         subAgentRuntimeSettings(settings),
 			}, nil
 		},
 		EnableCompaction: true,
@@ -523,6 +524,22 @@ func Run(opts bootstrap.Options) error {
 	if err != nil {
 		return err
 	}
+	// 新版只保留通用 generic 子 Agent；清理旧 profile 的编排历史，避免旧的
+	// 独立超时和职责标签继续影响管理台展示，但不触碰主任务或会话数据。
+	if deleted, cleanupErr := runtimeCoordinator.PurgeLegacySubAgentRecords(ctx); cleanupErr != nil {
+		slog.Warn("旧版子 Agent 历史清理失败", "error", cleanupErr)
+	} else if deleted > 0 {
+		slog.Info("旧版子 Agent 历史已清理", "groups_deleted", deleted)
+	}
+	// 父 Invocation 的总超时由配置中心统一决定；子 Agent 只继承这个 Context，
+	// 不再在子任务层设置 120/300 秒的独立截止时间。
+	runtimeCoordinator.SetInvocationTimeoutResolver(func(timeoutCtx context.Context, _ agentruntime.Invocation) (time.Duration, error) {
+		settings, settingsErr := configService.GetSystemSettings(timeoutCtx)
+		if settingsErr != nil {
+			return 0, settingsErr
+		}
+		return time.Duration(settings.RequestTimeoutSeconds) * time.Second, nil
+	})
 	// 删除会话前先让 Runtime 终止该会话的排队和运行中任务，保护其附件引用直到任务收尾完成。
 	conversationService.SetInvocationDeletionHook(func(deleteCtx context.Context, userID, conversationID string) error {
 		if runtimeCoordinator == nil {
@@ -1073,6 +1090,27 @@ func subAgentRuntimeProfiles(settings configsvc.SystemSettings) map[string]agent
 			options.TopP = &number
 		}
 		result[profile] = options
+	}
+	return result
+}
+
+// subAgentRuntimeSettings 将统一子 Agent 配置复制为无秘密运行参数；允许的工具
+// 只作为候选白名单，Kernel 仍会在执行边界再次过滤写入和命令能力。
+func subAgentRuntimeSettings(settings configsvc.SystemSettings) agent.SubAgentOptions {
+	value := settings.SubAgent
+	result := agent.SubAgentOptions{
+		ProviderID: value.ProviderID, ModelID: value.ModelID, ReasoningEffort: value.ReasoningEffort,
+		MaxOutputTokens: value.MaxOutputTokens, MaxConcurrency: value.MaxConcurrency,
+		InputBudgetBytes: value.InputBudgetBytes, OutputBudgetBytes: value.OutputBudgetBytes,
+		AllowedTools: append([]string(nil), value.AllowedTools...),
+	}
+	if value.Temperature != nil {
+		number := *value.Temperature
+		result.Temperature = &number
+	}
+	if value.TopP != nil {
+		number := *value.TopP
+		result.TopP = &number
 	}
 	return result
 }

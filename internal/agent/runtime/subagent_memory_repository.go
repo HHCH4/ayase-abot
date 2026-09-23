@@ -206,6 +206,32 @@ func (r *MemoryRepository) ClaimSubAgentRun(_ context.Context, id, owner string,
 	return cloneSubAgentRun(run), true, nil
 }
 
+// RenewSubAgentRunLease 延长执行租约。租约只是防止进程恢复时重复 claim，
+// 不会给通用子 Agent 增加总执行时限。
+func (r *MemoryRepository) RenewSubAgentRunLease(_ context.Context, id, owner string, now time.Time, ttl time.Duration) (bool, error) {
+	if r == nil || strings.TrimSpace(id) == "" || strings.TrimSpace(owner) == "" || ttl <= 0 || ttl > maxSubAgentLease {
+		return false, ErrConflict
+	}
+	if now.IsZero() {
+		now = nowUTC()
+	} else {
+		now = now.UTC()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	run, ok := r.subAgentRuns[strings.TrimSpace(id)]
+	if !ok {
+		return false, ErrNotFound
+	}
+	if run.Status != SubAgentRunRunning || run.LeaseOwner != strings.TrimSpace(owner) || run.LeaseExpiresAt.Before(now) {
+		return false, nil
+	}
+	run.LeaseExpiresAt = now.Add(ttl)
+	run.UpdatedAt = now
+	r.subAgentRuns[run.ID] = cloneSubAgentRun(run)
+	return true, nil
+}
+
 func (r *MemoryRepository) CompleteSubAgentRun(_ context.Context, id, owner string, status SubAgentRunStatus, resultText, errorCode, message string, now time.Time) (bool, error) {
 	if !status.terminal() {
 		return false, ErrConflict

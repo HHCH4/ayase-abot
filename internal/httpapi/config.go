@@ -304,6 +304,7 @@ func (s *Server) getSystemSettings(writer http.ResponseWriter, request *http.Req
 		"modal_fallback_vision_model": settings.ModalFallbackVisionModel, "modal_fallback_audio_model": settings.ModalFallbackAudioModel,
 		"subagent_enabled":        settings.IsSubAgentEnabled(),
 		"subagent_profiles":       settings.SubAgentProfiles,
+		"subagent":                settings.SubAgent,
 		"subagent_profile_schema": configsvc.SubAgentProfileSchema(),
 		"schema":                  configsvc.SystemSchema().Fields,
 	})

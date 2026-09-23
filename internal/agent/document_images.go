@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"time"
 
 	"Abot/internal/document"
 	"Abot/internal/provider"
@@ -122,10 +123,31 @@ func (k *Kernel) runDocumentImageSubagent(ctx context.Context, invocationID, use
 		Contents: []*genai.Content{content},
 	}
 
+	startedAt := time.Now()
+	// 记录完整文本请求和模型路由，图片只记录大小与类型，避免二进制内容污染日志。
+	slog.Info("文档图片子Agent模型请求",
+		"invocation_id", strings.TrimSpace(invocationID),
+		"document", documentName,
+		"locator", image.Locator,
+		"provider_id", resolved.Provider.ID,
+		"model_id", resolved.Model.ID,
+		"image_mime", image.MIMEType,
+		"image_bytes", len(image.Data),
+		"prompt", prompt,
+	)
 	var builder strings.Builder
 	var usage map[string]any
 	for response, responseErr := range resolved.LLM.GenerateContent(ctx, request, false) {
 		if responseErr != nil {
+			slog.Warn("文档图片子Agent模型失败",
+				"invocation_id", strings.TrimSpace(invocationID),
+				"document", documentName,
+				"locator", image.Locator,
+				"provider_id", resolved.Provider.ID,
+				"model_id", resolved.Model.ID,
+				"duration_ms", time.Since(startedAt).Milliseconds(),
+				"error", responseErr,
+			)
 			return "", responseErr
 		}
 		if response == nil {
@@ -149,6 +171,14 @@ func (k *Kernel) runDocumentImageSubagent(ctx context.Context, invocationID, use
 	}
 	result := trimModalFallbackText(builder.String())
 	if result == "" {
+		slog.Warn("文档图片子Agent模型返回空结果",
+			"invocation_id", strings.TrimSpace(invocationID),
+			"document", documentName,
+			"locator", image.Locator,
+			"provider_id", resolved.Provider.ID,
+			"model_id", resolved.Model.ID,
+			"duration_ms", time.Since(startedAt).Milliseconds(),
+		)
 		return "", errors.New("视觉子 Agent 未返回文字")
 	}
 
@@ -179,6 +209,7 @@ func (k *Kernel) runDocumentImageSubagent(ctx context.Context, invocationID, use
 		"locator", image.Locator,
 		"provider_id", resolved.Provider.ID,
 		"model_id", resolved.Model.ID,
+		"duration_ms", time.Since(startedAt).Milliseconds(),
 		"prompt", prompt,
 		"response", result,
 	)

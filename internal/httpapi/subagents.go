@@ -102,8 +102,8 @@ type builtInSubAgentGroupResponse struct {
 	Results []agentruntime.BuiltInSubAgentTaskResult `json:"results"`
 }
 
-// runBuiltInSubAgentGroup 暴露受限的内置文本子 Agent 编排入口。HTTP 层只
-// 负责解码和返回结果，实际 profile、并发、超时、Prompt 大小和模型权限校验由 Runtime 完成。
+// runBuiltInSubAgentGroup 保留给旧嵌入方编译兼容；生产 HTTP 路由已移除，
+// 防止外部请求绕过通用子 Agent 工具边界，继续创建按职责 profile 的旧任务。
 func (s *Server) runBuiltInSubAgentGroup(writer http.ResponseWriter, request *http.Request) {
 	runtime, err := s.requireRuntime()
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"Abot/internal/provider"
 
 	adkmodel "google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/tool"
 	"google.golang.org/genai"
 )
 
@@ -41,6 +42,27 @@ type DocumentImageAnalysisResult struct {
 // 通过接口隔离后，Kernel 不需要依赖 Runtime 包，也方便测试时替换为确定性实现。
 type DocumentImageSubagentRunner interface {
 	AnalyzeDocumentImages(context.Context, DocumentImageAnalysisRequest) ([]DocumentImageAnalysisResult, error)
+}
+
+// SubAgentRequest 是主 Agent 启动通用子 Agent 的边界请求。Tools 由主 Agent
+// 先按当前权限筛选，子 Agent 只能在这个集合内工作；Images 只在当前调用栈中传递。
+// 请求不包含独立超时，取消和最终生命周期完全由父 Invocation 的 Context 管理。
+type SubAgentRequest struct {
+	InvocationID   string
+	ParentNodeID   string
+	UserID         string
+	ConversationID string
+	Purpose        string
+	Prompt         string
+	Runtime        RuntimeOptions
+	Tools          []tool.Tool
+	Images         []document.Image
+}
+
+// SubAgentRunner 是 Runtime 与 Kernel 之间的通用子 Agent 执行边界。
+// Runtime 负责持久化、租约和状态；Kernel 负责使用已配置的内置模型执行。
+type SubAgentRunner interface {
+	RunSubAgent(context.Context, SubAgentRequest) (string, error)
 }
 
 const builtInSubAgentOutputTokens = 1536
@@ -203,4 +225,35 @@ func (k *Kernel) documentImageRunner() DocumentImageSubagentRunner {
 	k.locksMu.Lock()
 	defer k.locksMu.Unlock()
 	return k.documentImageSubagentRunner
+}
+
+// SetSubAgentRunner 安装通用子 Agent 的 Runtime 编排器。安装只改变依赖引用，
+// 不会启动任务，避免 Kernel 初始化阶段意外触发模型调用。
+func (k *Kernel) SetSubAgentRunner(runner SubAgentRunner) {
+	if k == nil {
+		return
+	}
+	k.locksMu.Lock()
+	k.subAgentRunner = runner
+	registry := k.toolRegistry
+	k.locksMu.Unlock()
+	if runner == nil || registry == nil {
+		return
+	}
+	// 提前登记固定 schema，保证主模型是否支持工具调用、会话开关或恢复时机
+	// 的差异不会改变 Runtime Tool Catalog revision；实际执行闭包仍在每轮 Run
+	// 中按当前父 Invocation 重新绑定。
+	placeholder, err := newRunSubAgentTool(runner, SubAgentRequest{}, nil)
+	if err == nil {
+		_ = registry.RegisterRuntimeTools([]tool.Tool{placeholder}, ToolSourceBuiltin)
+	}
+}
+
+func (k *Kernel) genericSubAgentRunner() SubAgentRunner {
+	if k == nil {
+		return nil
+	}
+	k.locksMu.Lock()
+	defer k.locksMu.Unlock()
+	return k.subAgentRunner
 }

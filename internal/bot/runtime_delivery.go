@@ -739,16 +739,11 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 		baseCtx = context.Background()
 	}
 	if interval <= 0 {
-		interval = 30 * time.Second
+		interval = defaultBotProgressInterval
 	}
 	go func() {
-		// 排队等待不计入执行超时；只有真正开始运行后才启动定时器。
-		var executionTimer *time.Timer
-		defer func() {
-			if executionTimer != nil {
-				executionTimer.Stop()
-			}
-		}()
+		var lastProgressAt time.Time
+		var executionStartedAt time.Time
 		backlog, live, unsubscribe, err := coordinator.Subscribe(baseCtx, invocationID, 0)
 		if err != nil {
 			m.clearActiveInvocation(message, invocationID)
@@ -819,11 +814,6 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 			switch event.Type {
 			case agentruntime.EventInvocationStarted:
 				m.setActiveInvocation(message, invocationID)
-				if timeout > 0 && executionTimer == nil {
-					executionTimer = time.AfterFunc(timeout, func() {
-						_, _ = coordinator.CancelInvocation(context.Background(), invocationID)
-					})
-				}
 			case agentruntime.EventAssistantMessage:
 				if text := eventString(event.Data, "text"); text != "" {
 					sentResponse = true
@@ -882,7 +872,13 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 				return
 			}
 		}
-		ticker := time.NewTicker(interval)
+		// 用较短的检查周期配合运行时长判断，避免任务刚从队列开始就因为
+		// 订阅已经存在了五分钟而立即发送“处理中”；实际提示仍按 interval 间隔。
+		progressCheckInterval := 30 * time.Second
+		if interval < progressCheckInterval {
+			progressCheckInterval = interval
+		}
+		ticker := time.NewTicker(progressCheckInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -892,10 +888,17 @@ func (m *Manager) observeInvocation(message Message, chatKey, invocationID strin
 				if !ok || process(event) {
 					return
 				}
-			case <-ticker.C:
-				// 队列中未开始的消息不定期刷屏，也不提前触发超时。
+			case now := <-ticker.C:
+				// 队列中未开始的消息不刷屏；若恢复订阅时已经错过 Started 事件，
+				// 从首次确认运行的时刻计时，宁可晚提示也不能过早提示。
 				if current, getErr := coordinator.GetInvocation(baseCtx, invocationID); getErr == nil && current.Status != agentruntime.InvocationQueued {
-					_ = m.send(baseCtx, message, "任务仍在处理中，请稍候。")
+					if executionStartedAt.IsZero() {
+						executionStartedAt = now
+					}
+					if now.Sub(executionStartedAt) >= interval && (lastProgressAt.IsZero() || now.Sub(lastProgressAt) >= interval) {
+						_ = m.send(baseCtx, message, "任务仍在处理中，请稍候。")
+						lastProgressAt = now
+					}
 				}
 			}
 		}

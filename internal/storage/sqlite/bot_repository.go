@@ -13,14 +13,16 @@ import (
 
 // botRow 保存平台连接配置；Token 保留在数据库和进程内，公开 API 只返回是否已配置。
 type botRow struct {
-	ID               string `gorm:"primaryKey;size:64"`
-	Name             string `gorm:"size:200;not null"`
-	Type             string `gorm:"size:32;not null"`
-	Endpoint         string `gorm:"size:1000"`
-	OneBotMode       string `gorm:"size:32"`
-	ListenHost       string `gorm:"size:255"`
-	ListenPort       int
-	ListenPath       string `gorm:"size:500"`
+	ID         string `gorm:"primaryKey;size:64"`
+	Name       string `gorm:"size:200;not null"`
+	Type       string `gorm:"size:32;not null"`
+	Endpoint   string `gorm:"size:1000"`
+	OneBotMode string `gorm:"size:32"`
+	ListenHost string `gorm:"size:255"`
+	ListenPort int
+	ListenPath string `gorm:"size:500"`
+	// OneBotFileRoot 保存当前机器人对应的附件宿主机目录；空值表示使用兼容兜底路径。
+	OneBotFileRoot   string `gorm:"size:2000"`
 	GroupTriggerMode string `gorm:"size:16"`
 	// AdminUserIDsJSON stores the global administrators of this bot. It is a
 	// JSON array so an existing row needs no migration step.
@@ -93,7 +95,7 @@ func (r *botRepository) Get(ctx context.Context, id string) (bot.Bot, error) {
 func (r *botRepository) Save(ctx context.Context, item bot.Bot) error {
 	row := botRow{
 		ID: item.ID, Name: item.Name, Type: string(item.Type), Endpoint: item.Endpoint,
-		OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath,
+		OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath, OneBotFileRoot: item.OneBotFileRoot,
 		GroupTriggerMode: item.GroupTriggerMode,
 		AdminUserIDsJSON: marshalBotAdminIDs(item.AdminUserIDs),
 		TelegramToken:    item.TelegramToken, OneBotAccessToken: item.OneBotAccessToken,
@@ -239,7 +241,7 @@ func (r *botRepository) ListMessageSources(ctx context.Context, query string) ([
 func botFromRow(row botRow) bot.Bot {
 	return bot.Bot{
 		ID: row.ID, Name: row.Name, Type: bot.Type(row.Type), Endpoint: row.Endpoint,
-		OneBotMode: row.OneBotMode, ListenHost: row.ListenHost, ListenPort: row.ListenPort, ListenPath: row.ListenPath,
+		OneBotMode: row.OneBotMode, ListenHost: row.ListenHost, ListenPort: row.ListenPort, ListenPath: row.ListenPath, OneBotFileRoot: row.OneBotFileRoot,
 		GroupTriggerMode: row.GroupTriggerMode,
 		AdminUserIDs:     unmarshalBotAdminIDs(row.AdminUserIDsJSON),
 		TelegramToken:    row.TelegramToken, OneBotAccessToken: row.OneBotAccessToken,

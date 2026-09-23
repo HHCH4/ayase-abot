@@ -11,6 +11,7 @@ import (
 	"iter"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -231,8 +232,19 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 		if document.IsDocumentData(ref.Name, ref.MIMEType, data) {
 			// PDF、Word、Excel 等格式通常不能直接作为通用模型的 file 输入；
 			// 在 provider 边界转换为带来源定位的文本，原始 Artifact 仍保持不变。
-			parsed, parseErr := document.Parse(ctx, ref.Name, ref.MIMEType, data)
+			parseStartedAt := time.Now()
+			parseMode := "full"
+			var parsed document.Result
+			var parseErr error
+			// 页数问题使用只读页树快速路径，避免为了一个数字逐页提取正文和图片。
+			if document.IsPageCountQuery(query) && document.DetectDocumentKind(ref.Name, ref.MIMEType, data) == "pdf" {
+				parseMode = "page_metadata"
+				parsed, parseErr = document.ParsePageMetadata(ctx, ref.Name, ref.MIMEType, data)
+			} else {
+				parsed, parseErr = document.Parse(ctx, ref.Name, ref.MIMEType, data)
+			}
 			if parseErr != nil {
+				slog.Warn("文档附件解析失败", "name", ref.Name, "mime_type", ref.MIMEType, "input_bytes", len(data), "duration_ms", time.Since(parseStartedAt).Milliseconds(), "error", parseErr)
 				return nil, fmt.Errorf("附件 %s 解析被取消: %w", safeAttachmentLabel(ref.Name), parseErr)
 			}
 			rendered, truncated := parsed.Render(query, document.DefaultRenderBytes)
@@ -240,12 +252,17 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 				"name", ref.Name,
 				"mime_type", ref.MIMEType,
 				"kind", parsed.Kind,
+				"parse_mode", parseMode,
 				"parsed", parsed.Parsed,
+				"input_bytes", len(data),
+				"duration_ms", time.Since(parseStartedAt).Milliseconds(),
+				"page_count", parsed.PageCount,
 				"blocks", len(parsed.Blocks),
+				"images", len(parsed.Images),
 				"truncated", truncated,
 				"warnings", parsed.Warnings,
 			)
-			if len(parsed.Images) > 0 && m.runtime.SubAgentsEnabled() && m.documentImageSubagentRunner != nil {
+			if len(parsed.Images) > 0 && parsed.NeedsImageAnalysis(query) && m.runtime.SubAgentsEnabled() && m.documentImageSubagentRunner != nil {
 				results, analyzeErr := m.documentImageSubagentRunner.AnalyzeDocumentImages(ctx, DocumentImageAnalysisRequest{
 					InvocationID: m.invocationID,
 					UserID:       m.userID,
@@ -256,10 +273,14 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 					Runtime:      m.runtime,
 				})
 				if analyzeErr != nil {
+					slog.Warn("文档图片子Agent调用失败", "name", ref.Name, "images", len(parsed.Images), "query", query, "error", analyzeErr)
 					rendered += "\n[图片解析提示] 视觉子 Agent 执行失败：" + limitAttachmentText(analyzeErr.Error(), 2048)
 				} else {
 					rendered += renderDocumentImageAnalysis(results)
 				}
+			} else if len(parsed.Images) > 0 {
+				// 只问页数等结构元数据时，解析结果已经足够回答，避免无意义地启动视觉模型。
+				slog.Info("文档图片子Agent已跳过", "name", ref.Name, "query", query, "images", len(parsed.Images), "reason", "当前问题不需要图片内容或子Agent不可用")
 			}
 			copyContent.Parts = append(copyContent.Parts, genai.NewPartFromText(text+"\n\n"+rendered))
 			continue

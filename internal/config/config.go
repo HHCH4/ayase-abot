@@ -111,6 +111,21 @@ type SubAgentProfileSettings struct {
 	FailurePolicy     string   `json:"failure_policy,omitempty"`
 }
 
+// SubAgentSettings 是统一的通用子 Agent 配置。它只描述模型、预算和允许的只读
+// 工具，不描述职责类型，也不包含子 Agent 总超时；总生命周期由父 Invocation 管理。
+type SubAgentSettings struct {
+	ProviderID        string   `json:"provider_id,omitempty"`
+	ModelID           string   `json:"model_id,omitempty"`
+	ReasoningEffort   string   `json:"reasoning_effort,omitempty"`
+	Temperature       *float64 `json:"temperature,omitempty"`
+	TopP              *float64 `json:"top_p,omitempty"`
+	MaxOutputTokens   int      `json:"max_output_tokens,omitempty"`
+	MaxConcurrency    int      `json:"max_concurrency,omitempty"`
+	InputBudgetBytes  int      `json:"input_budget_bytes,omitempty"`
+	OutputBudgetBytes int      `json:"output_budget_bytes,omitempty"`
+	AllowedTools      []string `json:"allowed_tools,omitempty"`
+}
+
 // SubAgentProfileDescriptor 是 WebUI 用来解释 profile 职责的稳定目录。
 // 目录只描述本项目内置的受控职责，不允许通过配置动态加载外部 Agent。
 type SubAgentProfileDescriptor struct {
@@ -175,6 +190,8 @@ type SystemSettings struct {
 	// SubAgentProfiles 是每种受控子 Agent 的独立路由、思考强度和预算设置。
 	// 未配置的 profile 继承当前主 Agent 配置；配置只允许使用上面的稳定目录。
 	SubAgentProfiles map[string]SubAgentProfileSettings `json:"subagent_profiles"`
+	// SubAgent 是新版本唯一使用的通用子 Agent 配置；旧 profiles 仅为历史兼容保留。
+	SubAgent SubAgentSettings `json:"subagent"`
 }
 
 // IsSubAgentEnabled returns the effective system default, preserving the
@@ -1086,6 +1103,7 @@ func normalizeSystemSettings(settings SystemSettings) SystemSettings {
 		settings.SubAgentEnabled = &enabled
 	}
 	settings.SubAgentProfiles = normalizeSubAgentProfiles(settings.SubAgentProfiles)
+	settings.SubAgent = normalizeSubAgentSettings(settings.SubAgent)
 	if settings.RequestTimeoutSeconds == 0 {
 		settings.RequestTimeoutSeconds = 300
 	}
@@ -1100,6 +1118,45 @@ func normalizeSystemSettings(settings SystemSettings) SystemSettings {
 		settings.ArtifactInputRetentionSeconds = DefaultArtifactInputRetentionSeconds
 	}
 	return settings
+}
+
+// normalizeSubAgentSettings 只做稳定化，不补入会改变语义的模型或超时默认值；
+// 空模型表示沿用主 Agent，空工具白名单表示由主 Agent 当前只读工具集合决定。
+func normalizeSubAgentSettings(value SubAgentSettings) SubAgentSettings {
+	value.ProviderID = strings.TrimSpace(value.ProviderID)
+	value.ModelID = strings.TrimSpace(value.ModelID)
+	value.ReasoningEffort = strings.ToLower(strings.TrimSpace(value.ReasoningEffort))
+	if value.Temperature != nil {
+		number := *value.Temperature
+		value.Temperature = &number
+	}
+	if value.TopP != nil {
+		number := *value.TopP
+		value.TopP = &number
+	}
+	value.AllowedTools = normalizeStringList(value.AllowedTools, 64)
+	return value
+}
+
+func normalizeStringList(values []string, limit int) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, item := range values {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, exists := seen[item]; exists {
+			continue
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+		if limit > 0 && len(result) >= limit {
+			break
+		}
+	}
+	sort.Strings(result)
+	return result
 }
 
 func normalizeSubAgentProfiles(values map[string]SubAgentProfileSettings) map[string]SubAgentProfileSettings {
@@ -1155,6 +1212,52 @@ func validateSystemSettings(settings SystemSettings) error {
 	}
 	if err := validateSubAgentProfiles(settings.SubAgentProfiles); err != nil {
 		return err
+	}
+	if err := validateSubAgentSettings(settings.SubAgent); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateSubAgentSettings(value SubAgentSettings) error {
+	for key, item := range map[string]string{
+		"subagent.provider_id": value.ProviderID,
+		"subagent.model_id":    value.ModelID,
+	} {
+		if len(item) > 128 {
+			return fmt.Errorf("%w: 通用子 Agent 设置 %s 长度不能超过 128 个字符", ErrInvalidRequest, key)
+		}
+	}
+	switch value.ReasoningEffort {
+	case "", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+	default:
+		return fmt.Errorf("%w: 通用子 Agent 的思考强度无效", ErrInvalidRequest)
+	}
+	if value.Temperature != nil && (*value.Temperature < 0 || *value.Temperature > 2 || math.IsNaN(*value.Temperature) || math.IsInf(*value.Temperature, 0)) {
+		return fmt.Errorf("%w: 通用子 Agent 的 temperature 必须在 0-2 之间", ErrInvalidRequest)
+	}
+	if value.TopP != nil && (*value.TopP < 0.01 || *value.TopP > 1 || math.IsNaN(*value.TopP) || math.IsInf(*value.TopP, 0)) {
+		return fmt.Errorf("%w: 通用子 Agent 的 top_p 必须在 0.01-1 之间", ErrInvalidRequest)
+	}
+	if value.MaxOutputTokens < 0 || value.MaxOutputTokens > 32768 {
+		return fmt.Errorf("%w: 通用子 Agent 的最大输出 token 必须在 0-32768 之间", ErrInvalidRequest)
+	}
+	if value.MaxConcurrency < 0 || value.MaxConcurrency > 4 {
+		return fmt.Errorf("%w: 通用子 Agent 的并发数必须在 0-4 之间", ErrInvalidRequest)
+	}
+	if value.InputBudgetBytes < 0 || value.InputBudgetBytes > 512<<10 {
+		return fmt.Errorf("%w: 通用子 Agent 的输入预算必须在 0-524288 字节之间", ErrInvalidRequest)
+	}
+	if value.OutputBudgetBytes < 0 || value.OutputBudgetBytes > 32<<10 {
+		return fmt.Errorf("%w: 通用子 Agent 的输出预算必须在 0-32768 字节之间", ErrInvalidRequest)
+	}
+	if len(value.AllowedTools) > 64 {
+		return fmt.Errorf("%w: 通用子 Agent 的工具白名单不能超过 64 个", ErrInvalidRequest)
+	}
+	for _, name := range value.AllowedTools {
+		if len(name) > 128 {
+			return fmt.Errorf("%w: 通用子 Agent 工具名称长度不能超过 128 个字符", ErrInvalidRequest)
+		}
 	}
 	return nil
 }

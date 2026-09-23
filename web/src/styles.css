@@ -203,7 +203,7 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .subagent-settings-panel { display: grid; gap: 12px; margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--line-soft); }
 .subagent-profile-card { display: grid; gap: 16px; padding: 16px; border: 1px solid var(--line-soft); border-radius: 12px; background: #fff; }
 .subagent-profile-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }.subagent-profile-heading > div { display: grid; gap: 5px; }.subagent-profile-heading span { color: var(--muted); font-size: 12px; line-height: 1.55; }.subagent-profile-heading code { color: var(--muted); font-size: 11px; }
-.subagent-profile-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }.subagent-control { display: grid; gap: 6px; min-width: 0; color: var(--muted); font-size: 12px; }.subagent-control .n-input-number, .subagent-control .n-select { width: 100%; }
+.subagent-profile-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }.subagent-control { display: grid; gap: 6px; min-width: 0; color: var(--muted); font-size: 12px; }.subagent-control .n-input-number, .subagent-control .n-select { width: 100%; }.subagent-control-wide { grid-column: 1 / -1; }
 
 .workspace-card { min-height: 210px; }.workspace-root { margin: 18px 0 9px; padding: 13px 14px; overflow: hidden; border-radius: 11px; background: var(--surface-soft); color: #6b7280; font-family: monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }.workspace-root span { color: #9aa0aa; }
 .workspace-conversations { display: grid; gap: 5px; margin-top: 14px; padding-top: 12px; border-top: 1px solid #eef0f2; }

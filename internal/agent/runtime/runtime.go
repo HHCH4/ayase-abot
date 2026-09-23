@@ -1293,6 +1293,10 @@ type InstructionSnapshotValidator func(context.Context, string) error
 // trust boundary by accident.
 type InstructionSnapshotReconfirmer func(context.Context, string) (InstructionSnapshotSet, error)
 
+// InvocationTimeoutResolver 为已接受的父 Invocation 提供唯一总生命周期。
+// 子 Agent 不再单独读取或创建超时，只继承该 Context。
+type InvocationTimeoutResolver func(context.Context, Invocation) (time.Duration, error)
+
 // Coordinator executes tasks on an application-owned context. It never uses a
 // request context for the actual Agent run, so a browser disconnect does not
 // cancel the model/tool loop.
@@ -1328,6 +1332,7 @@ type Coordinator struct {
 	instructionReconfirmer          InstructionSnapshotReconfirmer
 	baselineResolver                WorktreeBaselineResolver
 	operationResolver               WorkspaceOperationResolver
+	invocationTimeoutResolver       InvocationTimeoutResolver
 	approvalTTL                     time.Duration
 	expiryOnce                      sync.Once
 	resumeOutboxOnce                sync.Once
@@ -1459,6 +1464,39 @@ func (c *Coordinator) SetWorkspaceOperationResolver(resolver WorkspaceOperationR
 	c.mu.Lock()
 	c.operationResolver = resolver
 	c.mu.Unlock()
+}
+
+// SetInvocationTimeoutResolver 安装父任务总超时解析器。解析失败时保持原有
+// 无额外超时行为，并把错误交给调用方的配置日志处理，避免配置中心短暂故障
+// 反而立即中断已经接受的任务。
+func (c *Coordinator) SetInvocationTimeoutResolver(resolver InvocationTimeoutResolver) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.invocationTimeoutResolver = resolver
+	c.mu.Unlock()
+}
+
+func (c *Coordinator) withInvocationTimeout(ctx context.Context, invocationID string) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.Lock()
+	resolver := c.invocationTimeoutResolver
+	c.mu.Unlock()
+	if resolver == nil {
+		return ctx, func() {}
+	}
+	item, err := c.repo.GetInvocation(ctx, strings.TrimSpace(invocationID))
+	if err != nil {
+		return ctx, func() {}
+	}
+	timeout, err := resolver(ctx, item)
+	if err != nil || timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // SetRuntimeEventOutboxHandler enables optional asynchronous delivery of the
@@ -1683,6 +1721,10 @@ func NewCoordinator(kernel *agent.Kernel, repo Repository) (*Coordinator, error)
 	coordinator.subagents = subagents
 	subagents.SetEventSink(coordinator.appendAndPublish)
 	subagents.SetBuiltInTextRunner(kernel)
+	// 新执行路径统一由通用子 Agent 管理器记录生命周期，再由 Kernel 使用内置
+	// Provider 执行；旧文本/图片接口仅保留给历史兼容调用方。
+	subagents.SetGenericRunner(kernel)
+	kernel.SetSubAgentRunner(subagents)
 	kernel.SetDocumentImageSubagentRunner(subagents)
 	kernel.SetToolBudgetObserver(func(ctx context.Context, invocationID string, used, limit int) {
 		if strings.TrimSpace(invocationID) == "" {
@@ -7265,7 +7307,9 @@ func (c *Coordinator) launch(id string, request agent.ChatRequest) {
 			}
 			c.mu.Unlock()
 		}()
-		c.run(ctx, id, request)
+		runCtx, release := c.withInvocationTimeout(ctx, id)
+		defer release()
+		c.run(runCtx, id, request)
 	}()
 }
 
@@ -7373,7 +7417,11 @@ func (c *Coordinator) run(ctx context.Context, id string, request agent.ChatRequ
 				return
 			}
 			if ctx.Err() != nil {
-				c.finish(context.WithoutCancel(baseCtx), id, InvocationCancelled, ctx.Err().Error())
+				status := InvocationCancelled
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					status = InvocationExpired
+				}
+				c.finish(context.WithoutCancel(baseCtx), id, status, ctx.Err().Error())
 				return
 			}
 			var budgetErr *agent.ContextBudgetError

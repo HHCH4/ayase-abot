@@ -111,6 +111,8 @@ export interface Bot {
   listen_host?: string
   listen_port?: number
   listen_path?: string
+  /** NapCat 容器附件目录映射到宿主机后的根路径。 */
+  onebot_file_root?: string
   group_trigger_mode?: 'mention' | 'all' | string
   /** 聊天指令的全局管理员；只能在 WebUI 配置，聊天中无法授予。 */
   admin_user_ids?: string[]
@@ -678,6 +680,7 @@ export interface SystemSettings {
   modal_fallback_audio_model: string
   subagent_enabled: boolean
   subagent_profiles: Record<string, SubAgentProfileSettings>
+  subagent: SubAgentSettings
 }
 
 export interface SubAgentProfileSettings {
@@ -691,6 +694,19 @@ export interface SubAgentProfileSettings {
   max_concurrency?: number
   output_budget_bytes?: number
   failure_policy?: string
+}
+
+export interface SubAgentSettings {
+  provider_id?: string
+  model_id?: string
+  reasoning_effort?: string
+  temperature?: number | null
+  top_p?: number | null
+  max_output_tokens?: number
+  max_concurrency?: number
+  input_budget_bytes?: number
+  output_budget_bytes?: number
+  allowed_tools?: string[]
 }
 
 export interface SubAgentProfileDescriptor {

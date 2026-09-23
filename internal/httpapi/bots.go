@@ -11,15 +11,18 @@ import (
 )
 
 type botPayload struct {
-	ID               string   `json:"id"`
-	Name             string   `json:"name"`
-	Type             bot.Type `json:"type"`
-	Endpoint         string   `json:"endpoint"`
-	OneBotMode       string   `json:"onebot_mode"`
-	ListenHost       string   `json:"listen_host"`
-	ListenPort       int      `json:"listen_port"`
-	ListenPath       string   `json:"listen_path"`
-	GroupTriggerMode string   `json:"group_trigger_mode"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Type       bot.Type `json:"type"`
+	Endpoint   string   `json:"endpoint"`
+	OneBotMode string   `json:"onebot_mode"`
+	ListenHost string   `json:"listen_host"`
+	ListenPort int      `json:"listen_port"`
+	ListenPath string   `json:"listen_path"`
+	// OneBotFileRoot 使用指针区分“未提交”与“明确清空”，避免旧客户端的部分更新
+	// 意外覆盖已经配置好的附件宿主机目录。
+	OneBotFileRoot   *string `json:"onebot_file_root"`
+	GroupTriggerMode string  `json:"group_trigger_mode"`
 	// AdminUserIDs is the root of trust for chat commands. It is accepted only
 	// here (the WebUI), never from a chat message.
 	AdminUserIDs      *[]string `json:"admin_user_ids"`
@@ -37,6 +40,7 @@ type botView struct {
 	ListenHost              string     `json:"listen_host,omitempty"`
 	ListenPort              int        `json:"listen_port,omitempty"`
 	ListenPath              string     `json:"listen_path,omitempty"`
+	OneBotFileRoot          string     `json:"onebot_file_root,omitempty"`
 	GroupTriggerMode        string     `json:"group_trigger_mode,omitempty"`
 	AdminUserIDs            []string   `json:"admin_user_ids,omitempty"`
 	TelegramTokenConfigured bool       `json:"telegram_token_configured"`
@@ -135,13 +139,14 @@ func (s *Server) saveBot(writer http.ResponseWriter, request *http.Request, path
 	}
 	if haveOld && payload.Type == bot.TypeOneBot11 && old.Type == bot.TypeOneBot11 &&
 		strings.TrimSpace(payload.OneBotMode) == "" && strings.TrimSpace(payload.Endpoint) == "" &&
-		strings.TrimSpace(payload.ListenHost) == "" && payload.ListenPort == 0 && strings.TrimSpace(payload.ListenPath) == "" {
+		strings.TrimSpace(payload.ListenHost) == "" && payload.ListenPort == 0 && strings.TrimSpace(payload.ListenPath) == "" && payload.OneBotFileRoot == nil {
 		// 兼容旧客户端直接提交部分更新：未带新字段时保留原来的 OneBot 连接参数。
 		payload.Endpoint = old.Endpoint
 		payload.OneBotMode = old.OneBotMode
 		payload.ListenHost = old.ListenHost
 		payload.ListenPort = old.ListenPort
 		payload.ListenPath = old.ListenPath
+		payload.OneBotFileRoot = stringPointer(old.OneBotFileRoot)
 	}
 	if haveOld && strings.TrimSpace(payload.GroupTriggerMode) == "" {
 		payload.GroupTriggerMode = old.GroupTriggerMode
@@ -156,8 +161,14 @@ func (s *Server) saveBot(writer http.ResponseWriter, request *http.Request, path
 	if payload.AdminUserIDs != nil {
 		adminUserIDs = normalizeAdminUserIDs(*payload.AdminUserIDs)
 	}
+	fileRoot := ""
+	if payload.OneBotFileRoot != nil {
+		fileRoot = strings.TrimSpace(*payload.OneBotFileRoot)
+	} else if haveOld {
+		fileRoot = old.OneBotFileRoot
+	}
 	item, err := service.Save(request.Context(), bot.SaveRequest{
-		Bot:           bot.Bot{ID: payload.ID, Name: payload.Name, Type: payload.Type, Endpoint: payload.Endpoint, OneBotMode: payload.OneBotMode, ListenHost: payload.ListenHost, ListenPort: payload.ListenPort, ListenPath: payload.ListenPath, GroupTriggerMode: payload.GroupTriggerMode, AdminUserIDs: adminUserIDs, Enabled: enabled},
+		Bot:           bot.Bot{ID: payload.ID, Name: payload.Name, Type: payload.Type, Endpoint: payload.Endpoint, OneBotMode: payload.OneBotMode, ListenHost: payload.ListenHost, ListenPort: payload.ListenPort, ListenPath: payload.ListenPath, OneBotFileRoot: fileRoot, GroupTriggerMode: payload.GroupTriggerMode, AdminUserIDs: adminUserIDs, Enabled: enabled},
 		TelegramToken: payload.TelegramToken, OneBotAccessToken: payload.OneBotAccessToken,
 	})
 	if err != nil {
@@ -206,6 +217,9 @@ func (s *Server) previewBotTest(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	item := bot.Bot{ID: payload.ID, Name: payload.Name, Type: payload.Type, Endpoint: payload.Endpoint, OneBotMode: payload.OneBotMode, ListenHost: payload.ListenHost, ListenPort: payload.ListenPort, ListenPath: payload.ListenPath, GroupTriggerMode: payload.GroupTriggerMode}
+	if payload.OneBotFileRoot != nil {
+		item.OneBotFileRoot = strings.TrimSpace(*payload.OneBotFileRoot)
+	}
 	if payload.TelegramToken != nil {
 		item.TelegramToken = strings.TrimSpace(*payload.TelegramToken)
 	}
@@ -291,12 +305,17 @@ func (s *Server) restartBot(writer http.ResponseWriter, request *http.Request) {
 
 func publicBot(item bot.Bot) botView {
 	return botView{
-		ID: item.ID, Name: item.Name, Type: item.Type, Endpoint: item.Endpoint, OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath, GroupTriggerMode: item.GroupTriggerMode, AdminUserIDs: item.AdminUserIDs,
+		ID: item.ID, Name: item.Name, Type: item.Type, Endpoint: item.Endpoint, OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath, OneBotFileRoot: item.OneBotFileRoot, GroupTriggerMode: item.GroupTriggerMode, AdminUserIDs: item.AdminUserIDs,
 		TelegramTokenConfigured: strings.TrimSpace(item.TelegramToken) != "",
 		OneBotTokenConfigured:   strings.TrimSpace(item.OneBotAccessToken) != "",
 		Enabled:                 item.Enabled, Status: item.Status, StatusMessage: item.StatusMessage,
 		LastCheckedAt: item.LastCheckedAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 	}
+}
+
+// stringPointer 将旧配置复制到兼容性更新字段，明确表达“继续使用原值”。
+func stringPointer(value string) *string {
+	return &value
 }
 
 // normalizeAdminUserIDs keeps the administrator list bounded, deduplicated and

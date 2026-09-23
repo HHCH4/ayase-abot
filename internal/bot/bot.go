@@ -47,6 +47,9 @@ const (
 	DefaultOneBotListenHost = "0.0.0.0"
 	DefaultOneBotListenPort = 6199
 	DefaultOneBotListenPath = "/ws"
+	// defaultBotProgressInterval 控制平台侧“任务仍在处理中”提示的最短间隔，
+	// 避免模型或文档解析只运行几十秒就向聊天窗口重复发等待消息。
+	defaultBotProgressInterval = 5 * time.Minute
 )
 
 // Status 是机器人连接实例状态。
@@ -63,14 +66,17 @@ const (
 
 // Bot 是机器人连接配置和运行状态。秘密字段只在进程内部使用，API 层不会直接序列化它。
 type Bot struct {
-	ID               string `json:"id"`
-	Name             string `json:"name"`
-	Type             Type   `json:"type"`
-	Endpoint         string `json:"endpoint,omitempty"` // 正向 WS 客户端模式的目标地址，保留用于兼容旧配置。
-	OneBotMode       string `json:"onebot_mode,omitempty"`
-	ListenHost       string `json:"listen_host,omitempty"`
-	ListenPort       int    `json:"listen_port,omitempty"`
-	ListenPath       string `json:"listen_path,omitempty"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Type       Type   `json:"type"`
+	Endpoint   string `json:"endpoint,omitempty"` // 正向 WS 客户端模式的目标地址，保留用于兼容旧配置。
+	OneBotMode string `json:"onebot_mode,omitempty"`
+	ListenHost string `json:"listen_host,omitempty"`
+	ListenPort int    `json:"listen_port,omitempty"`
+	ListenPath string `json:"listen_path,omitempty"`
+	// OneBotFileRoot 是宿主机上对应 OneBot 容器附件目录的根路径；它属于
+	// 当前机器人实例，供 file_id 解析时把容器路径映射回宿主机文件。
+	OneBotFileRoot   string `json:"onebot_file_root,omitempty"`
 	GroupTriggerMode string `json:"group_trigger_mode,omitempty"`
 	// AdminUserIDs are the global administrators of this bot. They are the root
 	// of trust for chat commands and can only be edited from the WebUI, never
@@ -324,7 +330,7 @@ type Manager struct {
 	activeConversations map[string]string
 	activeInvocations   map[string]string
 	observedInvocations map[string]struct{}
-	observedOrder []string
+	observedOrder       []string
 	pendingApprovals    map[string][]approvalTicket
 	pendingUserInputs   map[string][]userInputTicket
 	progressInterval    time.Duration
@@ -384,7 +390,7 @@ func NewManager(ctx context.Context, repository Repository, kernel *agent.Kernel
 		bus: eventbus.New(), bots: make(map[string]Bot), runtimes: make(map[string]runtimeEntry),
 		locks: make(map[string]*sync.Mutex), baseCtx: ctx,
 		activeConversations: make(map[string]string), activeInvocations: make(map[string]string), observedInvocations: make(map[string]struct{}), pendingApprovals: make(map[string][]approvalTicket), pendingUserInputs: make(map[string][]userInputTicket),
-		progressInterval: 30 * time.Second,
+		progressInterval: defaultBotProgressInterval,
 		commands:         commands,
 		sourceNames:      make(map[string]string),
 		groupHistory:     make(map[string][]string),
@@ -439,8 +445,7 @@ func (m *Manager) SetAttachmentStorer(storer AttachmentStorer) {
 	m.mu.Unlock()
 }
 
-// SetProgressInterval is primarily useful to embedders and deterministic
-// tests; production defaults to one visible heartbeat every 30 seconds.
+// SetProgressInterval 主要供嵌入方和确定性测试调整进度提示；生产默认至少等待五分钟。
 func (m *Manager) SetProgressInterval(interval time.Duration) {
 	m.mu.Lock()
 	if interval > 0 {
@@ -512,6 +517,7 @@ func (m *Manager) Save(ctx context.Context, request SaveRequest) (Bot, error) {
 	candidate.ID = strings.TrimSpace(candidate.ID)
 	candidate.Name = strings.TrimSpace(candidate.Name)
 	candidate.Endpoint = strings.TrimSpace(candidate.Endpoint)
+	candidate.OneBotFileRoot = strings.TrimSpace(candidate.OneBotFileRoot)
 	candidate.GroupTriggerMode = strings.ToLower(strings.TrimSpace(candidate.GroupTriggerMode))
 	old, oldErr := m.Get(candidate.ID)
 	if request.TelegramToken != nil {

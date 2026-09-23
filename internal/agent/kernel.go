@@ -369,6 +369,22 @@ type SubAgentProfileOptions struct {
 	FailurePolicy     string
 }
 
+// SubAgentOptions 是唯一的通用子 Agent 运行配置。子 Agent 不再按文档、检索、研究
+// 等职责拆分模型配置；职责由父 Agent 通过 Prompt 和工具组合决定，生命周期由父任务
+// Context 决定，因此这里故意没有 timeout 字段。
+type SubAgentOptions struct {
+	ProviderID        string
+	ModelID           string
+	ReasoningEffort   string
+	Temperature       *float64
+	TopP              *float64
+	MaxOutputTokens   int
+	MaxConcurrency    int
+	InputBudgetBytes  int
+	OutputBudgetBytes int
+	AllowedTools      []string
+}
+
 // RuntimeOptions 是配置中心解析后的 Agent 运行参数。零值只适合作为 Resolver 的错误返回，不代表完整配置。
 type RuntimeOptions struct {
 	AIEnabled bool
@@ -410,6 +426,8 @@ type RuntimeOptions struct {
 	ModalFallbackVisionModel      string
 	ModalFallbackAudioModel       string
 	SubAgentProfiles              map[string]SubAgentProfileOptions
+	// SubAgent 是新执行路径使用的单一通用子 Agent 配置；Profiles 仅为旧配置兼容保留。
+	SubAgent SubAgentOptions
 }
 
 // SubAgentsEnabled returns the effective master switch. RuntimeOptions is also
@@ -512,6 +530,7 @@ type Kernel struct {
 	attachmentResolver            AttachmentResolver
 	attachmentListResolver        AttachmentListResolver
 	documentImageSubagentRunner   DocumentImageSubagentRunner
+	subAgentRunner                SubAgentRunner
 	modalFallbackUsageObserver    ModalFallbackUsageObserver
 	modalFallbackOutputObserver   ModalFallbackOutputObserver
 	defaultRuntime                RuntimeOptions
@@ -1226,6 +1245,7 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 		var workspaceToolsForRegistry []tool.Tool
 		var memoryToolsForRegistry []tool.Tool
 		var sessionAttachmentToolsForRegistry []tool.Tool
+		var subAgentToolsForRegistry []tool.Tool
 		if workspaceID != "" {
 			if !runtime.WorkspaceEnabled {
 				yield(nil, errors.New("当前配置已停用项目能力"))
@@ -1316,6 +1336,23 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 		if resolved.Model.Capabilities != nil {
 			profile = provider.NormalizeCapabilityProfile(*resolved.Model.Capabilities)
 		}
+		// 子 Agent 只能由主 Agent 显式调用；只有主模型确认支持工具调用时
+		// 才公开入口，避免启用子 Agent 后让纯文本模型整轮请求失败。
+		if !request.Proactive && runtime.SubAgentsEnabled() && (profile.ToolCalling.State == provider.SupportSupported || profile.ToolCalling.State == provider.SupportDegraded) {
+			if runner := k.genericSubAgentRunner(); runner != nil {
+				childTools := k.prepareSubAgentTools(tools, runtime.SubAgent.AllowedTools)
+				subAgentTool, toolErr := newRunSubAgentTool(runner, SubAgentRequest{
+					InvocationID: request.InvocationID, UserID: request.UserID, ConversationID: request.ConversationID,
+					Runtime: runtime,
+				}, childTools)
+				if toolErr != nil {
+					yield(nil, fmt.Errorf("创建通用子 Agent 工具失败: %w", toolErr))
+					return
+				}
+				subAgentToolsForRegistry = append(subAgentToolsForRegistry, subAgentTool)
+				tools = append(tools, subAgentTool)
+			}
+		}
 		if err := k.applyModalFallback(ctx, &request, resolved, profile, runtime); err != nil {
 			yield(nil, fmt.Errorf("处理多模态附件失败: %w", err))
 			return
@@ -1362,6 +1399,10 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 			}
 			if err := toolRegistry.RegisterRuntimeTools(sessionAttachmentToolsForRegistry, ToolSourceBuiltin); err != nil {
 				yield(nil, fmt.Errorf("注册会话附件工具失败: %w", err))
+				return
+			}
+			if err := toolRegistry.RegisterRuntimeTools(subAgentToolsForRegistry, ToolSourceBuiltin); err != nil {
+				yield(nil, fmt.Errorf("注册通用子 Agent 工具失败: %w", err))
 				return
 			}
 			maxSchemaTokens := runtime.ToolSchemaBudgetTokens
@@ -1848,6 +1889,21 @@ func (k *Kernel) warmRuntimeToolCatalog(ctx context.Context, runtime RuntimeOpti
 		}
 		if err := registry.RegisterRuntimeTools([]tool.Tool{attachmentTool}, ToolSourceBuiltin); err != nil {
 			return fmt.Errorf("注册会话附件工具失败: %w", err)
+		}
+	}
+	// Resume 前的 Runtime 快照必须看到和真实 Run 相同的子 Agent 工具目录，
+	// 否则首次运行保存的 catalog revision 会在恢复时被误判为配置变化。
+	if runner := k.genericSubAgentRunner(); runner != nil {
+		// 目录只需要固定的 schema 和 revision；是否把工具实际交给主模型，
+		// 仍由 Run 根据主模型能力和会话开关决定。
+		placeholder, toolErr := newRunSubAgentTool(runner, SubAgentRequest{
+			InvocationID: strings.TrimSpace(invocationID), UserID: strings.TrimSpace(userID), ConversationID: strings.TrimSpace(conversationID), Runtime: runtime,
+		}, nil)
+		if toolErr != nil {
+			return fmt.Errorf("创建通用子 Agent 快照工具失败: %w", toolErr)
+		}
+		if err := registry.RegisterRuntimeTools([]tool.Tool{placeholder}, ToolSourceBuiltin); err != nil {
+			return fmt.Errorf("注册通用子 Agent 快照工具失败: %w", err)
 		}
 	}
 	return nil

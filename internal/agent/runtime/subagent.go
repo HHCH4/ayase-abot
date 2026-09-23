@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -16,11 +17,14 @@ import (
 	"Abot/internal/agent"
 )
 
-// SubAgentProfile 标识子 Agent 的职责边界。Profile 不是模型名称，模型仍由
-// Kernel 的内置 Provider Registry 解析，避免把供应商配置泄漏到任务编排层。
+// SubAgentProfile 是持久化记录中的兼容标签。新执行链路统一使用 generic，
+// 具体职责由父 Agent 的 Prompt 和只读工具组合决定，而不是由标签拆分模型类型。
 type SubAgentProfile string
 
 const (
+	// SubAgentProfileGeneric 是新执行路径唯一使用的 profile。旧 profile 常量仅
+	// 为历史记录和兼容接口保留，不再决定模型、工具或生命周期。
+	SubAgentProfileGeneric            SubAgentProfile = "generic"
 	SubAgentProfileDocumentImage      SubAgentProfile = "document_image"
 	SubAgentProfileMemoryRetrieval    SubAgentProfile = "memory_retrieval"
 	SubAgentProfileKnowledgeRetrieval SubAgentProfile = "knowledge_retrieval"
@@ -94,6 +98,10 @@ const (
 	maxDocumentImageBytes    = 8 << 20
 	maxDocumentImageTotal    = 24 << 20
 	maxRetrievalCacheEntries = 256
+	// defaultDocumentImageTimeoutSeconds 给文档图片分析留下完整的模型调用窗口；
+	// 主任务仍会根据自己的 deadline 再为后续汇总保留安全余量。
+	defaultDocumentImageTimeoutSeconds = 300
+	documentImageParentReserve         = 30 * time.Second
 	// MaxSubAgentListLimit 给恢复和清理流程一个统一的分页上限；HTTP 展示层
 	// 可以继续使用更小的页面大小，避免一次返回过多运行记录。
 	MaxSubAgentListLimit = 256
@@ -247,6 +255,12 @@ type SubAgentRepository interface {
 	TransitionSubAgentRun(context.Context, string, SubAgentRunStatus, SubAgentRunStatus, string, time.Time) (bool, error)
 }
 
+// SubAgentLeaseRepository 只负责延长执行租约，不代表子 Agent 的总执行时限。
+// 父 Context 取消后，租约会停止续期并由完成状态收口。
+type SubAgentLeaseRepository interface {
+	RenewSubAgentRunLease(context.Context, string, string, time.Time, time.Duration) (bool, error)
+}
+
 // SubAgentEvidenceRepository 持久化有界证据摘要，来源正文仍由各领域服务保留。
 type SubAgentEvidenceRepository interface {
 	SaveSubAgentEvidence(context.Context, string, []EvidenceItem) error
@@ -257,6 +271,12 @@ type SubAgentEvidenceRepository interface {
 // 运行中任务、父任务关联和最近的审计摘要不会被定时清理。
 type SubAgentCleanupRepository interface {
 	PruneSubAgentRecords(context.Context, time.Time, int) (int, error)
+}
+
+// SubAgentLegacyCleanupRepository 只删除本次架构切换前的非 generic 子 Agent
+// 运行记录；它不触碰主 Invocation、会话消息、附件或当前 generic 记录。
+type SubAgentLegacyCleanupRepository interface {
+	PurgeLegacySubAgentRecords(context.Context) (int, error)
 }
 
 // RetrievalAdapter 是一个可插拔、可审计的检索来源。适配器不得绕过用户、会话
@@ -328,11 +348,12 @@ type BuiltInSubAgentTaskResult struct {
 // SubAgentManager 管理所有通用子 Agent。它不依赖外部 Agent 服务，执行实际由
 // 注入的 Kernel 回调或领域检索适配器完成。
 type SubAgentManager struct {
-	repo         Repository
-	subRepo      SubAgentRepository
-	evidenceRepo SubAgentEvidenceRepository
-	imageRunner  DocumentImageRunner
-	textRunner   agent.BuiltInSubAgentRunner
+	repo          Repository
+	subRepo       SubAgentRepository
+	evidenceRepo  SubAgentEvidenceRepository
+	imageRunner   DocumentImageRunner
+	textRunner    agent.BuiltInSubAgentRunner
+	genericRunner agent.SubAgentRunner
 
 	mu        sync.Mutex
 	adapters  map[string]RetrievalAdapter
@@ -397,6 +418,17 @@ func (m *SubAgentManager) SetBuiltInTextRunner(runner agent.BuiltInSubAgentRunne
 	}
 	m.mu.Lock()
 	m.textRunner = runner
+	m.mu.Unlock()
+}
+
+// SetGenericRunner 安装统一的 Kernel 执行器。所有新子 Agent（包括文档图片分析）
+// 都通过这一条边界执行，Runtime 只负责状态、租约和父子关联。
+func (m *SubAgentManager) SetGenericRunner(runner agent.SubAgentRunner) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.genericRunner = runner
 	m.mu.Unlock()
 }
 
@@ -502,11 +534,20 @@ func normalizeSubAgentGroup(group SubAgentGroup, now time.Time) (SubAgentGroup, 
 	if group.MaxConcurrency > maxSubAgentConcurrency {
 		return SubAgentGroup{}, fmt.Errorf("%w: 子 Agent 并发数超出上限", ErrConflict)
 	}
-	if group.TimeoutSeconds <= 0 {
-		group.TimeoutSeconds = 120
-	}
-	if group.TimeoutSeconds > 300 {
-		return SubAgentGroup{}, fmt.Errorf("%w: 子 Agent 超时超出 5 分钟上限", ErrConflict)
+	if group.Profile == SubAgentProfileGeneric {
+		// 通用子 Agent 不设置自身总超时；它只能继承父 Invocation Context。
+		if group.TimeoutSeconds < 0 {
+			return SubAgentGroup{}, fmt.Errorf("%w: 通用子 Agent timeout 不能为负数", ErrConflict)
+		}
+		group.TimeoutSeconds = 0
+		group.DeadlineAt = time.Time{}
+	} else {
+		if group.TimeoutSeconds <= 0 {
+			group.TimeoutSeconds = 120
+		}
+		if group.TimeoutSeconds > 300 {
+			return SubAgentGroup{}, fmt.Errorf("%w: 子 Agent 超时超出 5 分钟上限", ErrConflict)
+		}
 	}
 	if group.OutputBudgetBytes <= 0 {
 		group.OutputBudgetBytes = maxSubAgentGroupOutput
@@ -535,7 +576,7 @@ func normalizeSubAgentGroup(group SubAgentGroup, now time.Time) (SubAgentGroup, 
 	if group.StartedAt.IsZero() && group.Status == SubAgentGroupRunning {
 		group.StartedAt = now
 	}
-	if group.DeadlineAt.IsZero() && group.Status == SubAgentGroupRunning {
+	if group.Profile != SubAgentProfileGeneric && group.DeadlineAt.IsZero() && group.Status == SubAgentGroupRunning {
 		group.DeadlineAt = now.Add(time.Duration(group.TimeoutSeconds) * time.Second)
 	}
 	group.SourceKinds = normalizeStringSlice(group.SourceKinds, maxRetrievalSources)
@@ -574,7 +615,7 @@ func ValidSubAgentRunStatus(status SubAgentRunStatus) bool { return validSubAgen
 
 func validSubAgentProfile(profile SubAgentProfile) bool {
 	switch profile {
-	case SubAgentProfileDocumentImage, SubAgentProfileMemoryRetrieval, SubAgentProfileKnowledgeRetrieval,
+	case SubAgentProfileGeneric, SubAgentProfileDocumentImage, SubAgentProfileMemoryRetrieval, SubAgentProfileKnowledgeRetrieval,
 		SubAgentProfileConversationSearch, SubAgentProfileWebResearch, SubAgentProfileWorkspaceSearch,
 		SubAgentProfileStructuredQuery, SubAgentProfileRetrievalAggregate, SubAgentProfileResearch,
 		SubAgentProfileWorkspaceReview, SubAgentProfileWorkspaceChange, SubAgentProfileVerification:
@@ -795,6 +836,8 @@ func (m *SubAgentManager) AnalyzeDocumentImages(ctx context.Context, request age
 	}
 	m.mu.Lock()
 	closed := m.closed
+	genericRunner := m.genericRunner
+	imageRunner := m.imageRunner
 	m.mu.Unlock()
 	if closed {
 		return nil, ErrConflict
@@ -802,7 +845,7 @@ func (m *SubAgentManager) AnalyzeDocumentImages(ctx context.Context, request age
 	if len(request.Images) == 0 || len(request.Images) > 32 {
 		return nil, fmt.Errorf("文档图片数量必须在 1 到 32 之间")
 	}
-	if m.imageRunner == nil {
+	if genericRunner == nil && imageRunner == nil {
 		return nil, errors.New("视觉子 Agent 未装配")
 	}
 	if ctx == nil {
@@ -835,24 +878,50 @@ func (m *SubAgentManager) AnalyzeDocumentImages(ctx context.Context, request age
 		}
 	}
 	profileOptions, _ := request.Runtime.SubAgentProfile(string(SubAgentProfileDocumentImage))
-	maxConcurrency := profileOptions.MaxConcurrency
+	maxConcurrency := request.Runtime.SubAgent.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = profileOptions.MaxConcurrency
+	}
 	if maxConcurrency <= 0 {
 		maxConcurrency = 2
 	}
-	timeoutSeconds := profileOptions.TimeoutSeconds
-	if timeoutSeconds <= 0 {
-		timeoutSeconds = 120
+	configuredTimeoutSeconds := profileOptions.TimeoutSeconds
+	timeoutSeconds := configuredTimeoutSeconds
+	if genericRunner == nil {
+		if timeoutSeconds <= 0 {
+			timeoutSeconds = defaultDocumentImageTimeoutSeconds
+		}
+		// 旧版兼容 profile 仍保留原有限时；新通用子 Agent 不走这里。
+		timeoutSeconds = boundDocumentImageTimeout(ctx, timeoutSeconds)
+	} else {
+		timeoutSeconds = 0
 	}
-	outputBudgetBytes := profileOptions.OutputBudgetBytes
+	outputBudgetBytes := request.Runtime.SubAgent.OutputBudgetBytes
 	if outputBudgetBytes <= 0 {
-		outputBudgetBytes = maxSubAgentGroupOutput
+		outputBudgetBytes = profileOptions.OutputBudgetBytes
+	}
+	if outputBudgetBytes <= 0 {
+		if genericRunner != nil {
+			// 通用子 Agent 的单次输出、持久化结果和父模型回填都使用同一
+			// 个 32 KiB 上限；旧 profile 批处理继续保留组级预算兼容性。
+			outputBudgetBytes = maxSubAgentOutputBytes
+		} else {
+			outputBudgetBytes = maxSubAgentGroupOutput
+		}
+	}
+	if genericRunner != nil && outputBudgetBytes > maxSubAgentOutputBytes {
+		return nil, fmt.Errorf("通用子 Agent 输出预算不能超过 %d 字节", maxSubAgentOutputBytes)
 	}
 	failurePolicy := SubAgentFailurePolicy(profileOptions.FailurePolicy)
 	if failurePolicy == "" {
 		failurePolicy = SubAgentFailureContinue
 	}
+	profile := SubAgentProfileDocumentImage
+	if genericRunner != nil {
+		profile = SubAgentProfileGeneric
+	}
 	group := SubAgentGroup{
-		ID: newID("subagent-group"), InvocationID: strings.TrimSpace(request.InvocationID), Profile: SubAgentProfileDocumentImage,
+		ID: newID("subagent-group"), InvocationID: strings.TrimSpace(request.InvocationID), Profile: profile,
 		Purpose: "解析文档内嵌图片并返回事实摘要", FailurePolicy: failurePolicy, ExpectedCount: len(request.Images),
 		MaxConcurrency: maxConcurrency, TimeoutSeconds: timeoutSeconds, OutputBudgetBytes: outputBudgetBytes, ImageBudgetBytes: totalImageBytes,
 	}
@@ -860,7 +929,7 @@ func (m *SubAgentManager) AnalyzeDocumentImages(ctx context.Context, request age
 	for index, image := range request.Images {
 		run := SubAgentRun{
 			ID: newID("subagent-run"), GroupID: group.ID, InvocationID: group.InvocationID, Ordinal: index,
-			Profile: SubAgentProfileDocumentImage, Status: SubAgentRunQueued,
+			Profile: profile, Status: SubAgentRunQueued,
 			InputMetadata: map[string]any{"document": strings.TrimSpace(request.DocumentName), "locator": strings.TrimSpace(image.Locator), "mime_type": strings.TrimSpace(image.MIMEType), "image_bytes": len(image.Data)},
 		}
 		normalized, normalizeErr := normalizeSubAgentRun(run, now)
@@ -878,17 +947,43 @@ func (m *SubAgentManager) AnalyzeDocumentImages(ctx context.Context, request age
 	}
 	group.Status = SubAgentGroupRunning
 	group.StartedAt = now
-	group.DeadlineAt = now.Add(time.Duration(group.TimeoutSeconds) * time.Second)
+	if group.TimeoutSeconds > 0 {
+		group.DeadlineAt = now.Add(time.Duration(group.TimeoutSeconds) * time.Second)
+	}
 	group.QueuedCount = len(runs)
 	group.UpdatedAt = now
 	if err := m.subRepo.UpdateSubAgentGroup(ctx, group); err != nil {
 		return nil, err
 	}
+	providerID, modelID := documentImageRoute(request, profileOptions)
+	if genericRunner != nil {
+		providerID = strings.TrimSpace(request.Runtime.SubAgent.ProviderID)
+		if providerID == "" {
+			providerID = strings.TrimSpace(request.Runtime.ProviderID)
+		}
+		modelID = strings.TrimSpace(request.Runtime.SubAgent.ModelID)
+		if modelID == "" {
+			modelID = strings.TrimSpace(request.Runtime.ModelID)
+		}
+	}
+	slog.Info("文档图片子Agent组已启动",
+		"invocation_id", group.InvocationID,
+		"group_id", group.ID,
+		"document", request.DocumentName,
+		"query", request.Query,
+		"image_count", len(request.Images),
+		"image_bytes", totalImageBytes,
+		"provider_id", providerID,
+		"model_id", modelID,
+		"configured_timeout_seconds", configuredTimeoutSeconds,
+		"timeout_seconds", group.TimeoutSeconds,
+		"max_concurrency", group.MaxConcurrency,
+	)
 	groupCtx, release := m.startGroup(group.ID, ctx, group.TimeoutSeconds)
 	defer release()
 	m.emit(ctx, group.InvocationID, EventSubAgentRequested, map[string]any{"group_id": group.ID, "profile": group.Profile, "count": len(runs)})
 	m.emit(ctx, group.InvocationID, EventSubAgentQueued, map[string]any{"group_id": group.ID, "profile": group.Profile, "count": len(runs)})
-	if group.InvocationID != "" {
+	if genericRunner == nil && group.InvocationID != "" {
 		m.markInvocationWaiting(ctx, group.InvocationID, group.ID)
 	}
 
@@ -926,5 +1021,75 @@ func (m *SubAgentManager) AnalyzeDocumentImages(ctx context.Context, request age
 	workers.Wait()
 	m.finishGroup(groupCtx, group, runs, results)
 	m.clearGroup(group.ID)
+	completedCount := 0
+	failedCount := 0
+	for _, result := range results {
+		if strings.TrimSpace(result.Error) == "" && strings.TrimSpace(result.Text) != "" {
+			completedCount++
+		} else {
+			failedCount++
+		}
+	}
+	status := string(SubAgentGroupCompleted)
+	if groupCtx.Err() != nil {
+		status = string(SubAgentGroupExpired)
+	} else if failedCount > 0 {
+		status = string(SubAgentGroupPartial)
+	}
+	slog.Info("文档图片子Agent组已结束",
+		"invocation_id", group.InvocationID,
+		"group_id", group.ID,
+		"document", request.DocumentName,
+		"status", status,
+		"completed", completedCount,
+		"failed", failedCount,
+		"timeout_seconds", group.TimeoutSeconds,
+		"context_error", contextErrorText(groupCtx.Err()),
+	)
 	return results, nil
+}
+
+// boundDocumentImageTimeout 将图片分析的独立预算限制在主请求剩余时间内，
+// 同时为主 Agent 的最终汇总保留固定余量，防止子 Agent 成功后主任务反而超时。
+func boundDocumentImageTimeout(ctx context.Context, configured int) int {
+	if configured <= 0 {
+		configured = defaultDocumentImageTimeoutSeconds
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline) - documentImageParentReserve
+		available := int(remaining / time.Second)
+		if available < 1 {
+			available = 1
+		}
+		if available < configured {
+			configured = available
+		}
+	}
+	return configured
+}
+
+// documentImageRoute 只生成可观测的路由元数据，不把图片内容写入日志或持久化记录。
+func documentImageRoute(request agent.DocumentImageAnalysisRequest, profile agent.SubAgentProfileOptions) (string, string) {
+	providerID := strings.TrimSpace(profile.ProviderID)
+	if providerID == "" {
+		providerID = strings.TrimSpace(request.Runtime.ModalFallbackProviderID)
+	}
+	if providerID == "" {
+		providerID = strings.TrimSpace(request.Primary.Provider.ID)
+	}
+	modelID := strings.TrimSpace(profile.ModelID)
+	if modelID == "" {
+		modelID = strings.TrimSpace(request.Runtime.ModalFallbackVisionModel)
+	}
+	if modelID == "" {
+		modelID = strings.TrimSpace(request.Primary.Model.ID)
+	}
+	return providerID, modelID
+}
+
+func contextErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

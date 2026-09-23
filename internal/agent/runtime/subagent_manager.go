@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -18,10 +19,12 @@ func (m *SubAgentManager) startGroup(groupID string, parent context.Context, tim
 	if parent == nil {
 		parent = context.Background()
 	}
-	if timeoutSeconds <= 0 {
-		timeoutSeconds = 120
+	// timeoutSeconds 只服务旧版固定 profile。通用子 Agent 传 0，表示不创建
+	// 独立总超时；它只能继承父 Invocation 的 Context。
+	groupCtx, cancel := context.WithCancel(parent)
+	if timeoutSeconds > 0 {
+		groupCtx, cancel = context.WithTimeout(parent, time.Duration(timeoutSeconds)*time.Second)
 	}
-	groupCtx, cancel := context.WithTimeout(parent, time.Duration(timeoutSeconds)*time.Second)
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -85,11 +88,16 @@ func (m *SubAgentManager) markInvocationRunning(ctx context.Context, invocationI
 
 func (m *SubAgentManager) runDocumentImage(ctx context.Context, group SubAgentGroup, run SubAgentRun, request agent.DocumentImageAnalysisRequest, image document.Image) agent.DocumentImageAnalysisResult {
 	result := agent.DocumentImageAnalysisResult{Locator: image.Locator}
+	startedAt := time.Now()
 	if err := ctx.Err(); err != nil {
 		status := subAgentContextTerminalStatus(err)
 		_, _ = m.subRepo.TransitionSubAgentRun(context.WithoutCancel(ctx), run.ID, SubAgentRunQueued, status, err.Error(), time.Now().UTC())
 		result.Error = boundedSubAgentError(err)
 		m.emitContextTerminal(group.InvocationID, group.ID, run.ID, status, result.Error)
+		slog.Warn("文档图片子Agent未开始",
+			"invocation_id", group.InvocationID, "group_id", group.ID, "run_id", run.ID,
+			"locator", image.Locator, "status", status, "error", result.Error,
+		)
 		return result
 	}
 	owner := newID("subagent-worker")
@@ -97,12 +105,27 @@ func (m *SubAgentManager) runDocumentImage(ctx context.Context, group SubAgentGr
 	claimed, ok, err := m.subRepo.ClaimSubAgentRun(ctx, run.ID, owner, now, maxSubAgentLease)
 	if err != nil {
 		result.Error = boundedSubAgentError(err)
+		slog.Warn("文档图片子Agent取得租约失败",
+			"invocation_id", group.InvocationID, "group_id", group.ID, "run_id", run.ID,
+			"locator", image.Locator, "duration_ms", time.Since(startedAt).Milliseconds(), "error", result.Error,
+		)
 		return result
 	}
 	if !ok {
 		result.Error = "子 Agent run 未能取得执行租约"
+		slog.Warn("文档图片子Agent未取得执行租约",
+			"invocation_id", group.InvocationID, "group_id", group.ID, "run_id", run.ID,
+			"locator", image.Locator, "duration_ms", time.Since(startedAt).Milliseconds(), "error", result.Error,
+		)
 		return result
 	}
+	stopRenew := m.startSubAgentLeaseRenewal(ctx, claimed.ID, owner)
+	defer stopRenew()
+	slog.Info("文档图片子Agent运行已开始",
+		"invocation_id", group.InvocationID, "group_id", group.ID, "run_id", claimed.ID,
+		"locator", image.Locator, "image_bytes", len(image.Data), "mime_type", image.MIMEType,
+		"timeout_seconds", group.TimeoutSeconds,
+	)
 	m.emit(ctx, group.InvocationID, EventSubAgentStarted, map[string]any{"group_id": group.ID, "run_id": claimed.ID, "profile": claimed.Profile, "ordinal": claimed.Ordinal})
 	if err := ctx.Err(); err != nil {
 		status := subAgentContextTerminalStatus(err)
@@ -112,7 +135,23 @@ func (m *SubAgentManager) runDocumentImage(ctx context.Context, group SubAgentGr
 		return result
 	}
 	request.Images = []document.Image{{Locator: image.Locator, Name: image.Name, MIMEType: image.MIMEType, Data: append([]byte(nil), image.Data...)}}
-	text, runErr := m.imageRunner(ctx, request)
+	var text string
+	var runErr error
+	m.mu.Lock()
+	genericRunner := m.genericRunner
+	imageRunner := m.imageRunner
+	m.mu.Unlock()
+	if genericRunner != nil {
+		text, runErr = genericRunner.RunSubAgent(ctx, agent.SubAgentRequest{
+			InvocationID: group.InvocationID, ParentNodeID: claimed.ID, UserID: request.UserID,
+			Purpose: "解析文档内嵌图片并返回有来源的事实摘要", Prompt: request.Query,
+			Runtime: request.Runtime, Images: []document.Image{{Locator: image.Locator, Name: image.Name, MIMEType: image.MIMEType, Data: append([]byte(nil), image.Data...)}},
+		})
+	} else if imageRunner != nil {
+		text, runErr = imageRunner(ctx, request)
+	} else {
+		runErr = errors.New("视觉子 Agent 未装配")
+	}
 	text = strings.TrimSpace(text)
 	if len(text) > maxSubAgentOutputBytes {
 		text = limitSubAgentText(text, maxSubAgentOutputBytes)
@@ -127,6 +166,10 @@ func (m *SubAgentManager) runDocumentImage(ctx context.Context, group SubAgentGr
 		m.emitContextTerminal(group.InvocationID, group.ID, claimed.ID, status, message)
 		m.emit(ctx, group.InvocationID, EventSubAgentFailed, map[string]any{"group_id": group.ID, "run_id": claimed.ID, "error": message, "locator": image.Locator})
 		result.Error = message
+		slog.Warn("文档图片子Agent运行失败",
+			"invocation_id", group.InvocationID, "group_id", group.ID, "run_id", claimed.ID,
+			"locator", image.Locator, "status", status, "duration_ms", time.Since(startedAt).Milliseconds(), "error", message,
+		)
 		return result
 	}
 	if text == "" {
@@ -134,6 +177,10 @@ func (m *SubAgentManager) runDocumentImage(ctx context.Context, group SubAgentGr
 		_, _ = m.subRepo.CompleteSubAgentRun(context.WithoutCancel(ctx), claimed.ID, owner, SubAgentRunFailed, "", "empty_result", message, time.Now().UTC())
 		m.emit(ctx, group.InvocationID, EventSubAgentFailed, map[string]any{"group_id": group.ID, "run_id": claimed.ID, "error": message, "locator": image.Locator})
 		result.Error = message
+		slog.Warn("文档图片子Agent返回空结果",
+			"invocation_id", group.InvocationID, "group_id", group.ID, "run_id", claimed.ID,
+			"locator", image.Locator, "duration_ms", time.Since(startedAt).Milliseconds(), "error", message,
+		)
 		return result
 	}
 	if completed, completeErr := m.subRepo.CompleteSubAgentRun(context.WithoutCancel(ctx), claimed.ID, owner, SubAgentRunCompleted, text, "", "", time.Now().UTC()); completeErr != nil || !completed {
@@ -144,9 +191,17 @@ func (m *SubAgentManager) runDocumentImage(ctx context.Context, group SubAgentGr
 		_, _ = m.subRepo.TransitionSubAgentRun(context.WithoutCancel(ctx), claimed.ID, SubAgentRunRunning, SubAgentRunFailed, message, time.Now().UTC())
 		m.emit(ctx, group.InvocationID, EventSubAgentFailed, map[string]any{"group_id": group.ID, "run_id": claimed.ID, "error": message, "locator": image.Locator})
 		result.Error = message
+		slog.Warn("文档图片子Agent完成确认失败",
+			"invocation_id", group.InvocationID, "group_id", group.ID, "run_id", claimed.ID,
+			"locator", image.Locator, "duration_ms", time.Since(startedAt).Milliseconds(), "error", message,
+		)
 		return result
 	}
 	m.emit(ctx, group.InvocationID, EventSubAgentCompleted, map[string]any{"group_id": group.ID, "run_id": claimed.ID, "locator": image.Locator, "result_digest": digestSubAgentText(text), "result_bytes": len([]byte(text))})
+	slog.Info("文档图片子Agent运行已完成",
+		"invocation_id", group.InvocationID, "group_id", group.ID, "run_id", claimed.ID,
+		"locator", image.Locator, "duration_ms", time.Since(startedAt).Milliseconds(), "result_bytes", len([]byte(text)),
+	)
 	result.Text = text
 	return result
 }

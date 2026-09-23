@@ -256,6 +256,46 @@ func (r *runtimeRepository) CreateSubAgentGroup(ctx context.Context, group agent
 	})
 }
 
+// PurgeLegacySubAgentRecords 删除架构切换前按 profile 记录的子 Agent 历史。
+// 删除范围只覆盖三张子 Agent 表，不会级联删除主任务、会话、消息或附件。
+func (r *runtimeRepository) PurgeLegacySubAgentRecords(ctx context.Context) (int, error) {
+	if r == nil {
+		return 0, nil
+	}
+	var groups []subAgentGroupRow
+	if err := r.db.WithContext(ctx).Where("profile <> ? OR profile = ''", string(agentruntime.SubAgentProfileGeneric)).Find(&groups).Error; err != nil {
+		return 0, err
+	}
+	if len(groups) == 0 {
+		return 0, nil
+	}
+	groupIDs := make([]string, 0, len(groups))
+	for _, group := range groups {
+		if strings.TrimSpace(group.ID) != "" {
+			groupIDs = append(groupIDs, group.ID)
+		}
+	}
+	if len(groupIDs) == 0 {
+		return 0, nil
+	}
+	deleted := 0
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("group_id IN ?", groupIDs).Delete(&subAgentEvidenceRow{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("group_id IN ?", groupIDs).Delete(&subAgentRunRow{}).Error; err != nil {
+			return err
+		}
+		result := tx.Where("id IN ?", groupIDs).Delete(&subAgentGroupRow{})
+		if result.Error != nil {
+			return result.Error
+		}
+		deleted = int(result.RowsAffected)
+		return nil
+	})
+	return deleted, err
+}
+
 func normalizeSubAgentGroupForSQLite(item agentruntime.SubAgentGroup, now time.Time) (agentruntime.SubAgentGroup, error) {
 	item.ID = strings.TrimSpace(item.ID)
 	item.InvocationID = strings.TrimSpace(item.InvocationID)
@@ -285,11 +325,20 @@ func normalizeSubAgentGroupForSQLite(item agentruntime.SubAgentGroup, now time.T
 	if item.MaxConcurrency > 4 {
 		return agentruntime.SubAgentGroup{}, agentruntime.ErrConflict
 	}
-	if item.TimeoutSeconds <= 0 {
-		item.TimeoutSeconds = 120
-	}
-	if item.TimeoutSeconds > 300 {
-		return agentruntime.SubAgentGroup{}, agentruntime.ErrConflict
+	if item.Profile == agentruntime.SubAgentProfileGeneric {
+		// 通用子 Agent 不拥有独立总超时，父 Invocation 的 Context 才是唯一生命周期。
+		if item.TimeoutSeconds < 0 {
+			return agentruntime.SubAgentGroup{}, agentruntime.ErrConflict
+		}
+		item.TimeoutSeconds = 0
+		item.DeadlineAt = time.Time{}
+	} else {
+		if item.TimeoutSeconds <= 0 {
+			item.TimeoutSeconds = 120
+		}
+		if item.TimeoutSeconds > 300 {
+			return agentruntime.SubAgentGroup{}, agentruntime.ErrConflict
+		}
 	}
 	if item.OutputBudgetBytes <= 0 {
 		item.OutputBudgetBytes = 128 << 10
@@ -303,7 +352,7 @@ func normalizeSubAgentGroupForSQLite(item agentruntime.SubAgentGroup, now time.T
 	if item.InputBudgetBytes < 0 || item.InputBudgetBytes > 512<<10 || item.ImageBudgetBytes < 0 || item.ImageBudgetBytes > 24<<20 {
 		return agentruntime.SubAgentGroup{}, agentruntime.ErrConflict
 	}
-	if item.DeadlineAt.IsZero() && item.Status == agentruntime.SubAgentGroupRunning {
+	if item.Profile != agentruntime.SubAgentProfileGeneric && item.DeadlineAt.IsZero() && item.Status == agentruntime.SubAgentGroupRunning {
 		item.DeadlineAt = now.Add(time.Duration(item.TimeoutSeconds) * time.Second)
 	}
 	return item, nil
@@ -491,6 +540,26 @@ func (r *runtimeRepository) ClaimSubAgentRun(ctx context.Context, id, owner stri
 		return nil
 	})
 	return result, claimed, err
+}
+
+// RenewSubAgentRunLease 延长通用子 Agent 的执行租约。租约用于故障恢复时避免
+// 重复执行，真正的总生命周期仍由父 Invocation Context 控制。
+func (r *runtimeRepository) RenewSubAgentRunLease(ctx context.Context, id, owner string, now time.Time, ttl time.Duration) (bool, error) {
+	if r == nil || strings.TrimSpace(id) == "" || strings.TrimSpace(owner) == "" || ttl <= 0 || ttl > 10*time.Minute {
+		return false, agentruntime.ErrConflict
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	result := r.db.WithContext(ctx).Model(&subAgentRunRow{}).Where("id = ? AND status = ? AND lease_owner = ? AND lease_expires_at > ?", strings.TrimSpace(id), string(agentruntime.SubAgentRunRunning), strings.TrimSpace(owner), now).Updates(map[string]any{
+		"lease_expires_at": now.Add(ttl), "updated_at": now,
+	})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
 }
 
 func (r *runtimeRepository) CompleteSubAgentRun(ctx context.Context, id, owner string, status agentruntime.SubAgentRunStatus, resultText, errorCode, message string, now time.Time) (bool, error) {

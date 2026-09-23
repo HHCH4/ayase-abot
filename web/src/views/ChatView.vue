@@ -182,6 +182,7 @@ function subAgentTagType(status?: string): 'default' | 'success' | 'warning' | '
 
 function subAgentProfileLabel(profile?: string) {
   const labels: Record<string, string> = {
+    generic: '通用子 Agent',
     document_image: '文档图片', memory_retrieval: '记忆检索', knowledge_retrieval: '知识检索',
     conversation_retrieval: '会话检索', web_research: '网络研究', workspace_search: '工作区检索',
     structured_query: '结构化查询', retrieval_aggregate: '检索汇总', research: '研究',

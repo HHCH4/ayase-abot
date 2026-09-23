@@ -570,7 +570,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/subagent-groups/{id}", s.getSubAgentGroup)
 	mux.HandleFunc("GET /api/v1/subagent-groups/{id}/evidence", s.listSubAgentEvidence)
 	mux.HandleFunc("POST /api/v1/runtime/retrieval", s.runRetrieval)
-	mux.HandleFunc("POST /api/v1/runtime/subagents", s.runBuiltInSubAgentGroup)
 	mux.HandleFunc("GET /api/v1/runtime/delivery-groups/{id}", s.getRuntimeDeliveryGroup)
 	mux.HandleFunc("GET /api/v1/runtime/config-directory/fanouts", s.listRuntimeConfigDirectoryFanouts)
 	mux.HandleFunc("GET /api/v1/runtime/config-directory/fanouts/{id}", s.getRuntimeConfigDirectoryFanout)

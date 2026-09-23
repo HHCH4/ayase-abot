@@ -76,10 +76,13 @@ type Image struct {
 // Result 是一次本地解析的结果。Blocks 是正文，Images 是待交给视觉子 Agent
 // 分析的内嵌图片；两者都不改变 Artifact 中的原始文件。
 type Result struct {
-	Name      string
-	MIMEType  string
-	Kind      string
-	Parsed    bool
+	Name     string
+	MIMEType string
+	Kind     string
+	Parsed   bool
+	// PageCount 保存 PDF 的真实页数；它与 Blocks 数量分开，避免扫描页或空页
+	// 因为没有可提取文字而被错误地计为不存在。
+	PageCount int
 	Truncated bool
 	Blocks    []Block
 	Images    []Image
@@ -141,6 +144,44 @@ func Parse(ctx context.Context, name, mimeType string, data []byte) (Result, err
 		result.addWarning("旧版 Office 二进制格式未接入本地解析器，请先转换为 .docx、.xlsx 或 PDF")
 	default:
 		result.addWarning("该附件类型没有可用的本地文档解析器")
+	}
+	return result, nil
+}
+
+// ParsePageMetadata 只读取 PDF 页树元数据，供“多少页/页数”这类问题走快速路径。
+// 这种问题不需要逐页提取正文，也不需要扫描内嵌图片，避免大 PDF 被无关解析拖住。
+func ParsePageMetadata(ctx context.Context, name, mimeType string, data []byte) (Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result := Result{Name: strings.TrimSpace(name), MIMEType: normalizeMIME(mimeType), Kind: documentKind(name, mimeType)}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if len(data) > maxParseInputBytes {
+		result.addWarning("附件超过本地文档解析上限，未读取页数")
+		return result, nil
+	}
+	if len(data) == 0 {
+		result.addWarning("附件为空，未读取到页数")
+		return result, nil
+	}
+	if sniffed := sniffDocumentKind(data); sniffed != "" {
+		result.Kind = sniffed
+	}
+	if result.Kind != "pdf" {
+		// 非 PDF 没有统一的页树定义，回退到常规解析路径保持原有行为。
+		return Parse(ctx, name, mimeType, data)
+	}
+	reader, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		result.addWarning("PDF 读取失败：" + err.Error())
+		return result, nil
+	}
+	result.Parsed = true
+	result.PageCount = reader.NumPage()
+	if result.PageCount <= 0 {
+		result.addWarning("PDF 没有可读取的页面")
 	}
 	return result, nil
 }
@@ -281,6 +322,10 @@ func (r Result) Render(query string, maxBytes int) (string, bool) {
 
 	header := fmt.Sprintf("文件：%s（类型=%s，MIME=%s）\n", displayName(r.Name), r.Kind, displayName(r.MIMEType))
 	complete := write(header)
+	if r.PageCount > 0 {
+		// 把页数作为稳定的解析元数据直接交给主 Agent，页数问题不必等待视觉分析。
+		complete = complete && write(fmt.Sprintf("[文档元数据] PDF 共 %d 页。\n", r.PageCount))
+	}
 	blocks := r.Blocks
 	if matched := matchingBlocks(r.Blocks, query); len(matched) > 0 && len(matched) < len(r.Blocks) {
 		blocks = matched
@@ -316,6 +361,41 @@ func (r Result) Render(query string, maxBytes int) (string, bool) {
 		}
 	}
 	return output.String(), truncated
+}
+
+// NeedsImageAnalysis 判断当前问题是否确实需要读取文档内嵌图片。
+// 仅询问 PDF 页数、页码等结构元数据时，跳过视觉子 Agent 可以避免无意义的模型等待；
+// 一旦问题同时涉及正文、图片、表格或总结，仍然保留完整的图片分析路径。
+func (r Result) NeedsImageAnalysis(query string) bool {
+	if len(r.Images) == 0 {
+		return false
+	}
+	return !IsPageCountQuery(query)
+}
+
+// IsPageCountQuery 识别不需要正文或图片内容的页数问题。它只做保守匹配，
+// 同时出现“页数”和“内容/图片”等词时仍然返回 false，确保不会误跳过视觉分析。
+func IsPageCountQuery(query string) bool {
+	query = strings.TrimSpace(strings.ToLower(query))
+	if query == "" {
+		return false
+	}
+	pageQuestion := false
+	for _, marker := range []string{"多少页", "几页", "页数", "总页数", "页码", "多少张页面", "how many pages", "page count", "number of pages"} {
+		if strings.Contains(query, marker) {
+			pageQuestion = true
+			break
+		}
+	}
+	if !pageQuestion {
+		return false
+	}
+	for _, marker := range []string{"内容", "写了", "讲了", "介绍", "总结", "概括", "图片", "图表", "表格", "文字", "说明"} {
+		if strings.Contains(query, marker) {
+			return false
+		}
+	}
+	return true
 }
 
 // documentKind 仅依据文件元数据判断解析路线；具体解析时仍会检查 PDF 签名和 ZIP/XML 内容。
@@ -536,6 +616,7 @@ func parsePDF(ctx context.Context, data []byte, result *Result) {
 	}
 	result.Parsed = true
 	pageCount := reader.NumPage()
+	result.PageCount = pageCount
 	if pageCount <= 0 {
 		result.addWarning("PDF 没有可读取的页面")
 		extractPDFImages(ctx, data, result)
