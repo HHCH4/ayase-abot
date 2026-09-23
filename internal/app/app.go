@@ -507,9 +507,8 @@ func Run(opts bootstrap.Options) error {
 				MemoryEnabled: runtime.MemoryEnabled, MemoryAutoRetrieve: runtime.MemoryAutoRetrieve, MemoryMaxResults: runtime.MemoryMaxResults,
 				ModalFallbackEnabled: settings.ModalFallbackEnabled, ModalFallbackProviderID: settings.ModalFallbackProviderID,
 				ModalFallbackVisionModel: settings.ModalFallbackVisionModel, ModalFallbackAudioModel: settings.ModalFallbackAudioModel,
-				SubAgentEnabled:  &subAgentEnabledValue,
-				SubAgentProfiles: subAgentRuntimeProfiles(settings),
-				SubAgent:         subAgentRuntimeSettings(settings),
+				SubAgentEnabled: &subAgentEnabledValue,
+				SubAgent:        subAgentRuntimeSettings(settings),
 			}, nil
 		},
 		EnableCompaction: true,
@@ -526,11 +525,6 @@ func Run(opts bootstrap.Options) error {
 	}
 	// 新版只保留通用 generic 子 Agent；清理旧 profile 的编排历史，避免旧的
 	// 独立超时和职责标签继续影响管理台展示，但不触碰主任务或会话数据。
-	if deleted, cleanupErr := runtimeCoordinator.PurgeLegacySubAgentRecords(ctx); cleanupErr != nil {
-		slog.Warn("旧版子 Agent 历史清理失败", "error", cleanupErr)
-	} else if deleted > 0 {
-		slog.Info("旧版子 Agent 历史已清理", "groups_deleted", deleted)
-	}
 	// 父 Invocation 的总超时由配置中心统一决定；子 Agent 只继承这个 Context，
 	// 不再在子任务层设置 120/300 秒的独立截止时间。
 	runtimeCoordinator.SetInvocationTimeoutResolver(func(timeoutCtx context.Context, _ agentruntime.Invocation) (time.Duration, error) {
@@ -547,96 +541,6 @@ func Run(opts bootstrap.Options) error {
 		}
 		return runtimeCoordinator.CancelConversationInvocations(deleteCtx, userID, conversationID)
 	})
-	// 领域服务通过只读适配器接入通用检索层。适配器只返回有界证据摘要，
-	// 不把记忆、会话或工作区的底层仓储暴露给子 Agent。
-	if err := runtimeCoordinator.SetRetrievalAdapter(agentruntime.NewRetrievalAdapter("memory", func(retrieveCtx context.Context, request agentruntime.RetrievalRequest) ([]agentruntime.EvidenceItem, error) {
-		items, listErr := longMemory.List(retrieveCtx, request.UserID, request.Query, request.TopK)
-		if listErr != nil {
-			return nil, listErr
-		}
-		result := make([]agentruntime.EvidenceItem, 0, len(items))
-		for index, item := range items {
-			result = append(result, agentruntime.EvidenceItem{
-				SourceKind: "memory", SourceID: item.ID, SourceName: item.Source, Locator: "memory:" + item.ID,
-				Title: item.Tags, Excerpt: item.Content, RetrievalScore: 1 / float64(index+1), TrustLevel: "user_memory", Citation: "memory:" + item.ID,
-				Metadata: map[string]any{"conversation_id": item.ConversationID, "created_at": item.CreatedAt}, RetrievedAt: item.UpdatedAt,
-			})
-		}
-		return result, nil
-	})); err != nil {
-		return err
-	}
-	if err := runtimeCoordinator.SetRetrievalAdapter(agentruntime.NewRetrievalAdapter("conversation", func(retrieveCtx context.Context, request agentruntime.RetrievalRequest) ([]agentruntime.EvidenceItem, error) {
-		if strings.TrimSpace(request.ConversationID) == "" {
-			return nil, errors.New("会话检索必须指定 conversation_id")
-		}
-		conversationItem, conversationErr := conversationService.Get(retrieveCtx, request.UserID, request.ConversationID)
-		if conversationErr != nil {
-			return nil, conversationErr
-		}
-		messages, messagesErr := conversationService.Messages(retrieveCtx, request.UserID, request.ConversationID)
-		if messagesErr != nil {
-			return nil, messagesErr
-		}
-		query := strings.ToLower(strings.TrimSpace(request.Query))
-		result := make([]agentruntime.EvidenceItem, 0, len(messages))
-		for index, message := range messages {
-			if query != "" && !strings.Contains(strings.ToLower(message.Text), query) {
-				continue
-			}
-			result = append(result, agentruntime.EvidenceItem{
-				SourceKind: "conversation", SourceID: request.ConversationID, SourceName: message.Role,
-				Locator: fmt.Sprintf("message:%d", index+1), Excerpt: message.Text, RetrievalScore: 1 / float64(index+1),
-				TrustLevel: "conversation_context", Citation: request.ConversationID + "#" + fmt.Sprint(index+1),
-				Metadata: map[string]any{
-					"role": message.Role, "attachment_count": message.AttachmentCount,
-					"platform": conversationItem.Platform, "chat_type": conversationItem.ChatType,
-					"chat_id": conversationItem.ChatID, "source": conversationItem.Source,
-				}, RetrievedAt: message.Timestamp,
-			})
-			if len(result) >= request.TopK {
-				break
-			}
-		}
-		return result, nil
-	})); err != nil {
-		return err
-	}
-	if err := runtimeCoordinator.SetRetrievalAdapter(agentruntime.NewRetrievalAdapter("workspace", func(retrieveCtx context.Context, request agentruntime.RetrievalRequest) ([]agentruntime.EvidenceItem, error) {
-		if strings.TrimSpace(request.WorkspaceID) == "" {
-			return nil, errors.New("工作区检索必须指定 workspace_id")
-		}
-		relative := "."
-		if request.Scope != nil && strings.TrimSpace(request.Scope["path"]) != "" {
-			relative = strings.TrimSpace(request.Scope["path"])
-		}
-		matches, searchErr := workspaceService.SearchWithOptions(retrieveCtx, request.WorkspaceID, relative, request.Query, workspace.SearchOptions{Mode: workspace.SearchModeLiteral, ContextLines: 2, MaxHits: request.TopK})
-		if searchErr != nil {
-			return nil, searchErr
-		}
-		result := make([]agentruntime.EvidenceItem, 0, len(matches))
-		for index, match := range matches {
-			var builder strings.Builder
-			builder.WriteString(match.Preview)
-			for _, line := range match.ContextBefore {
-				builder.WriteString("\n")
-				builder.WriteString(line.Text)
-			}
-			for _, line := range match.ContextAfter {
-				builder.WriteString("\n")
-				builder.WriteString(line.Text)
-			}
-			result = append(result, agentruntime.EvidenceItem{
-				SourceKind: "workspace", SourceID: request.WorkspaceID, SourceName: match.Path,
-				Locator: fmt.Sprintf("%s:%d", match.Path, match.Line), Excerpt: builder.String(), RetrievalScore: 1 / float64(index+1),
-				TrustLevel: "workspace_read", Citation: fmt.Sprintf("%s:%d", match.Path, match.Line),
-				Metadata: map[string]any{"path": match.Path, "line": match.Line}, RetrievedAt: time.Now().UTC(),
-			})
-		}
-		return result, nil
-	})); err != nil {
-		return err
-	}
 	runtimeCoordinator.SetWorkspaceBaselineResolver(func(baselineCtx context.Context, workspaceID, targetPath string) (agentruntime.WorktreeBaseline, error) {
 		captured, captureErr := workspaceService.CaptureBaseline(baselineCtx, workspaceID)
 		if captureErr != nil {
@@ -706,7 +610,6 @@ func Run(opts bootstrap.Options) error {
 	// 启动维护只处理历史积压；定时循环负责后续过期附件和对象删除，避免
 	// 进程长期运行时原始文档一直占用磁盘。每轮都有独立超时，不阻塞关停。
 	go runArtifactMaintenanceLoop(ctx, artifactService)
-	go runSubAgentMaintenanceLoop(ctx, runtimeCoordinator)
 	if _, ok := runtimeRepo.(agentruntime.InstructionSnapshotRepository); ok {
 		runtimeCoordinator.SetInstructionSnapshotValidator(validateInstructionSnapshot)
 		runtimeCoordinator.SetInstructionSnapshotReconfirmer(reconfirmInstructionSnapshot)
@@ -1026,33 +929,6 @@ func runArtifactMaintenanceLoop(ctx context.Context, service *artifact.Service) 
 	}
 }
 
-// runSubAgentMaintenanceLoop 定期清理已经完成且超过保留期的子 Agent
-// 结果和证据摘要；活动任务永远不会被这个循环删除。
-func runSubAgentMaintenanceLoop(ctx context.Context, coordinator *agentruntime.Coordinator) {
-	if coordinator == nil {
-		return
-	}
-	ticker := time.NewTicker(10 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			maintenanceCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-			deleted, err := coordinator.PruneSubAgentRecords(maintenanceCtx, time.Now().UTC().Add(-30*24*time.Hour), 256)
-			cancel()
-			if err != nil {
-				slog.Warn("子 Agent 定时维护未完成", "error", err)
-				continue
-			}
-			if deleted > 0 {
-				slog.Info("子 Agent 定时维护完成", "groups_deleted", deleted)
-			}
-		}
-	}
-}
-
 func parseLevel(value string) slog.Level {
 	switch value {
 	case "debug":
@@ -1066,35 +942,7 @@ func parseLevel(value string) slog.Level {
 	}
 }
 
-// subAgentRuntimeProfiles 将系统设置转换为 Agent 内核使用的无秘密运行参数。
-// 配置层负责 profile 白名单和边界校验；这里仅复制值，避免运行时引用可变的
-// 配置对象或把系统设置类型泄漏到 Agent 包。
-func subAgentRuntimeProfiles(settings configsvc.SystemSettings) map[string]agent.SubAgentProfileOptions {
-	if len(settings.SubAgentProfiles) == 0 {
-		return nil
-	}
-	result := make(map[string]agent.SubAgentProfileOptions, len(settings.SubAgentProfiles))
-	for profile, value := range settings.SubAgentProfiles {
-		options := agent.SubAgentProfileOptions{
-			ProviderID: value.ProviderID, ModelID: value.ModelID, ReasoningEffort: value.ReasoningEffort,
-			MaxOutputTokens: value.MaxOutputTokens, TimeoutSeconds: value.TimeoutSeconds,
-			MaxConcurrency: value.MaxConcurrency, OutputBudgetBytes: value.OutputBudgetBytes,
-			FailurePolicy: value.FailurePolicy,
-		}
-		if value.Temperature != nil {
-			number := *value.Temperature
-			options.Temperature = &number
-		}
-		if value.TopP != nil {
-			number := *value.TopP
-			options.TopP = &number
-		}
-		result[profile] = options
-	}
-	return result
-}
-
-// subAgentRuntimeSettings 将统一子 Agent 配置复制为无秘密运行参数；允许的工具
+// subAgentRuntimeSettings 将唯一的通用子 Agent 配置复制为无秘密运行参数；允许的工具
 // 只作为候选白名单，Kernel 仍会在执行边界再次过滤写入和命令能力。
 func subAgentRuntimeSettings(settings configsvc.SystemSettings) agent.SubAgentOptions {
 	value := settings.SubAgent

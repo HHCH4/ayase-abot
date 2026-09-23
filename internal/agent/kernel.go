@@ -353,22 +353,6 @@ type WorkspacePolicy struct {
 	CommandTimeoutSeconds int
 }
 
-// SubAgentProfileOptions 是单个受控子 Agent 的可覆盖运行参数。
-// 指针数值用于区分“显式设置为 0”和“继承主 Agent”这两个语义；Provider/Model
-// 只允许引用已经注册的内置 Provider，子 Agent 仍然不会获得工具或网络能力。
-type SubAgentProfileOptions struct {
-	ProviderID        string
-	ModelID           string
-	ReasoningEffort   string
-	Temperature       *float64
-	TopP              *float64
-	MaxOutputTokens   int
-	TimeoutSeconds    int
-	MaxConcurrency    int
-	OutputBudgetBytes int
-	FailurePolicy     string
-}
-
 // SubAgentOptions 是唯一的通用子 Agent 运行配置。子 Agent 不再按文档、检索、研究
 // 等职责拆分模型配置；职责由父 Agent 通过 Prompt 和工具组合决定，生命周期由父任务
 // Context 决定，因此这里故意没有 timeout 字段。
@@ -425,37 +409,16 @@ type RuntimeOptions struct {
 	ModalFallbackProviderID       string
 	ModalFallbackVisionModel      string
 	ModalFallbackAudioModel       string
-	SubAgentProfiles              map[string]SubAgentProfileOptions
-	// SubAgent 是新执行路径使用的单一通用子 Agent 配置；Profiles 仅为旧配置兼容保留。
+	// SubAgent 是所有子任务共享的通用运行配置，不按职责定义不同子 Agent 类型。
 	SubAgent SubAgentOptions
 }
 
-// SubAgentsEnabled returns the effective master switch. RuntimeOptions is also
-// used by embedders and older tests that build partial values directly; an
-// unset switch therefore means enabled for backward compatibility.
+// SubAgentsEnabled 返回当前运行配置中子 Agent 主开关的显式状态。
 func (runtime RuntimeOptions) SubAgentsEnabled() bool {
 	if runtime.SubAgentEnabled == nil {
-		return true
+		return false
 	}
 	return *runtime.SubAgentEnabled
-}
-
-// SubAgentProfile 返回 profile 的配置副本；未配置时返回 false，调用方应继承
-// 主 Agent 参数和 Runtime 内置预算，而不是把空值解释成新的路由。
-func (runtime RuntimeOptions) SubAgentProfile(profile string) (SubAgentProfileOptions, bool) {
-	profile = strings.TrimSpace(profile)
-	if profile == "" || runtime.SubAgentProfiles == nil {
-		return SubAgentProfileOptions{}, false
-	}
-	value, ok := runtime.SubAgentProfiles[profile]
-	if !ok {
-		return SubAgentProfileOptions{}, false
-	}
-	value.ProviderID = strings.TrimSpace(value.ProviderID)
-	value.ModelID = strings.TrimSpace(value.ModelID)
-	value.ReasoningEffort = strings.TrimSpace(value.ReasoningEffort)
-	value.FailurePolicy = strings.TrimSpace(value.FailurePolicy)
-	return value, true
 }
 
 // RuntimeConfigResolver 按 bot、用户和对话解析当前有效配置。
@@ -529,7 +492,6 @@ type Kernel struct {
 	memoryTools                   func(context.Context, string) ([]tool.Tool, error)
 	attachmentResolver            AttachmentResolver
 	attachmentListResolver        AttachmentListResolver
-	documentImageSubagentRunner   DocumentImageSubagentRunner
 	subAgentRunner                SubAgentRunner
 	modalFallbackUsageObserver    ModalFallbackUsageObserver
 	modalFallbackOutputObserver   ModalFallbackOutputObserver
@@ -1344,7 +1306,7 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 				subAgentTool, toolErr := newRunSubAgentTool(runner, SubAgentRequest{
 					InvocationID: request.InvocationID, UserID: request.UserID, ConversationID: request.ConversationID,
 					Runtime: runtime,
-				}, childTools)
+				}, childTools, runtime.SubAgent.MaxConcurrency)
 				if toolErr != nil {
 					yield(nil, fmt.Errorf("创建通用子 Agent 工具失败: %w", toolErr))
 					return
@@ -1473,7 +1435,7 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 		if negotiation.RequestPlan.MaxOutputTokens > 0 && (runtime.AIMaxOutputTokens <= 0 || runtime.AIMaxOutputTokens > negotiation.RequestPlan.MaxOutputTokens) {
 			runtime.AIMaxOutputTokens = negotiation.RequestPlan.MaxOutputTokens
 		}
-		runner, compactionTracker, err := k.buildRunner(ctx, resolved, tools, runtime, memoryService, projectInstructions, request.UserID, request.InvocationID, taskContract, runtimeSnapshot, workingSet, toolSetSnapshot, negotiation.RequestPlan)
+		runner, compactionTracker, err := k.buildRunner(ctx, resolved, tools, runtime, memoryService, projectInstructions, request.UserID, request.ConversationID, request.InvocationID, taskContract, runtimeSnapshot, workingSet, toolSetSnapshot, negotiation.RequestPlan)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -1898,7 +1860,7 @@ func (k *Kernel) warmRuntimeToolCatalog(ctx context.Context, runtime RuntimeOpti
 		// 仍由 Run 根据主模型能力和会话开关决定。
 		placeholder, toolErr := newRunSubAgentTool(runner, SubAgentRequest{
 			InvocationID: strings.TrimSpace(invocationID), UserID: strings.TrimSpace(userID), ConversationID: strings.TrimSpace(conversationID), Runtime: runtime,
-		}, nil)
+		}, nil, runtime.SubAgent.MaxConcurrency)
 		if toolErr != nil {
 			return fmt.Errorf("创建通用子 Agent 快照工具失败: %w", toolErr)
 		}
@@ -2045,7 +2007,7 @@ func (k *Kernel) ResolveRuntimeConfigSnapshot(ctx context.Context, request ChatR
 	return BuildRuntimeConfigSnapshot(k.appName, runtime, resolved, workspaceID, request.TargetPath, k.CurrentToolCatalogRevision())
 }
 
-func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedModel, tools []tool.Tool, runtime RuntimeOptions, memoryService adkmemory.Service, projectInstructions []ProjectInstruction, userID, invocationID string, taskContract *TaskContractProjection, runtimeSnapshot *RuntimeSnapshotProjection, workingSet []WorkingSetItem, toolSetSnapshot *ToolSetSnapshot, requestPlan provider.RequestPlan) (*adkrunner.Runner, *compactionFailureTracker, error) {
+func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedModel, tools []tool.Tool, runtime RuntimeOptions, memoryService adkmemory.Service, projectInstructions []ProjectInstruction, userID, conversationID, invocationID string, taskContract *TaskContractProjection, runtimeSnapshot *RuntimeSnapshotProjection, workingSet []WorkingSetItem, toolSetSnapshot *ToolSetSnapshot, requestPlan provider.RequestPlan) (*adkrunner.Runner, *compactionFailureTracker, error) {
 	generationConfig := &genai.GenerateContentConfig{
 		Temperature: float32Ptr(float32(runtime.AITemperature)),
 		TopP:        float32Ptr(float32(runtime.AITopP)),
@@ -2189,8 +2151,8 @@ func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedMode
 		// boundary instead of silently sending metadata in place of the file.
 		model = &attachmentMaterializingLLM{
 			delegate: model, resolver: k.attachmentResolver, userID: strings.TrimSpace(userID),
-			invocationID: strings.TrimSpace(invocationID), primary: resolved, runtime: runtime,
-			documentImageSubagentRunner: k.documentImageRunner(),
+			invocationID: strings.TrimSpace(invocationID), conversationID: strings.TrimSpace(conversationID),
+			runtime: runtime, subAgentRunner: k.genericSubAgentRunner(),
 		}
 	}
 	if manifestModel.ContextWindow > 0 {

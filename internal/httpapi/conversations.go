@@ -229,8 +229,5 @@ func (s *Server) deleteConversation(writer http.ResponseWriter, request *http.Re
 		writeError(writer, err)
 		return
 	}
-	if s.runtime != nil {
-		s.runtime.InvalidateRetrievalCache(userID, conversationID, "")
-	}
 	writer.WriteHeader(http.StatusNoContent)
 }

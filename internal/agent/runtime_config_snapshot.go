@@ -63,56 +63,39 @@ type RuntimeConfigSnapshot struct {
 // fields from RuntimeOptions are represented by the digests above.
 type RuntimeOptionsSnapshot struct {
 	AIEnabled bool `json:"ai_enabled"`
-	// Pointer distinguishes an explicit false from snapshots written before
-	// the master switch existed. Missing values mean enabled for compatibility.
-	SubAgentEnabled               *bool                                     `json:"subagent_enabled,omitempty"`
-	AITemperature                 float64                                   `json:"ai_temperature"`
-	AIReasoningEffort             string                                    `json:"ai_reasoning_effort,omitempty"`
-	AITopP                        float64                                   `json:"ai_top_p"`
-	AIMaxOutputTokens             int                                       `json:"ai_max_output_tokens"`
-	AIRequestRetries              int                                       `json:"ai_request_retries"`
-	CompactionEnabled             bool                                      `json:"compaction_enabled"`
-	CompactionRatio               float64                                   `json:"compaction_ratio"`
-	CompactionSafetyTokens        int                                       `json:"compaction_safety_tokens"`
-	CompactionRetentionEvents     int                                       `json:"compaction_retention_events"`
-	CompactionInterval            int                                       `json:"compaction_interval"`
-	CompactionOverlap             int                                       `json:"compaction_overlap"`
-	CompactionUnknownWindowTokens int                                       `json:"compaction_unknown_window_tokens"`
-	AgentMaxToolCalls             int                                       `json:"agent_max_tool_calls"`
-	ToolSchemaBudgetTokens        int                                       `json:"tool_schema_budget_tokens"`
-	WorkspaceEnabled              bool                                      `json:"workspace_enabled"`
-	WorkspaceReadEnabled          bool                                      `json:"workspace_read_enabled"`
-	WorkspaceWriteEnabled         bool                                      `json:"workspace_write_enabled"`
-	WorkspaceExecEnabled          bool                                      `json:"workspace_exec_enabled"`
-	WorkspaceGitEnabled           bool                                      `json:"workspace_git_enabled"`
-	WorkspaceCommandTimeoutSecs   int                                       `json:"workspace_command_timeout_secs"`
-	MessageStreamingEnabled       bool                                      `json:"message_streaming_enabled"`
-	MemoryEnabled                 bool                                      `json:"memory_enabled"`
-	MemoryAutoRetrieve            bool                                      `json:"memory_auto_retrieve"`
-	MemoryMaxResults              int                                       `json:"memory_max_results"`
-	ModalFallbackEnabled          bool                                      `json:"modal_fallback_enabled"`
-	ModalFallbackProviderID       string                                    `json:"modal_fallback_provider_id,omitempty"`
-	ModalFallbackVisionModel      string                                    `json:"modal_fallback_vision_model,omitempty"`
-	ModalFallbackAudioModel       string                                    `json:"modal_fallback_audio_model,omitempty"`
-	SubAgentProfiles              map[string]SubAgentProfileOptionsSnapshot `json:"subagent_profiles,omitempty"`
-	// SubAgent 是新执行链路的通用子 Agent 快照。使用指针保持旧 Invocation
-	// 的 JSON 形状不变；只有显式配置过通用子 Agent 时才写入该字段。
+	// Pointer distinguishes an explicit false from a malformed/incomplete snapshot;
+	// runtime validation requires the switch to be present and match current settings.
+	SubAgentEnabled               *bool   `json:"subagent_enabled,omitempty"`
+	AITemperature                 float64 `json:"ai_temperature"`
+	AIReasoningEffort             string  `json:"ai_reasoning_effort,omitempty"`
+	AITopP                        float64 `json:"ai_top_p"`
+	AIMaxOutputTokens             int     `json:"ai_max_output_tokens"`
+	AIRequestRetries              int     `json:"ai_request_retries"`
+	CompactionEnabled             bool    `json:"compaction_enabled"`
+	CompactionRatio               float64 `json:"compaction_ratio"`
+	CompactionSafetyTokens        int     `json:"compaction_safety_tokens"`
+	CompactionRetentionEvents     int     `json:"compaction_retention_events"`
+	CompactionInterval            int     `json:"compaction_interval"`
+	CompactionOverlap             int     `json:"compaction_overlap"`
+	CompactionUnknownWindowTokens int     `json:"compaction_unknown_window_tokens"`
+	AgentMaxToolCalls             int     `json:"agent_max_tool_calls"`
+	ToolSchemaBudgetTokens        int     `json:"tool_schema_budget_tokens"`
+	WorkspaceEnabled              bool    `json:"workspace_enabled"`
+	WorkspaceReadEnabled          bool    `json:"workspace_read_enabled"`
+	WorkspaceWriteEnabled         bool    `json:"workspace_write_enabled"`
+	WorkspaceExecEnabled          bool    `json:"workspace_exec_enabled"`
+	WorkspaceGitEnabled           bool    `json:"workspace_git_enabled"`
+	WorkspaceCommandTimeoutSecs   int     `json:"workspace_command_timeout_secs"`
+	MessageStreamingEnabled       bool    `json:"message_streaming_enabled"`
+	MemoryEnabled                 bool    `json:"memory_enabled"`
+	MemoryAutoRetrieve            bool    `json:"memory_auto_retrieve"`
+	MemoryMaxResults              int     `json:"memory_max_results"`
+	ModalFallbackEnabled          bool    `json:"modal_fallback_enabled"`
+	ModalFallbackProviderID       string  `json:"modal_fallback_provider_id,omitempty"`
+	ModalFallbackVisionModel      string  `json:"modal_fallback_vision_model,omitempty"`
+	ModalFallbackAudioModel       string  `json:"modal_fallback_audio_model,omitempty"`
+	// SubAgent 是唯一通用子 Agent 的无秘密配置快照。
 	SubAgent *SubAgentOptionsSnapshot `json:"subagent,omitempty"`
-}
-
-// SubAgentProfileOptionsSnapshot 是子 Agent 配置的无秘密快照。它只包含模型
-// 目录引用、生成参数和受控预算，不包含 Provider 凭据或外部服务地址。
-type SubAgentProfileOptionsSnapshot struct {
-	ProviderID        string   `json:"provider_id,omitempty"`
-	ModelID           string   `json:"model_id,omitempty"`
-	ReasoningEffort   string   `json:"reasoning_effort,omitempty"`
-	Temperature       *float64 `json:"temperature,omitempty"`
-	TopP              *float64 `json:"top_p,omitempty"`
-	MaxOutputTokens   int      `json:"max_output_tokens,omitempty"`
-	TimeoutSeconds    int      `json:"timeout_seconds,omitempty"`
-	MaxConcurrency    int      `json:"max_concurrency,omitempty"`
-	OutputBudgetBytes int      `json:"output_budget_bytes,omitempty"`
-	FailurePolicy     string   `json:"failure_policy,omitempty"`
 }
 
 // SubAgentOptionsSnapshot 是通用子 Agent 的无秘密快照。它不包含超时，
@@ -169,27 +152,6 @@ func BuildRuntimeConfigSnapshot(appName string, runtime RuntimeOptions, resolved
 
 func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
 	subAgentEnabled := runtime.SubAgentsEnabled()
-	profiles := make(map[string]SubAgentProfileOptionsSnapshot, len(runtime.SubAgentProfiles))
-	for profile, value := range runtime.SubAgentProfiles {
-		item := SubAgentProfileOptionsSnapshot{
-			ProviderID: value.ProviderID, ModelID: value.ModelID, ReasoningEffort: value.ReasoningEffort,
-			MaxOutputTokens: value.MaxOutputTokens, TimeoutSeconds: value.TimeoutSeconds,
-			MaxConcurrency: value.MaxConcurrency, OutputBudgetBytes: value.OutputBudgetBytes,
-			FailurePolicy: value.FailurePolicy,
-		}
-		if value.Temperature != nil {
-			number := *value.Temperature
-			item.Temperature = &number
-		}
-		if value.TopP != nil {
-			number := *value.TopP
-			item.TopP = &number
-		}
-		profiles[profile] = item
-	}
-	if len(profiles) == 0 {
-		profiles = nil
-	}
 	var subAgent *SubAgentOptionsSnapshot
 	if runtime.SubAgent.ProviderID != "" || runtime.SubAgent.ModelID != "" || runtime.SubAgent.ReasoningEffort != "" || runtime.SubAgent.Temperature != nil || runtime.SubAgent.TopP != nil || runtime.SubAgent.MaxOutputTokens != 0 || runtime.SubAgent.MaxConcurrency != 0 || runtime.SubAgent.InputBudgetBytes != 0 || runtime.SubAgent.OutputBudgetBytes != 0 || len(runtime.SubAgent.AllowedTools) > 0 {
 		value := &SubAgentOptionsSnapshot{
@@ -240,7 +202,6 @@ func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
 		ModalFallbackProviderID:       strings.TrimSpace(runtime.ModalFallbackProviderID),
 		ModalFallbackVisionModel:      strings.TrimSpace(runtime.ModalFallbackVisionModel),
 		ModalFallbackAudioModel:       strings.TrimSpace(runtime.ModalFallbackAudioModel),
-		SubAgentProfiles:              profiles,
 		SubAgent:                      subAgent,
 	}
 }
@@ -356,46 +317,6 @@ func validateRuntimeOptionsSnapshot(options RuntimeOptionsSnapshot) error {
 			return fmt.Errorf("%w: %s 超出长度限制", ErrInvalidRuntimeConfigSnapshot, name)
 		}
 	}
-	for profile, value := range options.SubAgentProfiles {
-		profile = strings.TrimSpace(profile)
-		if profile == "" || len(profile) > 64 {
-			return fmt.Errorf("%w: 子 Agent profile 名称无效", ErrInvalidRuntimeConfigSnapshot)
-		}
-		for name, text := range map[string]string{
-			"provider_id":      value.ProviderID,
-			"model_id":         value.ModelID,
-			"reasoning_effort": value.ReasoningEffort,
-			"failure_policy":   value.FailurePolicy,
-		} {
-			if len(text) > 128 {
-				return fmt.Errorf("%w: 子 Agent %s.%s 超出长度限制", ErrInvalidRuntimeConfigSnapshot, profile, name)
-			}
-		}
-		for name, number := range map[string]float64{
-			"temperature": pointerFloat64(value.Temperature),
-			"top_p":       pointerFloat64(value.TopP),
-		} {
-			if math.IsNaN(number) || math.IsInf(number, 0) {
-				return fmt.Errorf("%w: 子 Agent %s.%s 不是有限数值", ErrInvalidRuntimeConfigSnapshot, profile, name)
-			}
-		}
-		if value.Temperature != nil && (*value.Temperature < 0 || *value.Temperature > 2) || value.TopP != nil && (*value.TopP < 0.01 || *value.TopP > 1) {
-			return fmt.Errorf("%w: 子 Agent %s 的采样参数超出范围", ErrInvalidRuntimeConfigSnapshot, profile)
-		}
-		if value.MaxOutputTokens < 0 || value.MaxOutputTokens > 1536 || value.TimeoutSeconds < 0 || value.TimeoutSeconds > 300 || value.MaxConcurrency < 0 || value.MaxConcurrency > 4 || value.OutputBudgetBytes < 0 || value.OutputBudgetBytes > 128<<10 {
-			return fmt.Errorf("%w: 子 Agent %s 的预算超出范围", ErrInvalidRuntimeConfigSnapshot, profile)
-		}
-		switch strings.ToLower(strings.TrimSpace(value.ReasoningEffort)) {
-		case "", "minimal", "low", "medium", "high":
-		default:
-			return fmt.Errorf("%w: 子 Agent %s 的思考强度无效", ErrInvalidRuntimeConfigSnapshot, profile)
-		}
-		switch strings.ToLower(strings.TrimSpace(value.FailurePolicy)) {
-		case "", "continue", "abort":
-		default:
-			return fmt.Errorf("%w: 子 Agent %s 的失败策略无效", ErrInvalidRuntimeConfigSnapshot, profile)
-		}
-	}
 	if value := options.SubAgent; value != nil {
 		for name, text := range map[string]string{
 			"provider_id":      value.ProviderID,
@@ -497,8 +418,6 @@ func ValidateRuntimeConfigSnapshot(stored string, current RuntimeConfigSnapshot)
 	if err != nil {
 		return err
 	}
-	parsed = effectiveRuntimeConfigSnapshot(parsed)
-	normalized = effectiveRuntimeConfigSnapshot(normalized)
 	left, marshalErr := json.Marshal(parsed)
 	if marshalErr != nil {
 		return fmt.Errorf("%w: 无法规范化已保存快照", ErrInvalidRuntimeConfigSnapshot)
@@ -511,15 +430,4 @@ func ValidateRuntimeConfigSnapshot(stored string, current RuntimeConfigSnapshot)
 		return nil
 	}
 	return fmt.Errorf("%w: stored=%s current=%s", ErrRuntimeConfigSnapshotMismatch, RuntimeConfigSnapshotDigest(string(left)), RuntimeConfigSnapshotDigest(string(right)))
-}
-
-// effectiveRuntimeConfigSnapshot applies compatibility defaults only when two
-// snapshots are compared. Persisted old snapshots keep their original JSON
-// and digest, while a missing master switch still means enabled at runtime.
-func effectiveRuntimeConfigSnapshot(snapshot RuntimeConfigSnapshot) RuntimeConfigSnapshot {
-	if snapshot.Options.SubAgentEnabled == nil {
-		enabled := true
-		snapshot.Options.SubAgentEnabled = &enabled
-	}
-	return snapshot
 }

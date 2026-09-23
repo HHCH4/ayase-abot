@@ -416,66 +416,6 @@ export interface InvocationTrace {
   usage: InvocationUsage
 }
 
-export interface SubAgentGroup {
-  id: string
-  invocation_id?: string
-  profile: string
-  purpose?: string
-  status: string
-  failure_policy?: string
-  expected_count: number
-  queued_count: number
-  running_count: number
-  completed_count: number
-  failed_count: number
-  cancelled_count: number
-  max_concurrency?: number
-  timeout_seconds?: number
-  output_budget_bytes?: number
-  result_digest?: string
-  error_summary?: string
-  created_at?: string
-  started_at?: string
-  finished_at?: string
-  updated_at?: string
-}
-
-export interface SubAgentRun {
-  id: string
-  group_id: string
-  ordinal: number
-  profile: string
-  source_kind?: string
-  status: string
-  attempt?: number
-  result_text?: string
-  result_digest?: string
-  error_code?: string
-  error?: string
-  started_at?: string
-  finished_at?: string
-}
-
-export interface SubAgentEvidence {
-  evidence_id: string
-  source_kind: string
-  source_id?: string
-  locator?: string
-  title?: string
-  excerpt?: string
-  retrieval_score?: number
-  rerank_score?: number
-  citation?: string
-  truncated?: boolean
-  stale?: boolean
-}
-
-export interface SubAgentGroupDetail {
-  group: SubAgentGroup
-  runs: SubAgentRun[]
-  evidence?: SubAgentEvidence[]
-}
-
 export interface ToolSetSnapshot {
   invocation_id: string
   digest: string
@@ -679,21 +619,7 @@ export interface SystemSettings {
   modal_fallback_vision_model: string
   modal_fallback_audio_model: string
   subagent_enabled: boolean
-  subagent_profiles: Record<string, SubAgentProfileSettings>
   subagent: SubAgentSettings
-}
-
-export interface SubAgentProfileSettings {
-  provider_id?: string
-  model_id?: string
-  reasoning_effort?: string
-  temperature?: number | null
-  top_p?: number | null
-  max_output_tokens?: number
-  timeout_seconds?: number
-  max_concurrency?: number
-  output_budget_bytes?: number
-  failure_policy?: string
 }
 
 export interface SubAgentSettings {
@@ -709,15 +635,8 @@ export interface SubAgentSettings {
   allowed_tools?: string[]
 }
 
-export interface SubAgentProfileDescriptor {
-  id: string
-  label: string
-  description: string
-}
-
 export interface SystemSettingsResponse extends SystemSettings {
   schema?: ConfigField[]
-  subagent_profile_schema?: SubAgentProfileDescriptor[]
 }
 
 /**

@@ -94,9 +94,6 @@ func (s *Server) createMemory(writer http.ResponseWriter, request *http.Request)
 		writeError(writer, err)
 		return
 	}
-	if s.runtime != nil {
-		s.runtime.InvalidateRetrievalCache(payload.UserID, payload.ConversationID, "")
-	}
 	writeJSON(writer, http.StatusCreated, item)
 }
 
@@ -116,9 +113,6 @@ func (s *Server) updateMemory(writer http.ResponseWriter, request *http.Request)
 		writeError(writer, err)
 		return
 	}
-	if s.runtime != nil {
-		s.runtime.InvalidateRetrievalCache(memoryUserID(request), "", "")
-	}
 	writeJSON(writer, http.StatusOK, item)
 }
 
@@ -132,9 +126,6 @@ func (s *Server) deleteMemory(writer http.ResponseWriter, request *http.Request)
 		writeError(writer, err)
 		return
 	}
-	if s.runtime != nil {
-		s.runtime.InvalidateRetrievalCache(memoryUserID(request), "", "")
-	}
 	writer.WriteHeader(http.StatusNoContent)
 }
 
@@ -147,9 +138,6 @@ func (s *Server) clearMemories(writer http.ResponseWriter, request *http.Request
 	if err := service.Clear(request.Context(), memoryUserID(request)); err != nil {
 		writeError(writer, err)
 		return
-	}
-	if s.runtime != nil {
-		s.runtime.InvalidateRetrievalCache(memoryUserID(request), "", "")
 	}
 	writer.WriteHeader(http.StatusNoContent)
 }

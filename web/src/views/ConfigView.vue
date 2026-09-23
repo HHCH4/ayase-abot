@@ -20,7 +20,7 @@ const systemDraft = reactive<Record<string, unknown>>({
   artifact_quota_bytes: 4 * 1024 * 1024 * 1024, artifact_stale_upload_seconds: 86400, artifact_input_retention_seconds: 7 * 86400,
   modal_fallback_enabled: false, modal_fallback_provider_id: '', modal_fallback_vision_model: '', modal_fallback_audio_model: '',
   subagent_enabled: true,
-  subagent_profiles: {}, subagent: {},
+  subagent: {},
 })
 const revisions = ref<ConfigRevision[]>([])
 const dirty = ref(false)
@@ -341,7 +341,6 @@ function syncSystemDraft() {
     modal_fallback_enabled: value.modal_fallback_enabled, modal_fallback_provider_id: value.modal_fallback_provider_id,
     modal_fallback_vision_model: value.modal_fallback_vision_model, modal_fallback_audio_model: value.modal_fallback_audio_model,
     subagent_enabled: value.subagent_enabled !== false,
-    subagent_profiles: clone(value.subagent_profiles || {}),
     subagent: clone(value.subagent || {}),
   })
 }

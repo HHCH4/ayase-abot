@@ -102,17 +102,16 @@ func compactionFailureEvent(invocationID string, cause error, consecutive int, n
 type InvocationStatus string
 
 const (
-	InvocationQueued           InvocationStatus = "queued"
-	InvocationRunning          InvocationStatus = "running"
-	InvocationWaitingApproval  InvocationStatus = "waiting_approval"
-	InvocationWaitingTool      InvocationStatus = "waiting_tool"
-	InvocationWaitingUser      InvocationStatus = "waiting_user"
-	InvocationWaitingSubagents InvocationStatus = "waiting_subagents"
-	InvocationCancelling       InvocationStatus = "cancelling"
-	InvocationCompleted        InvocationStatus = "completed"
-	InvocationFailed           InvocationStatus = "failed"
-	InvocationCancelled        InvocationStatus = "cancelled"
-	InvocationExpired          InvocationStatus = "expired"
+	InvocationQueued          InvocationStatus = "queued"
+	InvocationRunning         InvocationStatus = "running"
+	InvocationWaitingApproval InvocationStatus = "waiting_approval"
+	InvocationWaitingTool     InvocationStatus = "waiting_tool"
+	InvocationWaitingUser     InvocationStatus = "waiting_user"
+	InvocationCancelling      InvocationStatus = "cancelling"
+	InvocationCompleted       InvocationStatus = "completed"
+	InvocationFailed          InvocationStatus = "failed"
+	InvocationCancelled       InvocationStatus = "cancelled"
+	InvocationExpired         InvocationStatus = "expired"
 )
 
 func (s InvocationStatus) Terminal() bool {
@@ -240,23 +239,6 @@ const (
 	EventRuntimeNotice                 = "runtime.notice"
 	EventADK                           = "adk.event"
 	EventWorkflowContinuationRequested = "workflow.continuation_requested"
-	EventSubAgentRequested             = "subagent.requested"
-	EventSubAgentQueued                = "subagent.queued"
-	EventSubAgentStarted               = "subagent.started"
-	EventSubAgentCompleted             = "subagent.completed"
-	EventSubAgentFailed                = "subagent.failed"
-	EventSubAgentCancelled             = "subagent.cancelled"
-	EventSubAgentExpired               = "subagent.expired"
-	EventSubAgentGroupCompleted        = "subagent.group_completed"
-	EventRetrievalRequested            = "retrieval.requested"
-	EventRetrievalSourceStarted        = "retrieval.source_started"
-	EventRetrievalSourceCompleted      = "retrieval.source_completed"
-	EventRetrievalDeduplicated         = "retrieval.deduplicated"
-	EventRetrievalReranked             = "retrieval.reranked"
-	EventRetrievalSummarized           = "retrieval.summarized"
-	EventRetrievalStale                = "retrieval.stale"
-	EventRetrievalFailed               = "retrieval.failed"
-	EventRetrievalCompleted            = "retrieval.completed"
 )
 
 type ApprovalStatus string
@@ -1301,9 +1283,8 @@ type InvocationTimeoutResolver func(context.Context, Invocation) (time.Duration,
 // request context for the actual Agent run, so a browser disconnect does not
 // cancel the model/tool loop.
 type Coordinator struct {
-	kernel    *agent.Kernel
-	repo      Repository
-	subagents *SubAgentManager
+	kernel *agent.Kernel
+	repo   Repository
 
 	mu             sync.Mutex
 	admissionMu    sync.Mutex
@@ -1712,20 +1693,8 @@ func NewCoordinator(kernel *agent.Kernel, repo Repository) (*Coordinator, error)
 		toolStatusSource:                DefaultRuntimeLongRunningToolStatusSource,
 		toolStatusDestination:           DefaultRuntimeLongRunningToolStatusDestination,
 	}
-	subagents, subagentErr := NewSubAgentManager(repo, func(runCtx context.Context, request agent.DocumentImageAnalysisRequest) (string, error) {
-		return kernel.AnalyzeDocumentImage(runCtx, request)
-	})
-	if subagentErr != nil {
-		return nil, subagentErr
-	}
-	coordinator.subagents = subagents
-	subagents.SetEventSink(coordinator.appendAndPublish)
-	subagents.SetBuiltInTextRunner(kernel)
-	// 新执行路径统一由通用子 Agent 管理器记录生命周期，再由 Kernel 使用内置
-	// Provider 执行；旧文本/图片接口仅保留给历史兼容调用方。
-	subagents.SetGenericRunner(kernel)
-	kernel.SetSubAgentRunner(subagents)
-	kernel.SetDocumentImageSubagentRunner(subagents)
+	// 子 Agent 与主 Agent 共用一个执行入口和父 Invocation Context，由主任务统一取消、超时和收口。
+	kernel.SetSubAgentRunner(kernel)
 	kernel.SetToolBudgetObserver(func(ctx context.Context, invocationID string, used, limit int) {
 		if strings.TrimSpace(invocationID) == "" {
 			return
@@ -1984,11 +1953,6 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	if err := c.reconcileInterrupted(ctx); err != nil {
 		return err
 	}
-	if c.subagents != nil {
-		if err := c.subagents.Recover(ctx); err != nil {
-			return fmt.Errorf("恢复子 Agent 状态失败: %w", err)
-		}
-	}
 	c.startApprovalExpiryLoop()
 
 	active, err := c.repo.ListInvocations(ctx, "", []InvocationStatus{InvocationQueued})
@@ -1997,7 +1961,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	}
 	// 重启时每个对话只启动队首，等待审批的对话不能越过当前任务。
 	blocked := make(map[string]bool)
-	waiting, err := c.repo.ListInvocations(ctx, "", []InvocationStatus{InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationWaitingSubagents, InvocationCancelling})
+	waiting, err := c.repo.ListInvocations(ctx, "", []InvocationStatus{InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationCancelling})
 	if err != nil {
 		return fmt.Errorf("读取待恢复任务失败: %w", err)
 	}
@@ -2031,7 +1995,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 // side effect. Cancelling is terminalized without pretending the HTTP caller
 // caused it.
 func (c *Coordinator) reconcileInterrupted(ctx context.Context) error {
-	items, err := c.repo.ListInvocations(ctx, "", []InvocationStatus{InvocationRunning, InvocationWaitingSubagents, InvocationCancelling})
+	items, err := c.repo.ListInvocations(ctx, "", []InvocationStatus{InvocationRunning, InvocationCancelling})
 	if err != nil {
 		return fmt.Errorf("恢复中断任务失败: %w", err)
 	}
@@ -2049,8 +2013,6 @@ func (c *Coordinator) reconcileInterrupted(ctx context.Context) error {
 		if item.Status == InvocationCancelling {
 			status = InvocationCancelled
 			message = "服务重启时完成取消"
-		} else if item.Status == InvocationWaitingSubagents {
-			message = "runtime_interrupted: 服务重启时子 Agent 没有可安全恢复的 checkpoint"
 		}
 		// SQLite/Memory can close the Invocation and any active plan step under
 		// one durable boundary. Do not attempt a best-effort two-write repair in
@@ -4098,9 +4060,6 @@ func (c *Coordinator) Close() error {
 		delete(c.subscribers, id)
 	}
 	c.mu.Unlock()
-	if c.subagents != nil {
-		_ = c.subagents.Close()
-	}
 	return nil
 }
 
@@ -4139,7 +4098,7 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 			if lookupErr == nil {
 				// 平台重试同一消息时仍告知它在队列中，不能覆盖当前任务指针。
 				if request.QueueIfBusy && existing.Status == InvocationQueued {
-					pending, pendingErr := c.repo.ListInvocations(ctx, request.UserID, []InvocationStatus{InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationWaitingSubagents, InvocationCancelling})
+					pending, pendingErr := c.repo.ListInvocations(ctx, request.UserID, []InvocationStatus{InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationCancelling})
 					if pendingErr != nil {
 						return Invocation{}, pendingErr
 					}
@@ -4158,7 +4117,7 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 		}
 	}
 	active, err := c.repo.ListInvocations(ctx, request.UserID, []InvocationStatus{
-		InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationWaitingSubagents, InvocationCancelling,
+		InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationCancelling,
 	})
 	if err != nil {
 		return Invocation{}, err
@@ -4792,7 +4751,7 @@ func (c *Coordinator) CancelConversationInvocations(ctx context.Context, userID,
 	}
 	statuses := []InvocationStatus{
 		InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool,
-		InvocationWaitingUser, InvocationWaitingSubagents, InvocationCancelling,
+		InvocationWaitingUser, InvocationCancelling,
 	}
 	items, err := c.repo.ListInvocations(ctx, userID, statuses)
 	if err != nil {
@@ -5962,9 +5921,6 @@ func (c *Coordinator) CancelInvocation(ctx context.Context, id string) (Invocati
 		handle.cancel()
 	}
 	c.mu.Unlock()
-	if c.subagents != nil {
-		c.subagents.CancelForInvocation(context.WithoutCancel(ctx), id)
-	}
 	// Close every pending approval before publishing the terminal Invocation
 	// event. A cancellation must not leave an approval card that can later
 	// resurrect a cancelled task or a prepared workspace operation.
@@ -5994,11 +5950,9 @@ func validInvocationTransition(from, to InvocationStatus) bool {
 	case InvocationQueued:
 		return to == InvocationRunning || to == InvocationCancelling || to == InvocationCancelled || to == InvocationFailed
 	case InvocationRunning:
-		return to == InvocationWaitingApproval || to == InvocationWaitingTool || to == InvocationWaitingUser || to == InvocationWaitingSubagents || to == InvocationQueued || to == InvocationCompleted || to == InvocationFailed || to == InvocationCancelling || to == InvocationCancelled
+		return to == InvocationWaitingApproval || to == InvocationWaitingTool || to == InvocationWaitingUser || to == InvocationQueued || to == InvocationCompleted || to == InvocationFailed || to == InvocationCancelling || to == InvocationCancelled
 	case InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser:
 		return to == InvocationQueued || to == InvocationCancelling || to == InvocationCancelled || to == InvocationExpired || to == InvocationFailed
-	case InvocationWaitingSubagents:
-		return to == InvocationRunning || to == InvocationQueued || to == InvocationCancelling || to == InvocationCancelled || to == InvocationExpired || to == InvocationFailed
 	case InvocationCancelling:
 		return to == InvocationCancelled || to == InvocationFailed
 	default:
@@ -8219,7 +8173,7 @@ func (c *Coordinator) launchNextQueued(userID, conversationID string) {
 	c.admissionMu.Lock()
 	defer c.admissionMu.Unlock()
 	ctx := context.Background()
-	items, err := c.repo.ListInvocations(ctx, userID, []InvocationStatus{InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationWaitingSubagents, InvocationCancelling})
+	items, err := c.repo.ListInvocations(ctx, userID, []InvocationStatus{InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationCancelling})
 	if err != nil {
 		return
 	}

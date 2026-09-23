@@ -302,11 +302,9 @@ func (s *Server) getSystemSettings(writer http.ResponseWriter, request *http.Req
 		"artifact_input_retention_seconds": settings.ArtifactInputRetentionSeconds,
 		"modal_fallback_enabled":           settings.ModalFallbackEnabled, "modal_fallback_provider_id": settings.ModalFallbackProviderID,
 		"modal_fallback_vision_model": settings.ModalFallbackVisionModel, "modal_fallback_audio_model": settings.ModalFallbackAudioModel,
-		"subagent_enabled":        settings.IsSubAgentEnabled(),
-		"subagent_profiles":       settings.SubAgentProfiles,
-		"subagent":                settings.SubAgent,
-		"subagent_profile_schema": configsvc.SubAgentProfileSchema(),
-		"schema":                  configsvc.SystemSchema().Fields,
+		"subagent_enabled": settings.IsSubAgentEnabled(),
+		"subagent":         settings.SubAgent,
+		"schema":           configsvc.SystemSchema().Fields,
 	})
 }
 

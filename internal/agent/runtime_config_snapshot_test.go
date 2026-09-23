@@ -65,7 +65,7 @@ func TestRuntimeConfigSnapshotIsBoundedAndMetadataOnly(t *testing.T) {
 	}
 }
 
-func TestRuntimeConfigSnapshotPreservesExplicitSubAgentSwitch(t *testing.T) {
+func TestRuntimeConfigSnapshotRequiresExplicitSubAgentSwitch(t *testing.T) {
 	disabled := false
 	runtime := RuntimeOptions{AIEnabled: true, SubAgentEnabled: &disabled, Instruction: "stable"}
 	resolved := provider.ResolvedModel{
@@ -83,18 +83,17 @@ func TestRuntimeConfigSnapshotPreservesExplicitSubAgentSwitch(t *testing.T) {
 	if parsed.Options.SubAgentEnabled == nil || *parsed.Options.SubAgentEnabled {
 		t.Fatalf("显式停用未进入配置快照: %#v", parsed.Options)
 	}
-	// A snapshot written before this field existed must still compare equal to
-	// the explicit enabled value, without rewriting its original JSON/digest.
-	legacyEncoded := strings.Replace(encoded, `,"subagent_enabled":false`, "", 1)
-	legacy, err := ParseRuntimeConfigSnapshot(legacyEncoded)
+	missingSwitch := strings.Replace(encoded, `,"subagent_enabled":false`, "", 1)
+	parsedMissingSwitch, err := ParseRuntimeConfigSnapshot(missingSwitch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	enabled := true
-	current := legacy
-	current.Options.SubAgentEnabled = &enabled
-	if err := ValidateRuntimeConfigSnapshot(legacyEncoded, current); err != nil {
-		t.Fatalf("旧快照缺少开关字段时应按启用兼容: %v", err)
+	if parsedMissingSwitch.Options.SubAgentEnabled != nil {
+		t.Fatalf("缺失的子 Agent 开关不应被隐式补成已启用: %#v", parsedMissingSwitch.Options)
+	}
+	current := parsed
+	if err := ValidateRuntimeConfigSnapshot(missingSwitch, current); !errors.Is(err, ErrRuntimeConfigSnapshotMismatch) {
+		t.Fatalf("缺少子 Agent 开关的快照必须拒绝兼容并报告配置不匹配: %v", err)
 	}
 }
 

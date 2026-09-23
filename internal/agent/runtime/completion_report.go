@@ -433,7 +433,7 @@ func completionStatus(invocation Invocation, plan *TaskPlan, report CompletionRe
 	switch invocation.Status {
 	case InvocationQueued, InvocationRunning, InvocationCancelling:
 		return WorkflowResultInProgress, "任务仍在运行"
-	case InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationWaitingSubagents:
+	case InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser:
 		return WorkflowResultWaiting, "任务等待审批或外部输入"
 	case InvocationFailed:
 		return WorkflowResultFailed, "任务运行失败"

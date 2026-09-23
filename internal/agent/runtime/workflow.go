@@ -39,7 +39,6 @@ const (
 	WorkflowPhaseWaitingApproval         WorkflowPhase = "waiting_approval"
 	WorkflowPhaseWaitingTool             WorkflowPhase = "waiting_tool"
 	WorkflowPhaseWaitingUser             WorkflowPhase = "waiting_user"
-	WorkflowPhaseWaitingSubagents        WorkflowPhase = "waiting_subagents"
 	WorkflowPhaseVerifying               WorkflowPhase = "verifying"
 	WorkflowPhaseReviewing               WorkflowPhase = "reviewing"
 	WorkflowPhaseReporting               WorkflowPhase = "reporting"
@@ -48,7 +47,7 @@ const (
 
 func validWorkflowPhase(phase WorkflowPhase) bool {
 	switch phase {
-	case WorkflowPhaseUnderstanding, WorkflowPhaseDiscoveringInstructions, WorkflowPhaseInspecting, WorkflowPhasePlanning, WorkflowPhaseEditing, WorkflowPhaseWaitingApproval, WorkflowPhaseWaitingTool, WorkflowPhaseWaitingUser, WorkflowPhaseWaitingSubagents, WorkflowPhaseVerifying, WorkflowPhaseReviewing, WorkflowPhaseReporting, WorkflowPhaseBlocked:
+	case WorkflowPhaseUnderstanding, WorkflowPhaseDiscoveringInstructions, WorkflowPhaseInspecting, WorkflowPhasePlanning, WorkflowPhaseEditing, WorkflowPhaseWaitingApproval, WorkflowPhaseWaitingTool, WorkflowPhaseWaitingUser, WorkflowPhaseVerifying, WorkflowPhaseReviewing, WorkflowPhaseReporting, WorkflowPhaseBlocked:
 		return true
 	default:
 		return false
@@ -67,9 +66,6 @@ func deriveWorkflowPhase(invocation Invocation, plan *TaskPlan, pendingApprovals
 	}
 	if invocation.Status == InvocationWaitingUser {
 		return WorkflowPhaseWaitingUser
-	}
-	if invocation.Status == InvocationWaitingSubagents {
-		return WorkflowPhaseWaitingSubagents
 	}
 	if plan != nil {
 		if plan.Status == PlanBlocked {

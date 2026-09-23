@@ -13,6 +13,7 @@ import (
 	"Abot/internal/provider"
 
 	adkagent "google.golang.org/adk/v2/agent"
+	adkmemory "google.golang.org/adk/v2/memory"
 	adkrunner "google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
@@ -152,9 +153,18 @@ func (k *Kernel) RunSubAgent(ctx context.Context, request SubAgentRequest) (stri
 		childTools = childRegistry.WrapSelection(selection, k.toolExecutor, negotiation.RequestPlan.ParallelToolLimit)
 	}
 
-	// invocationID 传空值，阻止子 Agent 读取主 Invocation 的附件引用或写入主任务
-	// 的上下文快照；父 ID 只用于 Runtime 持久化和日志关联。
-	runner, _, err := k.buildRunner(ctx, resolved, childTools, childRuntime, nil, nil, request.UserID, "", nil, nil, nil, nil, negotiation.RequestPlan)
+	// 子 Agent 不继承主 Invocation 的持久上下文；允许的记忆能力仍通过同一只读服务和显式工具提供。
+	var childMemoryService adkmemory.Service
+	if childRuntime.MemoryEnabled {
+		childMemoryService = k.memoryService
+		if k.memoryServiceResolver != nil {
+			childMemoryService = k.memoryServiceResolver(ctx, childRuntime)
+		}
+		if childMemoryService == nil {
+			return "", errors.New("通用子 Agent 已启用记忆，但记忆服务未装配")
+		}
+	}
+	runner, _, err := k.buildRunner(ctx, resolved, childTools, childRuntime, childMemoryService, nil, request.UserID, request.ConversationID, "", nil, nil, nil, nil, negotiation.RequestPlan)
 	if err != nil {
 		return "", fmt.Errorf("创建通用子 Agent Runner 失败: %w", err)
 	}
@@ -306,15 +316,30 @@ type runSubAgentResult struct {
 }
 
 // newRunSubAgentTool 创建主 Agent 唯一的子 Agent 入口。工具本身不暴露给子 Agent，
-// 从而禁止递归扩张；每次执行都沿用父工具边界和父 Context。
-func newRunSubAgentTool(runner SubAgentRunner, request SubAgentRequest, tools []tool.Tool) (tool.Tool, error) {
+// 从而禁止递归扩张；每次执行都沿用父工具边界和父 Context，并在同一父任务内限制并发数。
+// 等待名额时仍监听父 Context，因此取消/过期会立即阻止排队调用继续执行。
+func newRunSubAgentTool(runner SubAgentRunner, request SubAgentRequest, tools []tool.Tool, configuredLimit int) (tool.Tool, error) {
 	if runner == nil {
 		return nil, errors.New("通用子 Agent Runner 未装配")
 	}
+	limit := configuredLimit
+	if limit <= 0 {
+		limit = 2
+	}
+	if limit > 4 {
+		limit = 4
+	}
+	semaphore := make(chan struct{}, limit)
 	return functiontool.New(functiontool.Config{
 		Name:        "run_subagent",
 		Description: "启动一个通用只读子 Agent。子 Agent 没有独立超时，会一直受当前父任务生命周期管理；适合处理长文档、检索、图片理解和事实汇总。",
 	}, func(ctx adkagent.Context, args runSubAgentArgs) (runSubAgentResult, error) {
+		select {
+		case semaphore <- struct{}{}:
+			defer func() { <-semaphore }()
+		case <-ctx.Done():
+			return runSubAgentResult{}, ctx.Err()
+		}
 		childRequest := request
 		childRequest.Prompt = strings.TrimSpace(args.Prompt)
 		childRequest.Purpose = strings.TrimSpace(args.Purpose)

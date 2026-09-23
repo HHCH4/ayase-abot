@@ -148,37 +148,35 @@ func TestSystemSettingsArtifactLifecycleBounds(t *testing.T) {
 	}
 }
 
-func TestSubAgentProfileSettingsNormalizeAndValidate(t *testing.T) {
+func TestSubAgentSettingsNormalizeAndValidate(t *testing.T) {
 	temperature := 0.25
 	topP := 0.8
 	settings := normalizeSystemSettings(SystemSettings{
 		LogLevel: "INFO", RequestTimeoutSeconds: 300, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds,
-		SubAgentProfiles: map[string]SubAgentProfileSettings{
-			" research ": {
-				ProviderID: " provider-a ", ModelID: " model-a ", ReasoningEffort: " HIGH ",
-				Temperature: &temperature, TopP: &topP, MaxOutputTokens: 1024,
-				TimeoutSeconds: 90, MaxConcurrency: 3, OutputBudgetBytes: 32768, FailurePolicy: " CONTINUE ",
-			},
+		SubAgent: SubAgentSettings{
+			ProviderID: " provider-a ", ModelID: " model-a ", ReasoningEffort: " HIGH ",
+			Temperature: &temperature, TopP: &topP, MaxOutputTokens: 1024,
+			MaxConcurrency: 3, InputBudgetBytes: 65536, OutputBudgetBytes: 32768,
 		},
 	})
-	profile, ok := settings.SubAgentProfiles["research"]
-	if !ok || profile.ProviderID != "provider-a" || profile.ModelID != "model-a" || profile.ReasoningEffort != "high" || profile.FailurePolicy != "continue" {
-		t.Fatalf("子 Agent profile 未规范化: %#v", settings.SubAgentProfiles)
+	options := settings.SubAgent
+	if options.ProviderID != "provider-a" || options.ModelID != "model-a" || options.ReasoningEffort != "high" {
+		t.Fatalf("通用子 Agent 配置未规范化: %#v", options)
 	}
-	if profile.Temperature == nil || *profile.Temperature != temperature || profile.TopP == nil || *profile.TopP != topP {
-		t.Fatalf("子 Agent 浮点配置未保留: %#v", profile)
+	if options.Temperature == nil || *options.Temperature != temperature || options.TopP == nil || *options.TopP != topP {
+		t.Fatalf("通用子 Agent 浮点配置未保留: %#v", options)
 	}
 	if err := validateSystemSettings(settings); err != nil {
 		t.Fatalf("有效子 Agent 设置被拒绝: %v", err)
 	}
 	invalid := []SystemSettings{
-		{RequestTimeoutSeconds: 300, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds, SubAgentProfiles: map[string]SubAgentProfileSettings{"unknown": {}}},
-		{RequestTimeoutSeconds: 300, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds, SubAgentProfiles: map[string]SubAgentProfileSettings{"research": {ReasoningEffort: "xhigh"}}},
-		{RequestTimeoutSeconds: 300, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds, SubAgentProfiles: map[string]SubAgentProfileSettings{"research": {MaxConcurrency: 5}}},
+		{RequestTimeoutSeconds: 300, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds, SubAgent: SubAgentSettings{ReasoningEffort: "unsupported"}},
+		{RequestTimeoutSeconds: 300, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds, SubAgent: SubAgentSettings{MaxConcurrency: 5}},
+		{RequestTimeoutSeconds: 300, ArtifactStaleUploadSeconds: DefaultArtifactStaleUploadSeconds, SubAgent: SubAgentSettings{InputBudgetBytes: 513 << 10}},
 	}
 	for index, item := range invalid {
 		if err := validateSystemSettings(normalizeSystemSettings(item)); err == nil {
-			t.Fatalf("非法子 Agent 设置 #%d 未被拒绝: %#v", index, item.SubAgentProfiles)
+			t.Fatalf("非法通用子 Agent 设置 #%d 未被拒绝: %#v", index, item.SubAgent)
 		}
 	}
 }

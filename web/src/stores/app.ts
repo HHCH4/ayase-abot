@@ -20,7 +20,7 @@ export const useAppStore = defineStore('app', {
       artifact_quota_bytes: 4 * 1024 * 1024 * 1024, artifact_stale_upload_seconds: 86400, artifact_input_retention_seconds: 7 * 86400,
       modal_fallback_enabled: false, modal_fallback_provider_id: '', modal_fallback_vision_model: '', modal_fallback_audio_model: '',
       subagent_enabled: true,
-      subagent_profiles: {}, subagent: {}, subagent_profile_schema: [],
+      subagent: {},
     } as SystemSettingsResponse,
     loading: false,
     lastError: '',

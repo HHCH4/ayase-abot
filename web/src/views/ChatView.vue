@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { NAlert, NButton, NEmpty, NForm, NFormItem, NInput, NScrollbar, NSelect, NSpace, NSpin, NTag, useMessage } from 'naive-ui'
-import { readConversationContext, readConversationMessages, readInvocationCapabilities, readInvocationPlan, readInvocationResult, readInvocationRuntimeSnapshot, readInvocationSubAgents, readInvocationToolSet, readInvocationTrace, readInvocationVerifications, readSubAgentGroup, request, streamChat, uploadArtifact } from '@/api'
+import { readConversationContext, readConversationMessages, readInvocationCapabilities, readInvocationPlan, readInvocationResult, readInvocationRuntimeSnapshot, readInvocationToolSet, readInvocationTrace, readInvocationVerifications, request, streamChat, uploadArtifact } from '@/api'
 import ConversationActions from '@/components/ConversationActions.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
@@ -9,7 +9,7 @@ import ProviderDialog from '@/components/ProviderDialog.vue'
 import { useAppStore } from '@/stores/app'
 import { useRoute, useRouter } from 'vue-router'
 import type { ChatAttachment, CompletionReport, Conversation, ConversationContextStatus, ConversationMessage,
-  Provider, InvocationTrace, ModelCapabilitySnapshot, RuntimeSnapshot, SubAgentGroup, SubAgentGroupDetail, TaskPlan, ToolSetSnapshot, VerificationRun, Workspace } from '@/types'
+  Provider, InvocationTrace, ModelCapabilitySnapshot, RuntimeSnapshot, TaskPlan, ToolSetSnapshot, VerificationRun, Workspace } from '@/types'
 
 const store = useAppStore()
 const route = useRoute()
@@ -70,7 +70,6 @@ type PendingUserInput = {
 }
 type InstructionSnapshotMeta = { path?: string; scope_path?: string; source?: string; priority?: number; content_digest?: string }
 type InstructionConflict = { previous?: InstructionSnapshotMeta[]; current?: InstructionSnapshotMeta[]; reason?: string }
-type RuntimeSubAgentDetails = { groups: SubAgentGroup[]; details: Record<string, SubAgentGroupDetail> }
 const runtimeTimeline = ref<RuntimeTimelineItem[]>([])
 const pendingApproval = ref<PendingApproval | null>(null)
 const pendingUserInput = ref<PendingUserInput | null>(null)
@@ -87,7 +86,6 @@ const runtimeDetails = ref<{
   verifications?: VerificationRun[]
   toolset?: ToolSetSnapshot
   capabilities?: ModelCapabilitySnapshot
-  subagents?: RuntimeSubAgentDetails
 } | null>(null)
 const loadingRuntimeDetails = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -172,24 +170,6 @@ function resultTagType(status?: string): 'default' | 'success' | 'warning' | 'er
   return 'default'
 }
 
-function subAgentTagType(status?: string): 'default' | 'success' | 'warning' | 'error' | 'info' {
-  if (status === 'completed') return 'success'
-  if (status === 'failed' || status === 'expired') return 'error'
-  if (status === 'partial_failed' || status === 'cancelled') return 'warning'
-  if (status === 'running' || status === 'queued') return 'info'
-  return 'default'
-}
-
-function subAgentProfileLabel(profile?: string) {
-  const labels: Record<string, string> = {
-    generic: '通用子 Agent',
-    document_image: '文档图片', memory_retrieval: '记忆检索', knowledge_retrieval: '知识检索',
-    conversation_retrieval: '会话检索', web_research: '网络研究', workspace_search: '工作区检索',
-    structured_query: '结构化查询', retrieval_aggregate: '检索汇总', research: '研究',
-    workspace_review: '工作区审查', workspace_change: '工作区变更', verification: '验证',
-  }
-  return labels[profile || ''] || profile || '子 Agent'
-}
 const quickPrompts = ['总结当前对话', '帮我检查这个项目', '从这里开始一个任务']
 
 function workspaceName(id?: string) {
@@ -223,7 +203,7 @@ async function loadRuntimeDetails(invocationID: string) {
   const read = async <T>(loader: () => Promise<T>) => {
     try { return await loader() } catch { return undefined }
   }
-  const [trace, snapshot, plan, result, verifications, toolset, capabilities, groups] = await Promise.all([
+  const [trace, snapshot, plan, result, verifications, toolset, capabilities] = await Promise.all([
     read(() => readInvocationTrace(invocationID)),
     read(() => readInvocationRuntimeSnapshot(invocationID)),
     read(() => readInvocationPlan(invocationID)),
@@ -231,15 +211,8 @@ async function loadRuntimeDetails(invocationID: string) {
     read(() => readInvocationVerifications(invocationID)),
     read(() => readInvocationToolSet(invocationID)),
     read(() => readInvocationCapabilities(invocationID)),
-    read(() => readInvocationSubAgents(invocationID)),
   ])
-  const details: Record<string, SubAgentGroupDetail> = {}
-  if (groups?.length) {
-    await Promise.all(groups.map(async (group) => {
-      try { details[group.id] = await readSubAgentGroup(group.id) } catch { /* 任务详情允许在子任务结束前暂时不可读 */ }
-    }))
-  }
-  runtimeDetails.value = { trace, snapshot, plan, result, verifications, toolset, capabilities, subagents: groups ? { groups, details } : undefined }
+  runtimeDetails.value = { trace, snapshot, plan, result, verifications, toolset, capabilities }
   loadingRuntimeDetails.value = false
 }
 
@@ -550,17 +523,6 @@ function runtimeEventText(type: string, data: Record<string, unknown>) {
   if (type === 'instruction.reconfirmed') return '项目指令快照已重新确认'
   if (type === 'model.migration_required') return '模型能力已变化，需要迁移或重新发起任务'
   if (type === 'toolset.snapshot_invalidated') return '工具目录已变化，需要重新选择工具'
-  if (type === 'subagent.requested') return `请求子 Agent：${String(data.profile || '未知职责')}`
-  if (type === 'subagent.started') return `子 Agent 已开始：${String(data.node_id || data.source_kind || data.run_id || '')}`
-  if (type === 'subagent.completed') return `子 Agent 已完成：${String(data.node_id || data.source_kind || data.run_id || '')}`
-  if (type === 'subagent.failed') return `子 Agent 失败：${String(data.error || data.run_id || '')}`
-  if (type === 'subagent.cancelled') return `子 Agent 已取消：${String(data.run_id || '')}`
-  if (type === 'subagent.expired') return `子 Agent 已超时：${String(data.run_id || '')}`
-  if (type === 'subagent.group_completed') return `子 Agent 组完成：${String(data.status || '')}`
-  if (type === 'retrieval.requested') return '开始并行检索'
-  if (type === 'retrieval.source_completed') return `检索来源完成：${String(data.source_kind || '')}`
-  if (type === 'retrieval.deduplicated') return `证据去重：${String(data.before || 0)} → ${String(data.after || 0)}`
-  if (type === 'retrieval.completed') return `检索完成：${String(data.evidence_count || 0)} 条证据`
   if (type === 'runtime.notice' && data.code === 'tool_execution') return `工具执行：${String(data.outcome || '未知')}`
   return type
 }
@@ -980,26 +942,6 @@ onMounted(async () => {
           <div v-if="runtimeDetails?.snapshot?.budget?.context_window" class="runtime-budget-line">
             上下文 {{ runtimeDetails.snapshot.budget.estimated_input || 0 }} / {{ runtimeDetails.snapshot.budget.context_window }} token
             <span v-if="runtimeDetails.snapshot.budget.budget_exhausted"> · 预算已触顶</span>
-          </div>
-          <div v-if="runtimeDetails?.subagents?.groups?.length" class="runtime-subagent-list">
-            <div class="runtime-subagent-heading">子 Agent 编排</div>
-            <div v-for="group in runtimeDetails.subagents.groups" :key="group.id" class="runtime-subagent-group">
-              <div class="runtime-subagent-group-heading">
-                <span><NTag size="small" :type="subAgentTagType(group.status)">{{ group.status }}</NTag> {{ subAgentProfileLabel(group.profile) }}</span>
-                <span>{{ group.completed_count }}/{{ group.expected_count }} 完成<span v-if="group.failed_count"> · {{ group.failed_count }} 失败</span></span>
-              </div>
-              <p v-if="group.purpose">{{ group.purpose }}</p>
-              <p v-if="group.error_summary" class="runtime-subagent-error">{{ group.error_summary }}</p>
-              <div v-if="runtimeDetails.subagents.details[group.id]?.runs?.length" class="runtime-subagent-runs">
-                <span v-for="run in runtimeDetails.subagents.details[group.id].runs" :key="run.id">
-                  <NTag size="tiny" :type="subAgentTagType(run.status)">{{ run.status }}</NTag>
-                  {{ run.source_kind || `节点 ${run.ordinal + 1}` }}<template v-if="run.error">：{{ run.error }}</template>
-                </span>
-              </div>
-              <div v-if="runtimeDetails.subagents.details[group.id]?.evidence?.length" class="runtime-subagent-evidence">
-                证据 {{ runtimeDetails.subagents.details[group.id].evidence?.length }} 条：{{ runtimeDetails.subagents.details[group.id].evidence?.slice(0, 3).map((item) => item.title || item.locator || item.source_kind).join(' · ') }}
-              </div>
-            </div>
           </div>
           <div v-if="runtimeDetails?.plan?.steps?.length" class="runtime-plan-list">
             <div v-for="step in runtimeDetails.plan.steps" :key="step.id" class="runtime-plan-step">

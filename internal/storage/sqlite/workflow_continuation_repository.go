@@ -95,7 +95,7 @@ func (r *runtimeRepository) CommitWorkflowContinuation(ctx context.Context, comm
 
 		var activeRows []invocationRow
 		if err := tx.Where("user_id = ? AND conversation_id = ? AND status IN ?", source.UserID, source.ConversationID, []string{
-			string(agentruntime.InvocationQueued), string(agentruntime.InvocationRunning), string(agentruntime.InvocationWaitingApproval), string(agentruntime.InvocationWaitingTool), string(agentruntime.InvocationWaitingUser), string(agentruntime.InvocationWaitingSubagents), string(agentruntime.InvocationCancelling),
+			string(agentruntime.InvocationQueued), string(agentruntime.InvocationRunning), string(agentruntime.InvocationWaitingApproval), string(agentruntime.InvocationWaitingTool), string(agentruntime.InvocationWaitingUser), string(agentruntime.InvocationCancelling),
 		}).Find(&activeRows).Error; err != nil {
 			return err
 		}
