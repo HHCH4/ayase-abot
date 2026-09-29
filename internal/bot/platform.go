@@ -1,7 +1,5 @@
 package bot
 
-import "context"
-
 // newPlatform 根据持久化配置创建具体平台适配器，管理器不依赖平台实现细节。
 func newPlatform(item Bot) (platform, error) {
 	switch item.Type {
@@ -18,5 +16,4 @@ func newPlatform(item Bot) (platform, error) {
 var (
 	_ platform = (*telegramPlatform)(nil)
 	_ platform = (*oneBotPlatform)(nil)
-	_ Handler  = func(context.Context, Message) error { return nil }
 )

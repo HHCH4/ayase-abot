@@ -191,7 +191,7 @@ func TestBotApprovalCannotCrossChatOrUserBoundary(t *testing.T) {
 	if _, _, err := manager.conversationForMessage(context.Background(), other); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.resolveApproval(context.Background(), other, "approval-owner", true); err == nil {
+	if _, err := manager.resolveApprovalChoiceID(context.Background(), other, "approval-owner", "approve"); err == nil {
 		t.Fatal("不同聊天不应解析审批")
 	}
 	if got := runtime.resolvedApproval(); got != "" {
@@ -243,15 +243,25 @@ type botTestPlatform struct {
 	sent []string
 }
 
-func (p *botTestPlatform) Run(context.Context, Handler) error { return nil }
-func (p *botTestPlatform) Test(context.Context) error         { return nil }
-func (p *botTestPlatform) Close() error                       { return nil }
-func (p *botTestPlatform) Send(_ context.Context, _ Message, text string) error {
+func (p *botTestPlatform) RunEvents(context.Context, EventHandler) error { return nil }
+func (p *botTestPlatform) Capabilities() PlatformCapabilities {
+	return PlatformCapabilities{PlainText: true, RichText: true, Reply: true, Mention: true, Reaction: true, Image: true, Audio: true, File: true, Recall: true, Poke: true, MaxTextLength: 4096}
+}
+func (p *botTestPlatform) DispatchAction(_ context.Context, action PlatformAction) (PlatformActionResult, error) {
+	text := action.Text
+	if action.Approval != nil {
+		text = approvalPromptText(*action.Approval)
+	}
+	if action.UserInput != nil {
+		text = userInputOptionsText(*action.UserInput)
+	}
 	p.mu.Lock()
 	p.sent = append(p.sent, text)
 	p.mu.Unlock()
-	return nil
+	return PlatformActionResult{MessageID: "test-message"}, nil
 }
+func (p *botTestPlatform) Test(context.Context) error { return nil }
+func (p *botTestPlatform) Close() error               { return nil }
 func (p *botTestPlatform) sentSnapshot() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -357,14 +367,21 @@ func (c *botRuntimeTestCoordinator) CancelInvocation(_ context.Context, id strin
 	c.invocations[id] = item
 	return item, nil
 }
-func (c *botRuntimeTestCoordinator) ResolveApproval(_ context.Context, id string, decision bool, _ string) (agentruntime.Approval, error) {
+func (c *botRuntimeTestCoordinator) ResolveApprovalChoice(_ context.Context, id, choiceID, _ string) (agentruntime.Approval, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	item, ok := c.approvals[id]
 	if !ok {
 		return agentruntime.Approval{}, agentruntime.ErrNotFound
 	}
-	if decision {
+	var approved bool
+	for _, choice := range item.Choices {
+		if choice.ID == choiceID {
+			approved = choice.Approved
+			break
+		}
+	}
+	if approved {
 		item.Status = agentruntime.ApprovalApproved
 	} else {
 		item.Status = agentruntime.ApprovalRejected

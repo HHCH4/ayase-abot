@@ -38,12 +38,30 @@ type userInputTicket struct {
 	Request      agentruntime.UserInputRequest
 }
 
-// approvalChoices 统一返回审批交互的两个安全选项；旧 Runtime 或旧事件中
-// 即使携带了业务 choices，也不能把它们混进工具授权流程。
-func approvalChoices(_ []agentruntime.ApprovalChoice) []agentruntime.ApprovalChoice {
-	// 普通问题的单选、多选和文本答案由 UserInputRequest 负责，审批本身
-	// 固定为“允许一次/拒绝”两个互斥选项，避免授权卡片承载业务选择。
-	return agentruntime.DefaultApprovalChoices()
+// approvalChoices 保留 Runtime 持久化的结构化选项。授权入口只接受这些
+// 稳定 ChoiceID，不能因为平台没有原生按钮就退化成一个无上下文的布尔值。
+func approvalChoices(values []agentruntime.ApprovalChoice) []agentruntime.ApprovalChoice {
+	if len(values) == 0 {
+		return agentruntime.DefaultApprovalChoices()
+	}
+	result := make([]agentruntime.ApprovalChoice, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value.ID = strings.TrimSpace(value.ID)
+		value.Label = strings.TrimSpace(value.Label)
+		if value.ID == "" || value.Label == "" {
+			continue
+		}
+		if _, exists := seen[value.ID]; exists {
+			continue
+		}
+		seen[value.ID] = struct{}{}
+		result = append(result, value)
+	}
+	if len(result) == 0 {
+		return agentruntime.DefaultApprovalChoices()
+	}
+	return result
 }
 
 // approvalChoicesFromEvent 将 SSE/Runtime 事件中的 JSON 选项恢复为强类型，
@@ -127,8 +145,14 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	rawText := message.Text
 	message.Text = strings.TrimSpace(message.Text)
 	startedAt := time.Now()
+	queued := false
 	slog.Info("机器人收到请求", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_type", message.ChatType, "chat_id", message.ChatID, "user_id", message.UserID, "message_id", message.ID, "text", rawText, "normalized_text", message.Text, "mentioned", message.Mentioned, "attachments", message.Attachments, "control", message.Control)
 	defer func() {
+		// 已先落 Inbox 的消息如果只走了观察、命令、审批或错误回复路径，
+		// 必须显式结束事实记录；真正排队的消息由话轮成功处理后统一回收。
+		if message.runtimeInboxPersisted && !message.runtimeInboxRetain && !queued && err == nil {
+			m.markRuntimeEvents([]string{runtimeInboxID(message)})
+		}
 		if err != nil {
 			// 统一记录处理失败及原始请求，避免只看到平台连接层的笼统错误。
 			slog.Error("机器人请求处理失败", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "text", rawText, "duration", time.Since(startedAt), "error", err)
@@ -140,11 +164,17 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	// 平台策略先于附件入库与模型执行；配置读取失败时不放宽白名单。
 	platformConfig, platformErr := m.resolveMessageConfig(ctx, message)
 	if platformErr != nil {
+		// 平台策略读取失败时仍给用户一个可操作的安全提示；具体配置错误只留在内部日志。
+		_ = m.send(ctx, message, "读取平台配置失败："+runtimeUserFacingError(platformErr))
 		return fmt.Errorf("读取平台策略失败: %w", platformErr)
 	}
 	message.UniqueSession = platformConfig.Platform.UniqueSession
 	if !m.platformMessageAllowed(message, platformConfig) {
 		return nil
+	}
+	m.touchRuntimeSource(ctx, message)
+	if configuredBot, botErr := m.Get(message.AdapterID); botErr == nil {
+		m.saveAdminRoute(ctx, configuredBot, message)
 	}
 	// 群历史在唤醒判断前记录，使未 @ 的成员发言也能进入同一来源的背景。
 	extensionConfig := platformConfig
@@ -153,6 +183,7 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 		if isGroupChat(message.ChatType) && message.Mentioned && platformConfig.Platform.EmptyMentionWaiting {
 			m.startMentionWait(message)
 			if platformConfig.Platform.EmptyMentionNeedReply {
+				m.recordRuntimeDecision(ctx, message, "reply_direct", "empty_mention_ack")
 				return m.send(ctx, message, "我在，接着发消息就好。")
 			}
 			return nil
@@ -174,21 +205,17 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	waitingForNext := m.consumeMentionWait(message)
 	allowed, admissionErr := m.messageAllowed(ctx, &message)
 	if admissionErr != nil {
+		// 准入策略失败不能静默丢弃消息，也不能把数据库或配置堆栈返回到聊天。
+		_ = m.send(ctx, message, "读取平台消息配置失败："+runtimeUserFacingError(admissionErr))
 		return fmt.Errorf("读取平台消息配置失败: %w", admissionErr)
 	}
 	if waitingForNext && isGroupChat(message.ChatType) {
 		allowed = true
 	}
-	proactive := false
-	if !allowed && shouldProactiveReply(message, extensionConfig.Extensions) {
-		// 主动回复只改变本轮的触发判定，后续仍走普通内置 Runtime 和会话权限。
-		allowed = true
-		proactive = true
-		slog.Info("群聊主动回复已触发", "source", messageSource(message), "user_id", message.UserID)
-	}
 	if !allowed {
-		// 未满足群聊触发或私聊唤醒条件时忽略，同时打印完整判断上下文。
-		slog.Info("机器人请求已忽略", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "text", rawText, "mentioned", message.Mentioned, "reason", "wakeup_not_met")
+		// 未被点名的群消息只进入持久上下文，不再以随机概率创建 Agent 任务。
+		slog.Info("机器人观察群聊消息", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "text", rawText, "mentioned", message.Mentioned)
+		m.recordRuntimeDecision(ctx, message, "observe", "not_addressed")
 		return nil
 	}
 	if message.Text == "" && len(message.Attachments) == 0 {
@@ -201,7 +228,46 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 		if platformConfig.Platform.DisableBuiltinCommands {
 			return nil
 		}
+		m.recordRuntimeDecision(ctx, message, "handle_command", "explicit_command")
 		return m.handleBotCommand(ctx, message, command)
+	}
+	if !extensionConfig.Extensions.RuntimeEnabled {
+		m.recordRuntimeDecision(ctx, message, "ignore", "runtime_disabled")
+		return nil
+	}
+	if !isGroupChat(message.ChatType) && extensionConfig.Extensions.PrivateMode == "observe_only" {
+		m.recordRuntimeDecision(ctx, message, "observe", "private_observe_only")
+		return nil
+	}
+	if isGroupChat(message.ChatType) && extensionConfig.Extensions.GroupParticipationMode == "observe_only" {
+		m.recordRuntimeDecision(ctx, message, "observe", "group_observe_only")
+		return nil
+	}
+	// 行为决策在启动 Agent 前执行：群聊无关消息只观察，稳定的社交短句直接
+	// 回复，只有真正需要理解或工具的内容才进入持久 Inbox/Invocation。
+	behavior := m.decideRuntimeBehavior(ctx, message, extensionConfig)
+	m.recordRuntimeDecisionDetail(ctx, message, behavior.Action, behavior.ReasonCodes, behavior.Confidence, behavior.RequiresAgent, behavior.AllowedTools, behavior.Urgency, behavior.FollowUpPolicy, behavior.SafetyPolicy)
+	switch behavior.Action {
+	case "observe":
+		return nil
+	case "acknowledge":
+		// 群聊中的低风险确认优先投影为一个轻量表情；这条路径仍经过
+		// 动作权限、平台能力和统一幂等记录，关闭 reaction_enabled 后才退回
+		// 普通文本，不会因为配置开关失效而丢掉确认。
+		if isGroupChat(message.ChatType) && extensionConfig.Extensions.ReactionEnabled && strings.TrimSpace(message.ID) != "" {
+			if _, reactionErr := m.DispatchAction(ctx, PlatformAction{Type: "add_reaction", Message: message, Emoji: "👍"}); reactionErr == nil {
+				return nil
+			} else {
+				slog.Debug("群聊轻量表情回应不可用，降级文本确认", "adapter_id", message.AdapterID, "error", reactionErr)
+			}
+		}
+		return m.send(ctx, message, behavior.DirectText)
+	case "wait_more":
+		return nil
+	}
+	if !extensionConfig.Extensions.AgentOnDemandEnabled {
+		m.recordRuntimeDecision(ctx, message, "acknowledge", "agent_disabled")
+		return m.send(ctx, message, "收到。")
 	}
 	if blockedByPattern(message.Text, platformConfig.Platform.BlockPatterns) {
 		return m.send(ctx, message, "消息未通过内容规则检查。")
@@ -209,17 +275,90 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	if !m.waitPlatformRateLimit(ctx, message, platformConfig.Platform) {
 		return nil
 	}
-	m.sendPlatformPreAck(ctx, message, platformConfig.Platform)
+	// Telegram 预回应本质上也是表情动作；行为层关闭表情后，平台级预回应
+	// 不能绕过该开关单独发送。
+	if extensionConfig.Extensions.ReactionEnabled {
+		m.sendPlatformPreAck(ctx, message, platformConfig.Platform)
+	}
+	// 附件必须在进入持久 Inbox 前转成 Artifact 引用；不能把临时路径或大块二进制
+	// 留到聚合窗口结束后再读取，否则平台临时文件可能已经被删除。
+	if len(message.Attachments) > 0 {
+		userID, conversationID, conversationErr := m.conversationForMessage(ctx, message)
+		if conversationErr != nil {
+			_ = m.send(ctx, message, "读取当前会话失败："+runtimeUserFacingError(conversationErr))
+			return conversationErr
+		}
+		stored, storeErr := m.storeMessageAttachments(ctx, message, userID, conversationID)
+		if storeErr != nil {
+			_ = m.send(ctx, message, botAttachmentFailureText(storeErr))
+			return fmt.Errorf("保存机器人附件失败: %w", storeErr)
+		}
+		message.Attachments = stored
+	}
+	delayMilliseconds := extensionConfig.Extensions.TurnWaitMilliseconds
+	if isGroupChat(message.ChatType) {
+		delayMilliseconds = extensionConfig.Extensions.GroupTurnWaitMilliseconds
+	}
+	delay := time.Duration(delayMilliseconds) * time.Millisecond
+	if delay <= 0 {
+		if isGroupChat(message.ChatType) {
+			delay = 1200 * time.Millisecond
+		} else {
+			delay = 1500 * time.Millisecond
+		}
+	}
+	if len(message.Attachments) > 0 {
+		attachmentDelay := time.Duration(extensionConfig.Extensions.AttachmentWaitMilliseconds) * time.Millisecond
+		if attachmentDelay <= 0 {
+			attachmentDelay = 4 * time.Second
+		}
+		delay = attachmentDelay
+	}
+	if enqueueErr := m.enqueueRuntimeMessage(ctx, message, delay, extensionConfig.Extensions.MaxTurnMessages, extensionConfig.Extensions.SourceQueueLimit); enqueueErr != nil {
+		if errors.Is(enqueueErr, ErrSourceQueueFull) {
+			// 队列满时只记录一次可检索的内部状态，不把“任务忙”作为
+			// 机器人聊天内容发送出去；平台消息已经进入 Inbox，保留 received
+			// 事实，恢复器会在来源有容量后再次聚合处理。
+			message.runtimeInboxRetain = message.runtimeInboxPersisted
+			m.recordRuntimeDecision(ctx, message, "ignore", "source_queue_full")
+			slog.Warn("Bot Runtime 来源队列已满，消息不再发送忙碌提示", "adapter_id", message.AdapterID, "source", messageSource(message), "message_id", message.ID)
+			return nil
+		}
+		// 入队失败不会再进入话轮刷新边界，必须在这里给出一次脱敏后的
+		// 可操作提示；原始错误只写入内部日志，避免把数据库或路径泄露给用户。
+		_ = m.send(ctx, message, botRuntimeStartError(enqueueErr))
+		return enqueueErr
+	}
+	queued = true
+	return nil
+}
+
+// startAgentForMessage 只处理已经由 Bot Runtime 聚合完成的自然话轮。
+func (m *Manager) startAgentForMessage(ctx context.Context, message Message) error {
+	config, err := m.resolveMessageConfig(ctx, message)
+	if err != nil {
+		return fmt.Errorf("读取 Bot Runtime 配置失败: %w", err)
+	}
+	m.recordRuntimeDecision(ctx, message, "reply_agent", "addressed_complex_request")
 	userID, conversationID, err := m.conversationForMessage(ctx, message)
 	if err != nil {
-		return err
+		return fmt.Errorf("读取当前会话失败: %w", err)
 	}
+	message.RuntimeConversationID = conversationID
 	// 在解析完会话后再读取群历史；如果这是新会话，conversationForMessage
 	// 已经清除了旧 UMO 缓存，当前请求不会把上一会话的群消息带进来。
 	idempotencyKey := botMessageIdempotencyKey(message)
 	groupContext := ""
-	if extensionConfig.Extensions.GroupContextEnabled || proactive {
-		groupContext = m.groupContextText(message, extensionConfig.Extensions)
+	if config.Extensions.GroupContextEnabled {
+		groupContext = m.groupContextText(ctx, message, config.Extensions)
+	}
+	if config.Extensions.RelationEnabled {
+		if relationContext := m.relationContextText(ctx, message); relationContext != "" {
+			if groupContext != "" {
+				groupContext += "\n"
+			}
+			groupContext += relationContext
+		}
 	}
 	lock := m.bindingLock(conversationID)
 	lock.Lock()
@@ -229,7 +368,7 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 		return fmt.Errorf("读取机器人会话失败: %w", err)
 	}
 	if item.Status != conversation.StatusActive {
-		return conversation.ErrArchived
+		return fmt.Errorf("机器人会话已归档: %w", conversation.ErrArchived)
 	}
 	timeout, timeoutErr := m.resolveRequestTimeout(ctx)
 	if timeoutErr != nil {
@@ -237,70 +376,56 @@ func (m *Manager) handleMessageWithRuntime(ctx context.Context, message Message)
 	}
 	attachments, storeErr := m.storeMessageAttachments(ctx, message, userID, conversationID)
 	if storeErr != nil {
-		_ = m.send(ctx, message, "附件保存失败："+trimError(storeErr))
 		return fmt.Errorf("保存机器人附件失败: %w", storeErr)
 	}
 	m.mu.RLock()
 	coordinator := m.runtimeCoordinator
 	m.mu.RUnlock()
 	if coordinator == nil {
-		// 兼容没有装配 Durable Runtime 的嵌入方，并记录本次完整输入。
-		slog.Info("机器人请求进入兼容 Agent 执行", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "text", message.Text, "attachments", attachments, "timeout", timeout)
-		return m.handleLegacyMessage(ctx, message, groupContext, proactive, userID, conversationID, attachments, timeout)
+		return errors.New("Bot Runtime 未装配 Agent Runtime")
 	}
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
 	request := agent.ChatRequest{
 		UserID: userID, BotID: message.AdapterID, ConversationID: conversationID, SessionID: conversationID,
-		Message: message.Text, GroupContext: groupContext, Proactive: proactive, Attachments: attachments, IdempotencyKey: idempotencyKey, QueueIfBusy: true, Stream: true,
-		BotDelivery: &agent.BotDeliveryTarget{Platform: string(message.Platform), ChatID: message.ChatID, ChatType: message.ChatType, UserID: message.UserID, MessageID: message.ID, ReplyMessageID: message.ReplyMessageID, UniqueSession: message.UniqueSession},
+		Message: message.Text, GroupContext: groupContext, Attachments: attachments, IdempotencyKey: idempotencyKey, QueueIfBusy: true, Stream: true,
+		AllowedTools: append([]string(nil), config.Extensions.AllowedReadOnlyTools...), ToolBudget: config.Extensions.ToolBudget,
+		BotDelivery: &agent.BotDeliveryTarget{Platform: string(message.Platform), ChatID: message.ChatID, ChatType: message.ChatType, UserID: message.UserID, MessageID: message.ID, ReplyMessageID: message.ReplyMessageID, SourceUMO: messageSource(message), TurnID: message.RuntimeTurnID, UniqueSession: message.UniqueSession},
 	}
 	if workspaceID := strings.TrimSpace(item.WorkspaceID); workspaceID != "" {
 		request.WorkspaceID = &workspaceID
+	}
+	action, execute, actionErr := m.prepareRuntimeAction(ctx, message, "start_agent", "start_agent:"+idempotencyKey, message.Text)
+	if actionErr != nil {
+		return fmt.Errorf("保存 Agent 启动作作计划失败: %w", actionErr)
+	}
+	if !execute {
+		return nil
+	}
+	if err := m.acquireBotSlot(ctx, message.AdapterID, config.Extensions.RuntimeMaxConcurrency); err != nil {
+		m.finishRuntimeAction(ctx, action, "failed", err.Error())
+		return err
 	}
 	// 记录交给内置 Agent 的完整请求对象，便于把平台消息和 Invocation 对齐。
 	slog.Info("机器人请求启动内置 Agent", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "request", request)
 	invocation, startErr := coordinator.StartInvocation(ctx, request)
 	if startErr != nil {
-		_ = m.send(ctx, message, botRuntimeStartError(startErr))
+		m.releaseBotSlot(message.AdapterID)
+		m.finishRuntimeAction(ctx, action, "failed", startErr.Error())
 		return fmt.Errorf("启动机器人 Runtime invocation 失败: %w", startErr)
 	}
+	m.finishRuntimeAction(ctx, action, "completed", invocation.ID)
 	// 启动成功后记录 Durable Runtime 返回的任务标识，后续事件和响应都用它关联。
 	slog.Info("机器人请求已启动", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "invocation_id", invocation.ID, "status", invocation.Status)
 	// 排队状态只保存在 Runtime 中，平台聊天等待最终答复即可。
 	if !invocation.QueuedBehind {
 		m.setActiveInvocation(message, invocation.ID)
 	}
-	m.observeInvocation(message, invocation.ID)
+	if !m.observeInvocation(message, invocation.ID) {
+		m.releaseBotSlot(message.AdapterID)
+	}
 	return nil
-}
-
-func (m *Manager) handleLegacyMessage(ctx context.Context, message Message, groupContext string, proactive bool, userID, conversationID string, attachments []agent.Attachment, timeout time.Duration) error {
-	requestCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	var response string
-	for event, runErr := range m.kernel.Run(requestCtx, agent.ChatRequest{
-		UserID: userID, BotID: message.AdapterID, ConversationID: conversationID, SessionID: conversationID,
-		Message: message.Text, GroupContext: groupContext, Proactive: proactive, Attachments: attachments,
-	}) {
-		if runErr != nil {
-			_ = m.send(requestCtx, message, "处理失败："+trimError(runErr))
-			return fmt.Errorf("Agent 处理机器人消息失败: %w", runErr)
-		}
-		if event == nil || !event.IsFinalResponse() || event.Content == nil || event.Author == "user" {
-			continue
-		}
-		if text := agent.TextFromContent(event.Content); text != "" {
-			response = text
-		}
-	}
-	if strings.TrimSpace(response) == "" {
-		return nil
-	}
-	// 兼容执行模式直接得到最终文本，发送动作本身还会由 Manager.Send 记录。
-	slog.Info("机器人兼容 Agent 返回响应", "adapter_id", message.AdapterID, "platform", message.Platform, "conversation_id", conversationID, "text", response)
-	return m.sendLLM(requestCtx, message, response)
 }
 
 func (m *Manager) groupMessageAllowed(message Message) bool {
@@ -362,7 +487,8 @@ func (m *Manager) handleBotCommand(ctx context.Context, message Message, command
 	}
 	authorization, err := m.authorizeCommand(ctx, bot, message, descriptor, arg)
 	if err != nil {
-		return err
+		// 权限判断失败可能来自存储或配置层，不能把内部错误直接泄露到平台聊天。
+		return m.send(ctx, message, "权限校验失败："+runtimeUserFacingError(err))
 	}
 	if !authorization.Command.Enabled {
 		// A disabled command is reported as disabled to everyone; the reason it
@@ -393,7 +519,9 @@ func (m *Manager) conversationForMessage(ctx context.Context, message Message) (
 			return userID, current, nil
 		}
 	}
+	baseOccupied := false
 	if item, err := m.conversations.Get(ctx, userID, baseConversationID); err == nil {
+		baseOccupied = true
 		if item.Status == conversation.StatusActive {
 			if err := m.ensureConversationSource(ctx, message, item); err != nil {
 				return "", "", err
@@ -428,15 +556,16 @@ func (m *Manager) conversationForMessage(ctx context.Context, message Message) (
 	} else {
 		return "", "", fmt.Errorf("恢复机器人会话失败: %w", listErr)
 	}
+	newConversationID := baseConversationID
+	if baseOccupied {
+		newConversationID = "bot-" + strings.TrimPrefix(agent.NewSessionID(), "session-")
+	}
 	item, err := m.conversations.Create(ctx, conversation.CreateRequest{
-		ID: baseConversationID, UserID: userID, Source: messageSource(message), Title: fmt.Sprintf("%s · %s", message.Platform, message.ChatID),
+		ID: newConversationID, UserID: userID, Source: messageSource(message), Title: fmt.Sprintf("%s · %s", message.Platform, message.ChatID),
 	})
 	if err != nil {
 		return "", "", fmt.Errorf("创建机器人会话失败: %w", err)
 	}
-	// 稳定基础会话不存在时代表来源开启了一个全新的会话，不能继续使用
-	// 进程内保留的旧群聊背景；当前消息仍会作为本轮独立输入发送。
-	m.clearGroupContext(messageSource(message))
 	m.setActiveConversation(key, item.ID)
 	return userID, item.ID, nil
 }
@@ -492,8 +621,7 @@ func (m *Manager) startNewConversation(ctx context.Context, message Message) err
 	if createErr != nil {
 		return fmt.Errorf("创建新机器人会话失败: %w", createErr)
 	}
-	// /new 明确要求从空上下文开始，连同来源级群聊背景一起重置。
-	m.clearGroupContext(messageSource(message))
+	// /new 只切断 Agent Conversation；来源背景和关系状态属于 Bot Runtime，继续保留。
 	key := chatBindingKey(message)
 	m.mu.Lock()
 	m.activeConversations[key] = created.ID
@@ -507,17 +635,17 @@ func (m *Manager) startNewConversation(ctx context.Context, message Message) err
 func (m *Manager) statusText(ctx context.Context, message Message) string {
 	_, conversationID, err := m.conversationForMessage(ctx, message)
 	if err != nil {
-		return "读取会话状态失败：" + trimError(err)
+		return "读取会话状态失败：" + runtimeUserFacingError(err)
 	}
 	m.mu.RLock()
 	coordinator := m.runtimeCoordinator
 	m.mu.RUnlock()
 	if coordinator == nil {
-		return fmt.Sprintf("当前会话：%s。当前使用兼容模式运行。", shortIdentifier(conversationID))
+		return fmt.Sprintf("当前会话：%s。任务状态服务尚未装配。", shortIdentifier(conversationID))
 	}
 	item, found, findErr := m.findActiveInvocation(ctx, message, conversationID)
 	if findErr != nil {
-		return "读取任务状态失败：" + trimError(findErr)
+		return "读取任务状态失败：" + runtimeUserFacingError(findErr)
 	}
 	if found {
 		// A fresh Manager has no in-memory subscription map. Attaching here makes
@@ -552,7 +680,7 @@ func (m *Manager) stopChatInvocation(ctx context.Context, message Message) error
 func (m *Manager) controlChatInvocation(ctx context.Context, message Message, action, available string) error {
 	_, conversationID, conversationErr := m.conversationForMessage(ctx, message)
 	if conversationErr != nil {
-		return conversationErr
+		return m.send(ctx, message, "读取当前会话失败："+runtimeUserFacingError(conversationErr))
 	}
 	m.mu.RLock()
 	coordinator := m.runtimeCoordinator
@@ -563,14 +691,14 @@ func (m *Manager) controlChatInvocation(ctx context.Context, message Message, ac
 	// 始终从 Runtime 读取当前状态，避免队列前进后内存中的旧 ID 指向终态任务。
 	item, found, findErr := m.findActiveInvocation(ctx, message, conversationID)
 	if findErr != nil {
-		return m.send(ctx, message, "读取任务状态失败："+trimError(findErr))
+		return m.send(ctx, message, "读取任务状态失败："+runtimeUserFacingError(findErr))
 	}
 	if !found {
 		return m.send(ctx, message, "当前没有"+available+"的任务。")
 	}
 	m.observeInvocation(message, item.ID)
 	if _, err := coordinator.CancelInvocation(ctx, item.ID); err != nil {
-		return m.send(ctx, message, action+"任务失败："+trimError(err))
+		return m.send(ctx, message, action+"任务失败："+runtimeUserFacingError(err))
 	}
 	return m.send(ctx, message, "已请求"+action+"当前任务。")
 }
@@ -712,11 +840,11 @@ func validateBotAttachmentSizes(items []agent.Attachment) error {
 	return nil
 }
 
-func (m *Manager) observeInvocation(message Message, invocationID string) {
+func (m *Manager) observeInvocation(message Message, invocationID string) bool {
 	m.mu.Lock()
 	if _, exists := m.observedInvocations[invocationID]; exists {
 		m.mu.Unlock()
-		return
+		return false
 	}
 	m.observedInvocations[invocationID] = struct{}{}
 	// 长期运行仅保留最近的订阅去重键，避免每条消息永久增加内存占用。
@@ -729,7 +857,7 @@ func (m *Manager) observeInvocation(message Message, invocationID string) {
 	baseCtx := m.baseCtx
 	m.mu.Unlock()
 	if coordinator == nil {
-		return
+		return false
 	}
 	if baseCtx == nil {
 		baseCtx = context.Background()
@@ -738,7 +866,8 @@ func (m *Manager) observeInvocation(message Message, invocationID string) {
 		backlog, live, unsubscribe, err := coordinator.Subscribe(baseCtx, invocationID, 0)
 		if err != nil {
 			m.clearActiveInvocation(message, invocationID)
-			_ = m.send(baseCtx, message, "任务订阅失败："+trimError(err))
+			m.releaseBotSlot(message.AdapterID)
+			_ = m.send(baseCtx, message, "任务订阅失败："+runtimeUserFacingError(err))
 			return
 		}
 		defer unsubscribe()
@@ -840,6 +969,7 @@ func (m *Manager) observeInvocation(message Message, invocationID string) {
 					slog.Error("机器人最终答复发送失败", "adapter_id", message.AdapterID, "invocation_id", invocationID, "error", sendErr)
 				}
 				m.clearActiveInvocation(message, invocationID)
+				m.releaseBotSlot(message.AdapterID)
 				return true
 			case agentruntime.EventInvocationFailed:
 				flushStreamLog("failed", "")
@@ -847,18 +977,21 @@ func (m *Manager) observeInvocation(message Message, invocationID string) {
 				if reason == "" {
 					reason = "运行时返回失败"
 				}
-				_ = m.send(baseCtx, message, "任务失败："+trimError(errors.New(reason)))
+				_ = m.send(baseCtx, message, "任务失败："+runtimeUserFacingError(errors.New(reason)))
 				m.clearActiveInvocation(message, invocationID)
+				m.releaseBotSlot(message.AdapterID)
 				return true
 			case agentruntime.EventInvocationCancelled:
 				flushStreamLog("cancelled", "")
 				_ = m.send(baseCtx, message, "任务已取消。")
 				m.clearActiveInvocation(message, invocationID)
+				m.releaseBotSlot(message.AdapterID)
 				return true
 			case agentruntime.EventInvocationExpired:
 				flushStreamLog("expired", "")
 				_ = m.send(baseCtx, message, "任务已过期。")
 				m.clearActiveInvocation(message, invocationID)
+				m.releaseBotSlot(message.AdapterID)
 				return true
 			}
 			return false
@@ -879,6 +1012,7 @@ func (m *Manager) observeInvocation(message Message, invocationID string) {
 			}
 		}
 	}()
+	return true
 }
 
 // restoreBotObservers 让重启前已接收的 Bot 队列继续把结果发回原聊天。
@@ -902,12 +1036,19 @@ func (m *Manager) restoreBotObservers(ctx context.Context) {
 		if _, botErr := m.Get(item.BotID); botErr != nil {
 			continue
 		}
+		// 恢复持久化任务时必须重建完整的来源上下文，否则恢复后的工具动作、引用回复、
+		// 主动消息策略和会话关联会退化成默认值，表现为“任务完成但发错地方”。
 		message := Message{ID: target.MessageID, AdapterID: item.BotID, Platform: Type(target.Platform), ChatID: target.ChatID,
-			ChatType: target.ChatType, UserID: target.UserID, ReplyMessageID: target.ReplyMessageID, UniqueSession: target.UniqueSession, Restored: true}
+			ChatType: target.ChatType, UserID: target.UserID, ReplyMessageID: target.ReplyMessageID, SourceUMO: target.SourceUMO,
+			RuntimeTurnID: target.TurnID, RuntimeConversationID: item.ConversationID, IsProactive: item.Proactive,
+			UniqueSession: target.UniqueSession, Restored: true}
 		if item.Status != agentruntime.InvocationQueued {
 			m.setActiveInvocation(message, item.ID)
 		}
-		m.observeInvocation(message, item.ID)
+		m.reserveRestoredBotSlot(item.BotID)
+		if !m.observeInvocation(message, item.ID) {
+			m.releaseBotSlot(item.BotID)
+		}
 	}
 }
 
@@ -916,55 +1057,162 @@ func (m *Manager) deliverApproval(ctx context.Context, message Message, event ag
 	if approvalID == "" {
 		return
 	}
-	chatKey := chatBindingKey(message)
-	m.mu.Lock()
-	tickets := m.pendingApprovals[chatKey]
-	for _, ticket := range tickets {
-		if ticket.ID == approvalID && ticket.InvocationID == event.InvocationID {
-			// Runtime 回放可能再次投递同一事件；去重后避免用户看到重复审批卡片。
-			m.mu.Unlock()
-			return
-		}
-	}
 	choices := approvalChoicesFromEvent(event.Data)
-	tickets = append(tickets, approvalTicket{ID: approvalID, InvocationID: event.InvocationID, Choices: choices})
-	if len(tickets) > 20 {
-		tickets = tickets[len(tickets)-20:]
+	requester := strings.TrimSpace(message.AutoName)
+	if requester == "" {
+		requester = strings.TrimSpace(message.UserID)
 	}
-	m.pendingApprovals[chatKey] = tickets
-	m.mu.Unlock()
-	prompt := ApprovalPrompt{ApprovalID: approvalID, ToolName: eventString(event.Data, "tool_name"), Hint: eventString(event.Data, "hint"), Choices: choices}
+	prompt := ApprovalPrompt{
+		ApprovalID: approvalID,
+		ToolName:   eventString(event.Data, "tool_name"),
+		Hint:       eventString(event.Data, "hint"),
+		Choices:    choices,
+		Source:     messageSource(message),
+		Requester:  requester,
+	}
 	prompt.ExpiresAt = eventTime(event.Data, "expires_at")
-	// 审批请求可能由平台专用交互组件发送，先在 Manager 层记录完整提示内容。
+	// 审批只推送到当前 Bot 的管理员私聊，不能把危险操作授权交给原聊天成员。
 	slog.Info("机器人发送审批请求", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "invocation_id", event.InvocationID, "approval_id", approvalID, "prompt", prompt)
+	botItem, botErr := m.Get(message.AdapterID)
+	if botErr != nil {
+		return
+	}
 	m.mu.RLock()
-	entry, running := m.runtimes[message.AdapterID]
+	_, running := m.runtimes[message.AdapterID]
+	repository := m.runtimeState
 	m.mu.RUnlock()
 	if !running {
 		return
 	}
-	if sender, ok := entry.platform.(ApprovalSender); ok {
-		if err := sender.SendApproval(ctx, message, prompt); err == nil {
-			slog.Info("机器人审批请求发送成功", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "approval_id", approvalID)
-			return
-		} else {
-			slog.Error("机器人审批请求发送失败", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "approval_id", approvalID, "prompt", prompt, "error", err)
+	routes := make(map[string]AdminRoute)
+	if repository != nil {
+		if stored, routeErr := repository.ListAdminRoutes(ctx, botItem.ID); routeErr == nil {
+			for _, route := range stored {
+				routes[route.UserID] = route
+			}
 		}
 	}
-	position := len(tickets)
-	text := fmt.Sprintf("需要确认（请求 %d）：工具 %s\n%s", position, safeProgressText(prompt.ToolName), safeProgressText(prompt.Hint))
+	delivered := 0
+	for _, adminID := range m.globalAdminIDsForMessage(ctx, botItem, message) {
+		if repository != nil {
+			alreadyDelivered, deliveryErr := repository.ApprovalDelivered(ctx, approvalID, adminID)
+			if deliveryErr != nil {
+				slog.Warn("读取审批私聊投递状态失败", "approval_id", approvalID, "admin_id", adminID, "error", deliveryErr)
+				continue
+			}
+			if alreadyDelivered {
+				delivered++
+				continue
+			}
+		}
+		target := Message{AdapterID: botItem.ID, Platform: botItem.Type, UserID: adminID, ChatID: adminID, ChatType: "private", Mentioned: true}
+		if botItem.Type == TypeTelegram {
+			route, ok := routes[adminID]
+			if !ok || route.Platform != TypeTelegram || strings.TrimSpace(route.ChatID) == "" {
+				continue
+			}
+			target.ChatID = route.ChatID
+		}
+		m.addPendingApprovalTicket(target, approvalTicket{ID: approvalID, InvocationID: event.InvocationID, Choices: choices})
+		if !m.runtimeActionAllowed(ctx, target, "send_text") {
+			continue
+		}
+		// 原生审批卡片也是平台动作；先落 Action Plan，再由适配器根据
+		// Approval 字段选择按钮或文本渲染，重启时不会重复推送。
+		nativeAction, executeNative, actionErr := m.prepareRuntimeAction(ctx, target, "send_text", "approval_notification:"+approvalID+":"+adminID, approvalPromptText(prompt))
+		if actionErr != nil {
+			slog.Error("保存审批通知动作失败", "adapter_id", message.AdapterID, "admin_id", adminID, "approval_id", approvalID, "error", actionErr)
+			continue
+		}
+		if !executeNative {
+			delivered++
+			continue
+		}
+		result, sendErr := m.executeRuntimeAction(ctx, PlatformAction{Type: "send_text", Message: target, Text: approvalPromptText(prompt), Approval: &prompt})
+		if sendErr != nil {
+			slog.Error("管理员审批私聊发送失败", "adapter_id", message.AdapterID, "admin_id", adminID, "approval_id", approvalID, "error", sendErr)
+			m.finishRuntimeAction(ctx, nativeAction, "failed", sendErr.Error())
+			continue
+		}
+		platformMessageID := result.MessageID
+		m.finishRuntimeAction(ctx, nativeAction, "completed", platformMessageID)
+		if repository != nil {
+			if markErr := repository.MarkApprovalDelivered(ctx, approvalID, adminID, time.Now().UTC()); markErr != nil {
+				slog.Warn("保存审批私聊投递状态失败", "approval_id", approvalID, "admin_id", adminID, "error", markErr)
+			}
+			if platformMessageID != "" {
+				if bindingRepository, bindingOK := repository.(RuntimeApprovalBindingRepository); bindingOK {
+					bindingErr := bindingRepository.SaveApprovalMessageBinding(ctx, ApprovalMessageBinding{
+						ID: newRuntimeID("approval-binding", botItem.ID, approvalID, adminID, string(target.Platform), target.ChatID, platformMessageID), BotID: botItem.ID,
+						ApprovalID: approvalID, AdminID: adminID, Platform: target.Platform, ChatID: target.ChatID, MessageID: platformMessageID, CreatedAt: time.Now().UTC(),
+					})
+					if bindingErr != nil {
+						slog.Warn("保存审批引用映射失败", "approval_id", approvalID, "admin_id", adminID, "message_id", platformMessageID, "error", bindingErr)
+					}
+				}
+			}
+		}
+		delivered++
+	}
+	if delivered == 0 {
+		// 当前消息来源没有可投递的管理员私聊路由时，仍在原会话展示结构化选项，
+		// 让已有的引用回复/命令解析链可以继续完成审批，而不是只留下无法操作的提示。
+		m.addPendingApprovalTicket(message, approvalTicket{ID: approvalID, InvocationID: event.InvocationID, Choices: choices})
+		fallback := "当前没有可用的管理员私聊路由，审批仍在等待中。\n\n" + approvalPromptText(prompt)
+		_ = m.send(ctx, message, fallback)
+	}
+	slog.Info("管理员审批私聊投递完成", "adapter_id", message.AdapterID, "approval_id", approvalID, "delivered", delivered)
+}
+
+func (m *Manager) addPendingApprovalTicket(message Message, ticket approvalTicket) {
+	chatKey := chatBindingKey(message)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, existing := range m.pendingApprovals[chatKey] {
+		if existing.ID == ticket.ID && existing.InvocationID == ticket.InvocationID {
+			return
+		}
+	}
+	tickets := append(m.pendingApprovals[chatKey], ticket)
+	if len(tickets) > 20 {
+		tickets = tickets[len(tickets)-20:]
+	}
+	m.pendingApprovals[chatKey] = tickets
+}
+
+func approvalPromptText(prompt ApprovalPrompt) string {
+	text := fmt.Sprintf("需要管理员审批：%s\n工具：%s\n%s", publicReference("A", prompt.ApprovalID), safeProgressText(prompt.ToolName), safeProgressText(prompt.Hint))
+	if strings.TrimSpace(prompt.Source) != "" {
+		text += "\n来源：" + safeProgressText(prompt.Source)
+	}
+	if strings.TrimSpace(prompt.Requester) != "" {
+		text += "\n请求人：" + safeProgressText(prompt.Requester)
+	}
 	if prompt.ExpiresAt != nil {
 		text += "\n有效期至：" + prompt.ExpiresAt.Format(time.RFC3339)
 	}
-	text += "\n请选择："
-	for index, choice := range prompt.Choices {
+	choices := prompt.Choices
+	if len(choices) == 0 {
+		choices = agentruntime.DefaultApprovalChoices()
+	}
+	for index, choice := range choices {
 		text += fmt.Sprintf("\n%d. %s", index+1, safeProgressText(choice.Label))
+		if strings.TrimSpace(choice.Description) != "" {
+			text += " — " + safeProgressText(choice.Description)
+		}
 	}
-	text += "\n请只回复选项序号；当前聊天没有待确认请求时，数字不会被当作审批。"
-	if len(tickets) > 1 {
-		text += "\n若同时有多个请求，请回复：审批 <请求序号> <选项序号>。"
+	multi := false
+	for _, choice := range choices {
+		if choice.MultiSelect {
+			multi = true
+			break
+		}
 	}
-	_ = m.send(ctx, message, text)
+	selectionHint := "选项编号"
+	if multi {
+		selectionHint = "选项编号（多选用逗号分隔，例如 1,3）"
+	}
+	return text + "\n请引用本消息回复" + selectionHint + "；也可使用 /approve " + publicReference("A", prompt.ApprovalID) + " <选项编号>，拒绝使用 /reject " + publicReference("A", prompt.ApprovalID) + " <选项编号> [原因]。孤立的“批准”不会授权。"
 }
 
 // deliverUserInput 将 ADK 的 RequestInput 投影为平台问题卡片。回答题目时
@@ -1001,15 +1249,30 @@ func (m *Manager) deliverUserInput(ctx context.Context, message Message, event a
 	m.mu.Unlock()
 	slog.Info("机器人发送用户问题", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "user_id", message.UserID, "invocation_id", event.InvocationID, "request", request)
 	m.mu.RLock()
-	entry, running := m.runtimes[message.AdapterID]
+	_, running := m.runtimes[message.AdapterID]
 	m.mu.RUnlock()
 	if running {
-		if sender, ok := entry.platform.(UserInputSender); ok {
-			if err := sender.SendUserInput(ctx, message, request); err == nil {
-				return
-			} else {
-				slog.Error("机器人用户问题发送失败", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "request", request, "error", err)
-			}
+		if !m.runtimeActionAllowed(ctx, message, "send_text") {
+			return
+		}
+		// 用户问题与审批一样必须先落动作计划；平台适配器只渲染结构化
+		// 请求，Bot Runtime 不直接调用具体平台接口。
+		nativeAction, executeNative, actionErr := m.prepareRuntimeAction(ctx, message, "send_text", "user_input:"+request.InvocationID+":"+request.ID, userInputOptionsText(request))
+		if actionErr != nil {
+			slog.Error("保存用户问题动作失败", "adapter_id", message.AdapterID, "request_id", request.ID, "error", actionErr)
+			return
+		} else if !executeNative {
+			return
+		}
+		if _, executeErr := m.executeRuntimeAction(ctx, PlatformAction{Type: "send_text", Message: message, Text: userInputOptionsText(request), UserInput: &request}); executeErr == nil {
+			m.finishRuntimeAction(ctx, nativeAction, "completed", "user_input_sent")
+			return
+		} else {
+			m.finishRuntimeAction(ctx, nativeAction, "failed", executeErr.Error())
+			slog.Error("机器人用户问题发送失败", "adapter_id", message.AdapterID, "platform", message.Platform, "chat_id", message.ChatID, "request", request, "error", executeErr)
+			// 动作已经进入统一计划并且执行结果不确定时不能再走第二条发送路径，
+			// 否则平台超时但实际已成功会导致用户收到重复问题。
+			return
 		}
 	}
 	_ = m.send(ctx, message, userInputOptionsText(request))
@@ -1031,34 +1294,57 @@ func (m *Manager) handleApprovalControl(ctx context.Context, message Message) er
 	}
 	allowed, authErr := m.approvalReplyAllowed(ctx, message)
 	if authErr != nil {
-		_ = m.send(ctx, message, "审批权限校验失败："+trimError(authErr))
+		_ = m.send(ctx, message, "审批权限校验失败："+runtimeUserFacingError(authErr))
 		return authErr
 	}
 	if !allowed {
 		return nil
 	}
 	if _, err := m.resolveApprovalChoiceID(ctx, message, message.Control.ApprovalID, choiceID); err != nil {
-		_ = m.send(ctx, message, "审批处理失败："+trimError(err))
+		_ = m.send(ctx, message, "审批处理失败："+runtimeUserFacingError(err))
 		return err
 	}
 	return nil
 }
 
-// handlePendingApprovalReply 只解析“当前审批卡片”里的结构化数字选择。
-// 它不会把批准、拒绝、可以等自然语言当作控制信号，避免普通聊天被拦截。
+// handlePendingApprovalReply 只在当前管理员私聊确实存在待审批票据时解析自然语言，
+// 因此普通聊天中的“批准”或数字不会被误当成授权决定。
 func (m *Manager) handlePendingApprovalReply(ctx context.Context, message Message) (bool, error) {
-	selection, ok := parseApprovalSelection(message.Text)
-	if !ok {
-		return false, nil
-	}
 	tickets, err := m.pendingApprovalTickets(ctx, message)
 	if err != nil {
+		_ = m.send(ctx, message, "读取审批失败："+runtimeUserFacingError(err))
 		return true, err
 	}
 	if len(tickets) == 0 {
 		return false, nil
 	}
+	text := strings.TrimSpace(message.Text)
+	if text == "批准" || text == "允许一次" || text == "拒绝" || strings.HasPrefix(text, "拒绝 ") {
+		// 自然语言没有绑定具体 approval_id 和选项，不能跨请求猜测授权目标。
+		return true, m.send(ctx, message, "审批必须绑定具体请求和选项：请引用审批消息回复选项编号，或使用 /approve <审批编号> <选项编号>。")
+	}
+	selection, ok := parseApprovalSelection(text)
+	if !ok {
+		return false, nil
+	}
+	// 当前聊天只有一张待审批票据时，直接回复选项就是明确绑定；有多张
+	// 票据时才要求引用或带审批编号，避免把“1”误投递到另一项审批。
+	return m.resolvePendingApprovalSelection(ctx, message, tickets, selection)
+}
+
+func (m *Manager) resolvePendingApprovalSelection(ctx context.Context, message Message, tickets []approvalTicket, selection approvalSelection) (bool, error) {
 	ticketIndex := selection.TicketIndex
+	if reference := strings.TrimSpace(selection.TicketReference); reference != "" {
+		for index, ticket := range tickets {
+			if ticket.ID == reference || publicReference("A", ticket.ID) == strings.ToUpper(reference) {
+				ticketIndex = index + 1
+				break
+			}
+		}
+		if ticketIndex == 0 {
+			return true, m.send(ctx, message, "审批编号不存在或不属于当前机器人。")
+		}
+	}
 	if ticketIndex == 0 {
 		if len(tickets) != 1 {
 			return true, m.send(ctx, message, "当前有多个待确认请求，请回复：审批 <请求序号> <选项序号>。")
@@ -1075,13 +1361,26 @@ func (m *Manager) handlePendingApprovalReply(ctx context.Context, message Messag
 	choice := ticket.Choices[selection.ChoiceIndex-1]
 	allowed, authErr := m.approvalReplyAllowed(ctx, message)
 	if authErr != nil {
-		_ = m.send(ctx, message, "审批权限校验失败："+trimError(authErr))
+		_ = m.send(ctx, message, "审批权限校验失败："+runtimeUserFacingError(authErr))
 		return true, authErr
 	}
 	if !allowed {
 		return true, nil
 	}
-	_, err = m.resolveApprovalChoiceID(ctx, message, ticket.ID, choice.ID)
+	choiceIDs := []string{choice.ID}
+	if len(selection.ChoiceIndices) > 1 {
+		choiceIDs = make([]string, 0, len(selection.ChoiceIndices))
+		for _, choiceIndex := range selection.ChoiceIndices {
+			if choiceIndex < 1 || choiceIndex > len(ticket.Choices) {
+				return true, m.send(ctx, message, "审批选项序号无效，请按审批提示中的选项选择。")
+			}
+			choiceIDs = append(choiceIDs, ticket.Choices[choiceIndex-1].ID)
+		}
+	}
+	_, err := m.resolveApprovalChoiceIDsWithReason(ctx, message, ticket.ID, choiceIDs, selection.Reason)
+	if err != nil {
+		_ = m.send(ctx, message, "审批处理失败："+runtimeUserFacingError(err))
+	}
 	return true, err
 }
 
@@ -1090,6 +1389,7 @@ func (m *Manager) handlePendingApprovalReply(ctx context.Context, message Messag
 func (m *Manager) handlePendingUserInputReply(ctx context.Context, message Message) (bool, error) {
 	tickets, err := m.pendingUserInputTickets(ctx, message)
 	if err != nil {
+		_ = m.send(ctx, message, "读取待回答问题失败："+runtimeUserFacingError(err))
 		return true, err
 	}
 	if len(tickets) == 0 {
@@ -1107,7 +1407,7 @@ func (m *Manager) handlePendingUserInputReply(ctx context.Context, message Messa
 		return true, m.send(ctx, message, userInputOptionsText(ticket.Request))
 	}
 	if err := m.resolveUserInput(ctx, message, ticket, response); err != nil {
-		_ = m.send(ctx, message, "提交回答失败："+trimError(err))
+		_ = m.send(ctx, message, "提交回答失败："+runtimeUserFacingError(err))
 		return true, err
 	}
 	if summary == "" {
@@ -1353,45 +1653,116 @@ func (m *Manager) sendPermissionDenied(ctx context.Context, message Message, rea
 // parseApprovalSelection 解析文本平台的选项选择。单个待办时允许回复“1”；
 // 多个待办时必须显式写成“审批 请求序号 选项序号”，避免数字含义歧义。
 type approvalSelection struct {
-	TicketIndex int
-	ChoiceIndex int
+	TicketIndex     int
+	TicketReference string
+	ChoiceIndex     int
+	ChoiceIndices   []int
+	Reason          string
 }
 
 func parseApprovalSelection(value string) (approvalSelection, bool) {
 	fields := strings.Fields(strings.TrimSpace(value))
 	if len(fields) == 1 {
-		choice, err := parsePositiveInt(fields[0])
+		choices, err := parseChoiceIndexes(fields[0])
 		if err != nil {
 			return approvalSelection{}, false
 		}
-		return approvalSelection{ChoiceIndex: choice}, true
+		return approvalSelection{ChoiceIndex: choices[0], ChoiceIndices: choices}, true
 	}
 	if len(fields) == 2 && (fields[0] == "选" || fields[0] == "选择") {
-		choice, err := parsePositiveInt(fields[1])
+		choices, err := parseChoiceIndexes(fields[1])
 		if err != nil {
 			return approvalSelection{}, false
 		}
-		return approvalSelection{ChoiceIndex: choice}, true
+		return approvalSelection{ChoiceIndex: choices[0], ChoiceIndices: choices}, true
 	}
 	if len(fields) == 3 && fields[0] == "审批" {
-		ticket, ticketErr := parsePositiveInt(fields[1])
-		choice, choiceErr := parsePositiveInt(fields[2])
-		if ticketErr != nil || choiceErr != nil {
+		choices, choiceErr := parseChoiceIndexes(fields[2])
+		if choiceErr != nil {
 			return approvalSelection{}, false
 		}
-		return approvalSelection{TicketIndex: ticket, ChoiceIndex: choice}, true
+		if ticket, ticketErr := parsePositiveInt(fields[1]); ticketErr == nil {
+			return approvalSelection{TicketIndex: ticket, ChoiceIndex: choices[0], ChoiceIndices: choices}, true
+		}
+		return approvalSelection{TicketReference: fields[1], ChoiceIndex: choices[0], ChoiceIndices: choices}, true
 	}
 	return approvalSelection{}, false
 }
 
+func parseChoiceIndexes(value string) ([]int, error) {
+	parts := strings.FieldsFunc(strings.TrimSpace(value), func(r rune) bool {
+		return r == ',' || r == '，' || r == '/' || r == '、'
+	})
+	if len(parts) == 0 {
+		return nil, errors.New("审批选项不能为空")
+	}
+	result := make([]int, 0, len(parts))
+	seen := make(map[int]struct{}, len(parts))
+	for _, part := range parts {
+		choice, err := parsePositiveInt(part)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seen[choice]; exists {
+			return nil, errors.New("审批选项不能重复")
+		}
+		seen[choice] = struct{}{}
+		result = append(result, choice)
+	}
+	return result, nil
+}
+
 // pendingApprovalTickets 优先读取内存票据，进程重启后再从 Durable Runtime 恢复当前聊天的审批。
 func (m *Manager) pendingApprovalTickets(ctx context.Context, message Message) ([]approvalTicket, error) {
+	// 引用回复优先使用持久映射，避免管理员私聊中存在多个审批时依赖内存顺序。
+	if replyID := strings.TrimSpace(message.ReplyToMessageID); replyID != "" {
+		m.mu.RLock()
+		repository := m.runtimeState
+		coordinator := m.runtimeCoordinator
+		m.mu.RUnlock()
+		if bindingRepository, ok := repository.(RuntimeApprovalBindingRepository); ok && coordinator != nil {
+			binding, bindingErr := bindingRepository.FindApprovalMessageBinding(ctx, message.AdapterID, message.Platform, message.ChatID, replyID)
+			if bindingErr != nil {
+				return nil, bindingErr
+			}
+			if binding.ApprovalID != "" {
+				approval, approvalErr := coordinator.GetApproval(ctx, binding.ApprovalID)
+				if approvalErr != nil {
+					return nil, approvalErr
+				}
+				if approval.Status == agentruntime.ApprovalPending {
+					ticket := approvalTicket{ID: approval.ID, InvocationID: approval.InvocationID, Choices: approvalChoices(approval.Choices)}
+					m.addPendingApprovalTicket(message, ticket)
+					return []approvalTicket{ticket}, nil
+				}
+			}
+		}
+	}
 	chatKey := chatBindingKey(message)
 	m.mu.RLock()
 	tickets := append([]approvalTicket(nil), m.pendingApprovals[chatKey]...)
 	m.mu.RUnlock()
 	if len(tickets) > 0 {
 		return tickets, nil
+	}
+	// 管理员私聊重启后可从 Runtime 恢复当前 Bot 的全部待审批项；无需依赖进程内票据。
+	m.mu.RLock()
+	coordinatorAvailable := m.runtimeCoordinator != nil
+	m.mu.RUnlock()
+	if botItem, botErr := m.Get(message.AdapterID); coordinatorAvailable && botErr == nil && m.globalAdminForMessage(ctx, botItem, message) {
+		items, listErr := m.botApprovals(ctx, botItem.ID, true)
+		if listErr != nil {
+			return nil, listErr
+		}
+		for _, item := range items {
+			tickets = append(tickets, approvalTicket{ID: item.Approval.ID, InvocationID: item.Invocation.ID, Choices: approvalChoices(item.Approval.Choices)})
+		}
+		if len(tickets) > 0 {
+			m.mu.Lock()
+			m.pendingApprovals[chatKey] = tickets
+			m.mu.Unlock()
+			return tickets, nil
+		}
 	}
 	return m.hydratePendingApprovals(ctx, message)
 }
@@ -1433,21 +1804,20 @@ func (m *Manager) hydratePendingApprovals(ctx context.Context, message Message) 
 	return tickets, nil
 }
 
-type approvalChoiceCoordinator interface {
-	ResolveApprovalChoice(context.Context, string, string, string) (agentruntime.Approval, error)
-}
-
-// resolveApproval 保留旧的内部调用形态，真正的交互入口使用
-// resolveApprovalChoiceID，以确保选项语义不会在 Bot 边界丢失。
-func (m *Manager) resolveApproval(ctx context.Context, message Message, approvalID string, approved bool) (agentruntime.Approval, error) {
-	choiceID := "reject"
-	if approved {
-		choiceID = "approve"
-	}
-	return m.resolveApprovalChoiceID(ctx, message, approvalID, choiceID)
-}
-
 func (m *Manager) resolveApprovalChoiceID(ctx context.Context, message Message, approvalID, choiceID string) (agentruntime.Approval, error) {
+	return m.resolveApprovalChoiceIDWithReason(ctx, message, approvalID, choiceID, "机器人聊天选择")
+}
+
+// resolveApprovalChoiceIDWithReason 在引用回复拒绝审批时保留管理员给出的理由；
+// 理由只进入审批决定审计，不进入普通对话历史。
+func (m *Manager) resolveApprovalChoiceIDWithReason(ctx context.Context, message Message, approvalID, choiceID, reason string) (agentruntime.Approval, error) {
+	return m.resolveApprovalChoiceIDsWithReason(ctx, message, approvalID, []string{choiceID}, reason)
+}
+
+// resolveApprovalChoiceIDsWithReason 让引用回复、命令和原生按钮共享同一
+// 权限/会话归属校验；多选只有在 Runtime 明确声明 MultiSelect 且提供结构化
+// ResolveApprovalChoices 时才会提交，避免旧嵌入方误把多个授权降级成一次批准。
+func (m *Manager) resolveApprovalChoiceIDsWithReason(ctx context.Context, message Message, approvalID string, choiceIDs []string, reason string) (agentruntime.Approval, error) {
 	approvalID = strings.TrimSpace(approvalID)
 	if approvalID == "" {
 		return agentruntime.Approval{}, errors.New("审批 ID 不能为空")
@@ -1462,50 +1832,90 @@ func (m *Manager) resolveApprovalChoiceID(ctx context.Context, message Message, 
 	if err != nil {
 		return agentruntime.Approval{}, err
 	}
-	_, conversationID, conversationErr := m.conversationForMessage(ctx, message)
-	if conversationErr != nil {
-		return agentruntime.Approval{}, conversationErr
-	}
-	// ConversationID on old/custom approval rows may be empty, so use the
-	// Runtime invocation as the authoritative ownership boundary. This also
-	// prevents a forged approval callback from resolving a task belonging to a
-	// different chat or bot-scoped user.
 	invocation, invocationErr := coordinator.GetInvocation(ctx, approval.InvocationID)
 	if invocationErr != nil {
 		return agentruntime.Approval{}, invocationErr
 	}
-	if invocation.ConversationID != conversationID || invocation.UserID != bindingUserID(message) {
-		return agentruntime.Approval{}, errors.New("审批不属于当前聊天")
+	botItem, botErr := m.Get(message.AdapterID)
+	isAdmin := botErr == nil && m.globalAdminForMessage(ctx, botItem, message)
+	if isAdmin {
+		if invocation.BotID != "" && invocation.BotID != message.AdapterID {
+			return agentruntime.Approval{}, errors.New("审批不属于当前机器人")
+		}
+	} else {
+		_, conversationID, conversationErr := m.conversationForMessage(ctx, message)
+		if conversationErr != nil {
+			return agentruntime.Approval{}, conversationErr
+		}
+		if invocation.ConversationID != conversationID || invocation.UserID != bindingUserID(message) {
+			return agentruntime.Approval{}, errors.New("审批不属于当前聊天")
+		}
 	}
 	if approval.ConversationID != "" && approval.ConversationID != invocation.ConversationID {
 		return agentruntime.Approval{}, errors.New("审批与 Runtime 会话不一致")
 	}
-	choiceID = strings.TrimSpace(choiceID)
 	choices := approvalChoices(approval.Choices)
-	var choice agentruntime.ApprovalChoice
-	for _, candidate := range choices {
-		if candidate.ID == choiceID {
-			choice = candidate
-			break
+	selected := make([]agentruntime.ApprovalChoice, 0, len(choiceIDs))
+	seen := make(map[string]struct{}, len(choiceIDs))
+	for _, choiceID := range choiceIDs {
+		choiceID = strings.TrimSpace(choiceID)
+		var choice agentruntime.ApprovalChoice
+		for _, candidate := range choices {
+			if candidate.ID == choiceID {
+				choice = candidate
+				break
+			}
 		}
+		if choice.ID == "" {
+			return agentruntime.Approval{}, fmt.Errorf("审批选项 %q 无效", choiceID)
+		}
+		if _, exists := seen[choice.ID]; exists {
+			return agentruntime.Approval{}, errors.New("审批选项不能重复")
+		}
+		seen[choice.ID] = struct{}{}
+		selected = append(selected, choice)
 	}
-	if choice.ID == "" {
-		return agentruntime.Approval{}, fmt.Errorf("审批选项 %q 无效", choiceID)
+	if len(selected) == 0 {
+		return agentruntime.Approval{}, errors.New("至少选择一个审批选项")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "机器人聊天选择"
 	}
 	var resolved agentruntime.Approval
-	if choiceResolver, ok := coordinator.(approvalChoiceCoordinator); ok {
-		resolved, err = choiceResolver.ResolveApprovalChoice(ctx, approvalID, choice.ID, "机器人聊天选择")
+	var resolveErr error
+	if len(selected) == 1 {
+		resolved, resolveErr = coordinator.ResolveApprovalChoice(ctx, approvalID, selected[0].ID, reason)
 	} else {
-		// 兼容尚未升级的嵌入 Runtime；真实 Coordinator 始终走上面的
-		// ChoiceID 路径，旧实现只能安全地接收允许/拒绝布尔值。
-		resolved, err = coordinator.ResolveApproval(ctx, approvalID, choice.Approved, "机器人聊天选择")
+		for _, choice := range selected {
+			if !choice.MultiSelect {
+				return agentruntime.Approval{}, errors.New("该审批不是可多选请求")
+			}
+		}
+		resolver, ok := coordinator.(interface {
+			ResolveApprovalChoices(context.Context, string, []string, string, string, string) (agentruntime.Approval, error)
+		})
+		if !ok {
+			return agentruntime.Approval{}, errors.New("当前 Runtime 不支持审批多选")
+		}
+		resolved, resolveErr = resolver.ResolveApprovalChoices(ctx, approvalID, func() []string {
+			ids := make([]string, 0, len(selected))
+			for _, choice := range selected {
+				ids = append(ids, choice.ID)
+			}
+			return ids
+		}(), "once", "", reason)
 	}
-	if err != nil {
-		return agentruntime.Approval{}, err
+	if resolveErr != nil {
+		return agentruntime.Approval{}, resolveErr
 	}
 	// 决定已经持久化后立刻删除本地票据，避免用户重复回复造成二次决议错误。
 	m.removePendingApproval(message, approvalID)
-	_ = m.send(ctx, message, choiceResultText(choice))
+	labels := make([]string, 0, len(selected))
+	for _, choice := range selected {
+		labels = append(labels, safeProgressText(choice.Label))
+	}
+	_ = m.send(ctx, message, "已选择“"+strings.Join(labels, "、")+"”，操作将按审批结果继续执行。")
 	return resolved, nil
 }
 
@@ -1601,6 +2011,9 @@ func messageUMOMessageType(message Message) string {
 // messageSource 生成稳定的 UMO：platform_id:message_type:session_id。
 // AdapterID 作为 platform_id；适配器尚未注入 ID 时才回退到平台类型，避免产生空的来源键。
 func messageSource(message Message) string {
+	if source := strings.TrimSpace(message.SourceUMO); source != "" {
+		return source
+	}
 	platformID := strings.TrimSpace(message.AdapterID)
 	if platformID == "" {
 		platformID = strings.TrimSpace(string(message.Platform))
@@ -1655,7 +2068,78 @@ func botRuntimeStartError(err error) string {
 		}
 		return "当前聊天任务暂时无法入队，请稍后重试。"
 	}
-	return "任务启动失败：" + trimError(err)
+	return "任务启动失败：" + runtimeUserFacingError(err)
+}
+
+// runtimeUserFacingError 将内部错误映射为与任务相关的简短提示；完整错误仍由
+// Runtime 日志保留，避免数据库路径、供应商原始响应和内部参数泄露到聊天平台。
+func runtimeUserFacingError(err error) string {
+	if err == nil {
+		return "未知错误。"
+	}
+	if errors.Is(err, agent.ErrContextBudgetExceeded) {
+		return "当前会话内容已达到模型上下文上限，请新建会话或减少附件、历史内容后重试。"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "任务已取消。"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "任务处理超时，请稍后重试或拆分请求。"
+	}
+	var toolErr *agent.ToolError
+	if errors.As(err, &toolErr) && toolErr != nil {
+		switch toolErr.Category {
+		case agent.ToolErrorAuthorization:
+			return "当前策略不允许使用该工具。"
+		case agent.ToolErrorApproval:
+			return "该操作需要完成审批后才能继续。"
+		case agent.ToolErrorRateLimit:
+			return "工具服务暂时限流，请稍后重试。"
+		case agent.ToolErrorTimeout:
+			return "工具处理超时，请稍后重试。"
+		case agent.ToolErrorDependency:
+			return "所需工具当前不可用，请检查配置后重试。"
+		case agent.ToolErrorResultTooLarge:
+			return "工具返回内容过大，无法继续处理。"
+		}
+	}
+	raw := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(raw, "context budget exhausted"), strings.Contains(raw, "context_budget_exhausted"), strings.Contains(raw, "上下文预算"):
+		return "当前会话内容已达到模型上下文上限，请新建会话或减少附件、历史内容后重试。"
+	case strings.Contains(raw, "database is locked"), strings.Contains(raw, "sqlite_busy"), strings.Contains(raw, "database busy"), strings.Contains(raw, "数据库锁"):
+		return "运行状态暂时繁忙，请稍后重试。"
+	case strings.Contains(raw, "rate limit"), strings.Contains(raw, "too many requests"), strings.Contains(raw, "429"), strings.Contains(raw, "限流"):
+		return "模型或工具服务暂时限流，请稍后重试。"
+	case strings.Contains(raw, "deadline exceeded"), strings.Contains(raw, "timeout"), strings.Contains(raw, "timed out"), strings.Contains(raw, "超时"):
+		return "任务处理超时，请稍后重试或拆分请求。"
+	case strings.Contains(raw, "approval"), strings.Contains(raw, "授权"), strings.Contains(raw, "审批"):
+		return "该操作需要完成审批后才能继续。"
+	case strings.Contains(raw, "permission denied"), strings.Contains(raw, "forbidden"), strings.Contains(raw, "无权限"):
+		return "当前操作没有权限。"
+	case strings.Contains(raw, "attachment"), strings.Contains(raw, "附件"), strings.Contains(raw, "no such file"), strings.Contains(raw, "file not found"):
+		return "附件暂时无法读取，请重新发送后重试。"
+	case strings.Contains(raw, "model capability"), strings.Contains(raw, "模型能力"):
+		return "当前模型不支持本次任务所需能力，请更换模型后重试。"
+	case strings.Contains(raw, "queue"), strings.Contains(raw, "队列已满"), strings.Contains(raw, "待处理消息已达"):
+		return "当前聊天消息队列已满，请稍后重试。"
+	default:
+		return "内部任务错误，请稍后重试。"
+	}
+}
+
+// botAttachmentFailureText 允许把用户可以修正的附件约束反馈给用户，但隐藏
+// 本地临时路径和底层文件系统错误，避免把服务器部署细节暴露给聊天平台。
+func botAttachmentFailureText(err error) string {
+	if err == nil {
+		return "附件保存失败，请重新发送后重试。"
+	}
+	raw := strings.TrimSpace(err.Error())
+	lower := strings.ToLower(raw)
+	if strings.Contains(lower, "数量不能超过") || strings.Contains(lower, "大小必须") || strings.Contains(lower, "总大小不能超过") || strings.Contains(lower, "不能同时包含") {
+		return "附件保存失败：" + boundedGroupText(raw, 160)
+	}
+	return "附件保存失败：附件暂时无法读取，请重新发送后重试。"
 }
 
 func eventString(data map[string]any, key string) string {

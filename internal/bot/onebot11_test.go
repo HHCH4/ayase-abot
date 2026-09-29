@@ -57,9 +57,14 @@ func TestOneBotReverseWebSocketReceivesAndSends(t *testing.T) {
 	messageReceived := make(chan Message, 1)
 	runDone := make(chan error, 1)
 	go func() {
-		runDone <- platform.Run(ctx, func(handlerCtx context.Context, message Message) error {
+		runDone <- platform.RunEvents(ctx, func(handlerCtx context.Context, event PlatformEvent) error {
+			if event.Message == nil {
+				return nil
+			}
+			message := *event.Message
 			messageReceived <- message
-			return platform.Send(handlerCtx, message, "收到")
+			_, err := platform.DispatchAction(handlerCtx, PlatformAction{Type: "send_text", Message: message, Text: "收到"})
+			return err
 		})
 	}()
 
@@ -116,9 +121,14 @@ func TestOneBotReverseWebSocketServer(t *testing.T) {
 	messageReceived := make(chan Message, 1)
 	runDone := make(chan error, 1)
 	go func() {
-		runDone <- platform.Run(ctx, func(handlerCtx context.Context, message Message) error {
+		runDone <- platform.RunEvents(ctx, func(handlerCtx context.Context, event PlatformEvent) error {
+			if event.Message == nil {
+				return nil
+			}
+			message := *event.Message
 			messageReceived <- message
-			return platform.Send(handlerCtx, message, "收到")
+			_, err := platform.DispatchAction(handlerCtx, PlatformAction{Type: "send_text", Message: message, Text: "收到"})
+			return err
 		})
 	}()
 

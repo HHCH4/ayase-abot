@@ -24,11 +24,7 @@ type timeArgs struct {
 }
 
 type timeResult struct {
-	Timezone      string `json:"timezone"`
-	LocalDatetime string `json:"local_datetime"`
-	UTCOffset     string `json:"utc_offset"`
-	Weekday       string `json:"weekday"`
-	Unix          int64  `json:"unix"`
+	CurrentTime string `json:"current_time"`
 }
 
 type calculateArgs struct {
@@ -49,7 +45,7 @@ func Tools() ([]tool.Tool, error) {
 func toolsWithClock(now func() time.Time) ([]tool.Tool, error) {
 	currentTime, err := functiontool.New(functiontool.Config{
 		Name:        "current_time",
-		Description: "查询指定 IANA 时区的准确当前日期、时间、星期和 UTC 偏移。用户询问当前时间或日期时使用，不要凭模型知识猜测。",
+		Description: "查询指定 IANA 时区的准确当前日期、时间、星期和 UTC 偏移。返回值是供你组织回答的事实，不要把工具响应对象原样发给用户；用户询问当前时间或日期时使用，不要凭模型知识猜测。",
 	}, func(_ adkagent.Context, args timeArgs) (timeResult, error) {
 		zone := strings.TrimSpace(args.Timezone)
 		if zone == "" {
@@ -62,9 +58,9 @@ func toolsWithClock(now func() time.Time) ([]tool.Tool, error) {
 		}
 		value := now().In(location)
 		_, offsetSeconds := value.Zone()
+		// 工具只返回一条可阅读的时间事实，避免把 Unix 秒数和内部字段泄漏为聊天正文。
 		return timeResult{
-			Timezone: zone, LocalDatetime: value.Format(time.RFC3339),
-			UTCOffset: formatUTCOffset(offsetSeconds), Weekday: value.Weekday().String(), Unix: value.Unix(),
+			CurrentTime: fmt.Sprintf("%s 当前是 %s（%s，UTC%s）", zone, value.Format("2006年1月2日 15:04:05"), chineseWeekday(value.Weekday()), formatUTCOffset(offsetSeconds)),
 		}, nil
 	})
 	if err != nil {
@@ -99,6 +95,11 @@ func formatUTCOffset(seconds int) string {
 		seconds = -seconds
 	}
 	return fmt.Sprintf("%s%02d:%02d", sign, seconds/3600, seconds%3600/60)
+}
+
+// chineseWeekday 将 Go 的英文星期名转成中文，供时间工具提供自然语言事实。
+func chineseWeekday(day time.Weekday) string {
+	return [...]string{"星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"}[day]
 }
 
 func evaluate(expression string) (float64, error) {

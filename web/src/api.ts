@@ -34,10 +34,17 @@ import type {
   ScheduledTask,
   DashboardStats,
   DataLogEntry,
+  DocumentArtifactView,
+  RuntimeEvent,
   WebSearchService,
   WebSearchServiceInput,
   WebSearchUsageSummary,
   WebSearchTestResult,
+  EvidenceItem,
+  RetrievalRequestPayload,
+  RetrievalResult,
+  SubAgentGroup,
+  SubAgentRun,
 } from './types'
 
 export class ApiError extends Error {
@@ -93,6 +100,23 @@ export async function readConversationContext(userID: string, conversationID: st
 
 export async function readInvocationTrace(invocationID: string): Promise<InvocationTrace> {
   return request<InvocationTrace>(`/api/v1/invocations/${encodeURIComponent(invocationID)}/trace`)
+}
+
+export async function readInvocationSubAgents(invocationID: string, limit = 100): Promise<SubAgentGroup[]> {
+  const result = await request<{ groups: SubAgentGroup[] }>(`/api/runtime/invocations/${encodeURIComponent(invocationID)}/subagents?limit=${limit}`)
+  return result.groups || []
+}
+
+export async function readSubAgentGroup(groupID: string, limit = 256): Promise<{ group: SubAgentGroup; runs: SubAgentRun[] }> {
+  return request<{ group: SubAgentGroup; runs: SubAgentRun[] }>(`/api/runtime/subagent-groups/${encodeURIComponent(groupID)}?limit=${limit}`)
+}
+
+export async function readSubAgentEvidence(groupID: string, offset = 0, limit = 50): Promise<{ evidence: EvidenceItem[]; offset: number; limit: number; total: number; has_more?: boolean; next_offset?: number }> {
+  return request<{ evidence: EvidenceItem[]; offset: number; limit: number; total: number; has_more?: boolean; next_offset?: number }>(`/api/runtime/subagent-groups/${encodeURIComponent(groupID)}/evidence?offset=${offset}&limit=${limit}`)
+}
+
+export async function searchRuntimeRetrieval(payload: RetrievalRequestPayload): Promise<RetrievalResult> {
+  return request<RetrievalResult>('/api/runtime/retrieval/search', jsonBody(payload))
 }
 
 export async function readInvocationUsage(invocationID: string): Promise<InvocationUsage> {
@@ -292,6 +316,42 @@ export function openDataLogStream(
   return () => source.close()
 }
 
+// Runtime 事件使用多个 SSE event 名称；统一在客户端重新归一化为一条有界
+// 事件流，任务树页面不需要通过日志文本猜测状态。
+export function openRuntimeEventStream(
+  invocationID: string,
+  after: number,
+  onEvent: (event: RuntimeEvent) => void,
+  onError?: () => void,
+): () => void {
+  const query = after > 0 ? `?after=${encodeURIComponent(String(after))}` : ''
+  const source = new EventSource(`/api/runtime/invocations/${encodeURIComponent(invocationID)}/events${query}`)
+  const eventTypes = [
+    'invocation.queued', 'invocation.started', 'invocation.waiting', 'invocation.resumed', 'invocation.cancelling',
+    'invocation.completed', 'invocation.failed', 'invocation.cancelled', 'invocation.expired',
+    'subagent.requested', 'subagent.queued', 'subagent.started', 'subagent.progress', 'subagent.completed', 'subagent.failed', 'subagent.cancelled', 'subagent.expired',
+    'retrieval.requested', 'retrieval.source_started', 'retrieval.source_completed', 'retrieval.deduplicated', 'retrieval.reranked', 'retrieval.summarized', 'retrieval.stale',
+    'tool.requested', 'tool.started', 'tool.completed', 'tool.failed',
+    'model.started', 'model.completed', 'model.retrying', 'model.failed', 'approval.requested', 'approval.resolved', 'approval.expired',
+    'user_input.requested', 'user_input.resolved', 'context.compacted', 'context.compaction_failed', 'context.manifest',
+    'runtime.snapshot', 'runtime.config_snapshot', 'runtime.config_changed', 'runtime.config_migrated', 'toolset.snapshot_created', 'toolset.snapshot_invalidated',
+    'model.capabilities_resolved', 'model.request_downgraded', 'model.incompatible', 'model.migration_required',
+    'command.output', 'command.queued', 'command.started', 'command.completed', 'command.failed', 'command.unknown', 'usage.updated', 'plan.updated',
+    'task.contract.updated', 'instruction.conflict', 'instruction.reconfirmed', 'working_set.updated', 'repository.baseline_captured',
+    'verification.updated', 'artifact.updated', 'runtime.notice', 'workflow.continuation_requested',
+  ]
+  const handle = (event: Event) => {
+    try {
+      onEvent(JSON.parse((event as MessageEvent).data) as RuntimeEvent)
+    } catch {
+      onError?.()
+    }
+  }
+  eventTypes.forEach((type) => source.addEventListener(type, handle))
+  source.onerror = () => onError?.()
+  return () => source.close()
+}
+
 export async function readOperations(workspaceID = '', conversationID = ''): Promise<Operation[]> {
   const params = new URLSearchParams()
   if (workspaceID) params.set('workspace_id', workspaceID)
@@ -336,6 +396,10 @@ export async function uploadArtifact(file: Blob, userID: string, options: { name
 export function artifactContentURL(artifactID: string, userID: string): string {
   const params = new URLSearchParams({ user_id: userID })
   return `/api/v1/artifacts/${encodeURIComponent(artifactID)}/content?${params.toString()}`
+}
+
+export async function readArtifactDocument(artifactID: string, userID: string): Promise<DocumentArtifactView> {
+  return request<DocumentArtifactView>(`/api/v1/artifacts/${encodeURIComponent(artifactID)}/document?user_id=${encodeURIComponent(userID)}`)
 }
 
 export function commandOutputDownloadURL(commandRunID: string, format: 'text' | 'ndjson' = 'text'): string {

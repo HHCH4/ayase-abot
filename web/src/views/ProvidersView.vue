@@ -271,7 +271,21 @@ async function discoverModels() {
     }
     if (form.api_key.trim()) payload.api_key = form.api_key.trim()
     const result = await request<{ models: ProviderModel[] }>('/api/v1/providers/preview/models/discover', { method: 'POST', body: JSON.stringify(payload) })
-    form.models = (result.models || []).map((item) => ({ ...item, enabled: item.enabled !== false, source: item.source || 'discovered' }))
+    // 目录接口常常不返回 token 上限；刷新目录时保留用户手填的窗口、输出上限和能力选择。
+    const existing = new Map(form.models.map((model) => [model.id, model]))
+    const discovered = (result.models || []).map((item) => {
+      const saved = existing.get(item.id)
+      return {
+        ...item,
+        enabled: saved?.enabled ?? item.enabled !== false,
+        source: saved?.source === 'manual' ? 'manual' : (item.source || 'discovered'),
+        context_window: item.context_window || saved?.context_window || 0,
+        max_output_tokens: item.max_output_tokens || saved?.max_output_tokens || 0,
+        capabilities: saved?.capabilities || item.capabilities,
+      }
+    })
+    const discoveredIDs = new Set(discovered.map((item) => item.id))
+    form.models = [...discovered, ...form.models.filter((item) => !discoveredIDs.has(item.id))]
     resetExpandedModels()
     message.success(`已获取 ${form.models.length} 个模型`)
   } catch (error) {
@@ -440,8 +454,9 @@ async function remove(provider: Provider) {
               <NButton quaternary type="error" aria-label="删除模型" @click="removeModel(index)">删除</NButton>
             </div>
             <div v-if="expandedModels[index]" class="model-row-details">
-              <label class="model-detail-field"><span>上下文窗口</span><NInputNumber :value="model.context_window || null" :min="0" :show-button="false" placeholder="例如 256K" @update:value="(value) => { model.context_window = value || undefined }" /></label>
-              <label class="model-detail-field"><span>最大输出 token</span><NInputNumber :value="model.max_output_tokens || null" :min="0" :show-button="false" placeholder="例如 32K" @update:value="(value) => { model.max_output_tokens = value || undefined }" /></label>
+              <label class="model-detail-field"><span>上下文窗口（token 数）</span><NInputNumber :value="model.context_window || null" :min="0" :show-button="false" placeholder="例如 1000000（1M）" @update:value="(value) => { model.context_window = value || undefined }" /></label>
+              <label class="model-detail-field"><span>单次最大输出能力（token 数）</span><NInputNumber :value="model.max_output_tokens || null" :min="0" :show-button="false" placeholder="例如 393216（384K）" @update:value="(value) => { model.max_output_tokens = value || undefined }" /></label>
+              <p class="muted">填写整数 token 数，不填表示未知。这里只记录模型能力上限；单次请求的输出限制在“配置中心 → AI → 最大输出 token”单独设置。</p>
               <div class="model-capability-box">
                 <div class="model-capability-heading">
                   <span>能力证据</span>

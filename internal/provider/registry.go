@@ -173,8 +173,17 @@ func (r *Registry) Save(ctx context.Context, req SaveRequest) (Provider, error) 
 				continue
 			}
 			previous := modelByID(old.Models, candidate.Models[index].ID)
-			if previous.Capabilities != nil && capabilityTargetUnchanged(old, candidate) && modelCapabilityTargetUnchanged(previous, candidate.Models[index]) {
+			if previous.Capabilities != nil && capabilityTargetUnchanged(old, candidate) && previous.ID == candidate.Models[index].ID && previous.Enabled == candidate.Models[index].Enabled {
 				profile := *previous.Capabilities
+				// 手工修改 token 上限时只更新容量证据，保留已确认的图片、工具等能力选择。
+				if previous.ContextWindow != candidate.Models[index].ContextWindow {
+					value := candidate.Models[index].ContextWindow
+					profile.ContextWindow = CapabilityValue[int]{Value: value, Known: value > 0, Source: "catalog", Confidence: boolConfidence(value > 0)}
+				}
+				if previous.MaxOutputTokens != candidate.Models[index].MaxOutputTokens {
+					value := candidate.Models[index].MaxOutputTokens
+					profile.MaxOutputTokens = CapabilityValue[int]{Value: value, Known: value > 0, Source: "catalog", Confidence: boolConfidence(value > 0)}
+				}
 				candidate.Models[index].Capabilities = &profile
 			}
 		}
@@ -196,10 +205,6 @@ func (r *Registry) Save(ctx context.Context, req SaveRequest) (Provider, error) 
 
 func capabilityTargetUnchanged(previous, current Provider) bool {
 	return previous.BaseURL == current.BaseURL && previous.APIKey == current.APIKey && normalizeProtocol(previous.Protocol) == normalizeProtocol(current.Protocol) && previous.OpenAIFormat == current.OpenAIFormat && previous.TokenCountProtocol == current.TokenCountProtocol
-}
-
-func modelCapabilityTargetUnchanged(previous, current Model) bool {
-	return previous.ID == current.ID && previous.Enabled == current.Enabled && previous.ContextWindow == current.ContextWindow && previous.MaxOutputTokens == current.MaxOutputTokens
 }
 
 // Delete 删除供应商；仓储会同步清理失效的默认引用。

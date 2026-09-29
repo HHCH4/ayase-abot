@@ -132,9 +132,6 @@ func (k *Kernel) RunSubAgent(ctx context.Context, request SubAgentRequest) (stri
 	if options.MaxOutputTokens > 0 {
 		childRuntime.AIMaxOutputTokens = options.MaxOutputTokens
 	}
-	if childRuntime.AgentMaxToolCalls <= 0 {
-		childRuntime.AgentMaxToolCalls = 20
-	}
 	if len(childTools) > 0 {
 		// 子 Agent 不能直接拿到主 Agent 的原始工具实现。重新建立临时
 		// Registry 并经过同一套执行包装，确保参数校验、并发限制、审批策略

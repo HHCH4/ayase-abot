@@ -26,7 +26,9 @@ type botRow struct {
 	GroupTriggerMode string `gorm:"size:16"`
 	// AdminUserIDsJSON stores the global administrators of this bot. It is a
 	// JSON array so an existing row needs no migration step.
-	AdminUserIDsJSON  string `gorm:"type:text"`
+	AdminUserIDsJSON string `gorm:"type:text"`
+	// RuntimeConfigJSON 保存机器人页面的显式覆盖；JSON 结构可随字段扩展而无需拆表迁移。
+	RuntimeConfigJSON string `gorm:"type:text"`
 	TelegramToken     string `gorm:"size:4000"`
 	OneBotAccessToken string `gorm:"size:4000"`
 	Enabled           bool
@@ -96,9 +98,10 @@ func (r *botRepository) Save(ctx context.Context, item bot.Bot) error {
 	row := botRow{
 		ID: item.ID, Name: item.Name, Type: string(item.Type), Endpoint: item.Endpoint,
 		OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath, OneBotFileRoot: item.OneBotFileRoot,
-		GroupTriggerMode: item.GroupTriggerMode,
-		AdminUserIDsJSON: marshalBotAdminIDs(item.AdminUserIDs),
-		TelegramToken:    item.TelegramToken, OneBotAccessToken: item.OneBotAccessToken,
+		GroupTriggerMode:  item.GroupTriggerMode,
+		AdminUserIDsJSON:  marshalBotAdminIDs(item.AdminUserIDs),
+		RuntimeConfigJSON: marshalBotRuntimeConfig(item.RuntimeConfig),
+		TelegramToken:     item.TelegramToken, OneBotAccessToken: item.OneBotAccessToken,
 		Enabled: item.Enabled, Status: string(item.Status), StatusMessage: item.StatusMessage,
 		LastCheckedAt: item.LastCheckedAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 	}
@@ -110,6 +113,21 @@ func (r *botRepository) Delete(ctx context.Context, id string) error {
 		// 删除机器人时同步清理配置绑定，防止已不存在的机器人形成孤儿引用。
 		if err := tx.Where("scope = ? AND target_id = ?", "bot", id).Delete(&configBindingRow{}).Error; err != nil {
 			return err
+		}
+		// Bot 删除是破坏性操作；命令策略、群管理员、审计和 Follow-up 不能在
+		// 机器人配置消失后继续保留，否则会形成无法管理的孤儿授权和主动任务。
+		for _, item := range []struct {
+			model any
+			where string
+		}{
+			{&botGroupAdminRow{}, "adapter_id = ?"},
+			{&botCommandPolicyRow{}, "adapter_id = ?"},
+			{&botCommandAuditRow{}, "adapter_id = ?"},
+			{&scheduledTaskRow{}, "adapter_id = ?"},
+		} {
+			if err := tx.Where(item.where, id).Delete(item.model).Error; err != nil {
+				return err
+			}
 		}
 		// 机器人删除后同步清理该 adapter 产生的来源别名，避免留下无法再管理的 UMO 元数据。
 		if err := tx.Where("source LIKE ?", id+":%").Delete(&botSourceNameRow{}).Error; err != nil {
@@ -239,15 +257,31 @@ func (r *botRepository) ListMessageSources(ctx context.Context, query string) ([
 }
 
 func botFromRow(row botRow) bot.Bot {
+	runtimeConfig := bot.BotRuntimeConfig{}
+	if strings.TrimSpace(row.RuntimeConfigJSON) != "" {
+		_ = json.Unmarshal([]byte(row.RuntimeConfigJSON), &runtimeConfig)
+	}
 	return bot.Bot{
 		ID: row.ID, Name: row.Name, Type: bot.Type(row.Type), Endpoint: row.Endpoint,
 		OneBotMode: row.OneBotMode, ListenHost: row.ListenHost, ListenPort: row.ListenPort, ListenPath: row.ListenPath, OneBotFileRoot: row.OneBotFileRoot,
 		GroupTriggerMode: row.GroupTriggerMode,
 		AdminUserIDs:     unmarshalBotAdminIDs(row.AdminUserIDsJSON),
+		RuntimeConfig:    runtimeConfig.NormalizeRuntimeConfig(),
 		TelegramToken:    row.TelegramToken, OneBotAccessToken: row.OneBotAccessToken,
 		Enabled: row.Enabled, Status: bot.Status(row.Status), StatusMessage: row.StatusMessage,
 		LastCheckedAt: row.LastCheckedAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}
+}
+
+// marshalBotRuntimeConfig 保存机器人覆盖配置；序列化失败时返回空对象，避免
+// 仅因为前端提交了未知扩展字段而阻断机器人连接配置保存。
+func marshalBotRuntimeConfig(value bot.BotRuntimeConfig) string {
+	value = value.NormalizeRuntimeConfig()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
 }
 
 // marshalBotAdminIDs keeps the administrator list bounded and stable so a save

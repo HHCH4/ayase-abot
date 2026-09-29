@@ -464,6 +464,12 @@ func stableRuntimeToolID(source ToolSource, name string) string {
 func inferToolCapabilities(source ToolSource, name string) []ToolCapability {
 	name = strings.ToLower(name)
 	result := make([]ToolCapability, 0, 3)
+	// Follow-up 会创建持久化任务并在未来主动投递，属于外部副作用；主动
+	// Invocation 只能使用只读工具，因此必须在目录层明确标记，而不是只
+	// 依赖调用方记住这个特殊工具名。
+	if name == "create_follow_up" {
+		result = append(result, ToolCapabilityExternalSideEffect)
+	}
 	if strings.Contains(name, "search") {
 		result = append(result, ToolCapabilityNetwork)
 	}

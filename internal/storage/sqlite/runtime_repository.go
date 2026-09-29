@@ -30,21 +30,25 @@ type invocationRow struct {
 	ProviderID                     string `gorm:"size:100"`
 	ModelID                        string `gorm:"size:300"`
 	ConfigSnapshot                 string `gorm:"type:text"`
+	RuntimeOptionsJSON             string `gorm:"type:text"`
 	Message                        string `gorm:"type:text"`
-	// 群历史与主动回复权限随任务保存，避免重启后恢复时语义改变。
-	GroupContext     string `gorm:"type:text"`
-	BotDeliveryJSON  string `gorm:"type:text"`
-	Proactive        bool
-	AttachmentsJSON  string `gorm:"type:text"`
-	Status           string `gorm:"index;size:40;not null"`
-	Error            string `gorm:"type:text"`
-	ActiveApprovalID string `gorm:"index;size:100"`
-	LeaseOwner       string `gorm:"index;size:160"`
-	LeaseExpiresAt   *time.Time
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	StartedAt        *time.Time
-	FinishedAt       *time.Time
+	GroupContext                   string `gorm:"type:text"`
+	BotDeliveryJSON                string `gorm:"type:text"`
+	AttachmentsJSON                string `gorm:"type:text"`
+	Proactive                      bool   `gorm:"index"`
+	AllowedToolsJSON               string `gorm:"type:text"`
+	ToolBudget                     int
+	Status                         string `gorm:"index;size:40;not null"`
+	Error                          string `gorm:"type:text"`
+	ActiveApprovalID               string `gorm:"index;size:100"`
+	WaitingGroupID                 string `gorm:"index;size:220"`
+	WaitingReason                  string `gorm:"size:80"`
+	LeaseOwner                     string `gorm:"index;size:160"`
+	LeaseExpiresAt                 *time.Time
+	CreatedAt                      time.Time
+	UpdatedAt                      time.Time
+	StartedAt                      *time.Time
+	FinishedAt                     *time.Time
 }
 
 func (invocationRow) TableName() string { return "abot_agent_invocations" }
@@ -218,6 +222,9 @@ type approvalRow struct {
 	ArgsJSON            string `gorm:"type:text"`
 	Hint                string `gorm:"type:text"`
 	ChoicesJSON         string `gorm:"type:text"`
+	SelectedChoicesJSON string `gorm:"type:text"`
+	Scope               string `gorm:"size:32"`
+	Supplement          string `gorm:"type:text"`
 	Status              string `gorm:"index;size:32;not null"`
 	DecisionReason      string `gorm:"type:text"`
 	CreatedAt           time.Time
@@ -922,8 +929,12 @@ func (r *runtimeRepository) commitApprovalResume(ctx context.Context, commit age
 			return findErr
 		}
 		resolvedAt := now
+		selectedChoicesJSON, marshalSelectedErr := json.Marshal(commit.ApprovalSelectedChoices)
+		if marshalSelectedErr != nil {
+			return marshalSelectedErr
+		}
 		updated := tx.Model(&approvalRow{}).Where("id = ? AND status = ?", approvalID, string(commit.ApprovalFromStatus)).Updates(map[string]any{
-			"status": string(commit.ApprovalToStatus), "decision_reason": strings.TrimSpace(commit.Reason), "updated_at": now, "resolved_at": &resolvedAt,
+			"status": string(commit.ApprovalToStatus), "decision_reason": strings.TrimSpace(commit.Reason), "selected_choices_json": string(selectedChoicesJSON), "scope": strings.TrimSpace(commit.ApprovalScope), "supplement": strings.TrimSpace(commit.ApprovalSupplement), "updated_at": now, "resolved_at": &resolvedAt,
 		})
 		if updated.Error != nil {
 			return updated.Error
@@ -1772,8 +1783,8 @@ func validRuntimeInvocationTransition(from, to agentruntime.InvocationStatus) bo
 	case agentruntime.InvocationQueued:
 		return to == agentruntime.InvocationRunning || to == agentruntime.InvocationCancelling || to == agentruntime.InvocationCancelled || to == agentruntime.InvocationFailed
 	case agentruntime.InvocationRunning:
-		return to == agentruntime.InvocationWaitingApproval || to == agentruntime.InvocationWaitingTool || to == agentruntime.InvocationWaitingUser || to == agentruntime.InvocationQueued || to == agentruntime.InvocationCompleted || to == agentruntime.InvocationFailed || to == agentruntime.InvocationCancelling || to == agentruntime.InvocationCancelled
-	case agentruntime.InvocationWaitingApproval, agentruntime.InvocationWaitingTool, agentruntime.InvocationWaitingUser:
+		return to == agentruntime.InvocationWaitingApproval || to == agentruntime.InvocationWaitingTool || to == agentruntime.InvocationWaitingUser || to == agentruntime.InvocationWaitingSubagents || to == agentruntime.InvocationQueued || to == agentruntime.InvocationCompleted || to == agentruntime.InvocationFailed || to == agentruntime.InvocationCancelling || to == agentruntime.InvocationCancelled
+	case agentruntime.InvocationWaitingApproval, agentruntime.InvocationWaitingTool, agentruntime.InvocationWaitingUser, agentruntime.InvocationWaitingSubagents:
 		return to == agentruntime.InvocationQueued || to == agentruntime.InvocationCancelling || to == agentruntime.InvocationCancelled || to == agentruntime.InvocationExpired || to == agentruntime.InvocationFailed
 	case agentruntime.InvocationCancelling:
 		return to == agentruntime.InvocationCancelled || to == agentruntime.InvocationFailed
@@ -2594,10 +2605,14 @@ func (r *runtimeRepository) CreateApproval(ctx context.Context, item agentruntim
 	if err != nil {
 		return err
 	}
+	selectedChoices, err := json.Marshal(item.SelectedChoices)
+	if err != nil {
+		return err
+	}
 	return r.db.WithContext(ctx).Create(&approvalRow{
 		ID: item.ID, InvocationID: item.InvocationID, ConversationID: item.ConversationID,
 		ToolCallID: item.ToolCallID, TaskContractVersion: item.TaskContractVersion, ToolName: item.ToolName, OperationID: item.OperationID, OriginalCallID: item.OriginalCallID, ConfirmationCallID: item.ConfirmationCallID,
-		ArgsJSON: string(data), Hint: item.Hint, ChoicesJSON: string(choices), Status: string(item.Status), DecisionReason: item.DecisionReason,
+		ArgsJSON: string(data), Hint: item.Hint, ChoicesJSON: string(choices), SelectedChoicesJSON: string(selectedChoices), Scope: item.Scope, Supplement: item.Supplement, Status: string(item.Status), DecisionReason: item.DecisionReason,
 		CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt, ExpiresAt: item.ExpiresAt, ResolvedAt: item.ResolvedAt,
 	}).Error
 }
@@ -3480,11 +3495,13 @@ func (r *runtimeRepository) ReplaceInstructionSnapshotSet(ctx context.Context, i
 func invocationToRow(item agentruntime.Invocation) *invocationRow {
 	attachments, _ := json.Marshal(item.Attachments)
 	delivery, _ := json.Marshal(item.BotDelivery)
-	return &invocationRow{ID: item.ID, UserID: item.UserID, IdempotencyKey: item.IdempotencyKey, BotID: item.BotID, ConversationID: item.ConversationID, WorkspaceID: item.WorkspaceID, TargetPath: item.TargetPath, SessionID: item.SessionID, ParentInvocationID: item.ParentInvocationID, ContinuationDecision: string(item.ContinuationDecision), ContinuationSourcePlanRevision: item.ContinuationSourcePlanRevision, ProviderID: item.ProviderID, ModelID: item.ModelID, ConfigSnapshot: item.ConfigSnapshot, Message: item.Message, GroupContext: item.GroupContext, BotDeliveryJSON: string(delivery), Proactive: item.Proactive, AttachmentsJSON: string(attachments), Status: string(item.Status), Error: item.Error, ActiveApprovalID: item.ActiveApprovalID, LeaseOwner: item.LeaseOwner, LeaseExpiresAt: item.LeaseExpiresAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt, StartedAt: item.StartedAt, FinishedAt: item.FinishedAt}
+	allowedTools, _ := json.Marshal(item.AllowedTools)
+	return &invocationRow{ID: item.ID, UserID: item.UserID, IdempotencyKey: item.IdempotencyKey, BotID: item.BotID, ConversationID: item.ConversationID, WorkspaceID: item.WorkspaceID, TargetPath: item.TargetPath, SessionID: item.SessionID, ParentInvocationID: item.ParentInvocationID, ContinuationDecision: string(item.ContinuationDecision), ContinuationSourcePlanRevision: item.ContinuationSourcePlanRevision, ProviderID: item.ProviderID, ModelID: item.ModelID, ConfigSnapshot: item.ConfigSnapshot, RuntimeOptionsJSON: item.RuntimeOptionsJSON, Message: item.Message, GroupContext: item.GroupContext, BotDeliveryJSON: string(delivery), AttachmentsJSON: string(attachments), Proactive: item.Proactive, AllowedToolsJSON: string(allowedTools), ToolBudget: item.ToolBudget, Status: string(item.Status), Error: item.Error, ActiveApprovalID: item.ActiveApprovalID, WaitingGroupID: item.WaitingGroupID, WaitingReason: item.WaitingReason, LeaseOwner: item.LeaseOwner, LeaseExpiresAt: item.LeaseExpiresAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt, StartedAt: item.StartedAt, FinishedAt: item.FinishedAt}
 }
 
 func invocationFromRow(row invocationRow) agentruntime.Invocation {
 	var attachments []agent.Attachment
+	var allowedTools []string
 	var delivery *agent.BotDeliveryTarget
 	if strings.TrimSpace(row.BotDeliveryJSON) != "" && strings.TrimSpace(row.BotDeliveryJSON) != "null" {
 		_ = json.Unmarshal([]byte(row.BotDeliveryJSON), &delivery)
@@ -3492,7 +3509,10 @@ func invocationFromRow(row invocationRow) agentruntime.Invocation {
 	if strings.TrimSpace(row.AttachmentsJSON) != "" {
 		_ = json.Unmarshal([]byte(row.AttachmentsJSON), &attachments)
 	}
-	return agentruntime.Invocation{ID: row.ID, UserID: row.UserID, IdempotencyKey: row.IdempotencyKey, BotID: row.BotID, ConversationID: row.ConversationID, WorkspaceID: row.WorkspaceID, TargetPath: row.TargetPath, SessionID: row.SessionID, ParentInvocationID: row.ParentInvocationID, ContinuationDecision: agentruntime.WorkflowContinuationDecision(row.ContinuationDecision), ContinuationSourcePlanRevision: row.ContinuationSourcePlanRevision, ProviderID: row.ProviderID, ModelID: row.ModelID, ConfigSnapshot: row.ConfigSnapshot, ConfigSnapshotDigest: agent.RuntimeConfigSnapshotDigest(row.ConfigSnapshot), Message: row.Message, GroupContext: row.GroupContext, BotDelivery: delivery, Proactive: row.Proactive, Attachments: attachments, Status: agentruntime.InvocationStatus(row.Status), Error: row.Error, ActiveApprovalID: row.ActiveApprovalID, LeaseOwner: row.LeaseOwner, LeaseExpiresAt: row.LeaseExpiresAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt}
+	if strings.TrimSpace(row.AllowedToolsJSON) != "" {
+		_ = json.Unmarshal([]byte(row.AllowedToolsJSON), &allowedTools)
+	}
+	return agentruntime.Invocation{ID: row.ID, UserID: row.UserID, IdempotencyKey: row.IdempotencyKey, BotID: row.BotID, ConversationID: row.ConversationID, WorkspaceID: row.WorkspaceID, TargetPath: row.TargetPath, SessionID: row.SessionID, ParentInvocationID: row.ParentInvocationID, ContinuationDecision: agentruntime.WorkflowContinuationDecision(row.ContinuationDecision), ContinuationSourcePlanRevision: row.ContinuationSourcePlanRevision, ProviderID: row.ProviderID, ModelID: row.ModelID, ConfigSnapshot: row.ConfigSnapshot, RuntimeOptionsJSON: row.RuntimeOptionsJSON, ConfigSnapshotDigest: agent.RuntimeConfigSnapshotDigest(row.ConfigSnapshot), Message: row.Message, GroupContext: row.GroupContext, BotDelivery: delivery, Attachments: attachments, Proactive: row.Proactive, AllowedTools: allowedTools, ToolBudget: row.ToolBudget, Status: agentruntime.InvocationStatus(row.Status), Error: row.Error, ActiveApprovalID: row.ActiveApprovalID, WaitingGroupID: row.WaitingGroupID, WaitingReason: row.WaitingReason, LeaseOwner: row.LeaseOwner, LeaseExpiresAt: row.LeaseExpiresAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt}
 }
 
 func invocationResumeFromRow(row invocationResumeRow) agentruntime.InvocationResume {
@@ -3535,7 +3555,11 @@ func approvalFromRow(row approvalRow) agentruntime.Approval {
 	if len(choices) == 0 {
 		choices = agentruntime.DefaultApprovalChoices()
 	}
-	return agentruntime.Approval{ID: row.ID, InvocationID: row.InvocationID, ConversationID: row.ConversationID, ToolCallID: row.ToolCallID, TaskContractVersion: row.TaskContractVersion, ToolName: row.ToolName, OperationID: row.OperationID, OriginalCallID: row.OriginalCallID, ConfirmationCallID: row.ConfirmationCallID, Args: args, Hint: row.Hint, Choices: choices, Status: agentruntime.ApprovalStatus(row.Status), DecisionReason: row.DecisionReason, ExpiresAt: row.ExpiresAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, ResolvedAt: row.ResolvedAt}
+	var selectedChoices []string
+	if strings.TrimSpace(row.SelectedChoicesJSON) != "" {
+		_ = json.Unmarshal([]byte(row.SelectedChoicesJSON), &selectedChoices)
+	}
+	return agentruntime.Approval{ID: row.ID, InvocationID: row.InvocationID, ConversationID: row.ConversationID, ToolCallID: row.ToolCallID, TaskContractVersion: row.TaskContractVersion, ToolName: row.ToolName, OperationID: row.OperationID, OriginalCallID: row.OriginalCallID, ConfirmationCallID: row.ConfirmationCallID, Args: args, Hint: row.Hint, Choices: choices, SelectedChoices: selectedChoices, Scope: row.Scope, Supplement: row.Supplement, Status: agentruntime.ApprovalStatus(row.Status), DecisionReason: row.DecisionReason, ExpiresAt: row.ExpiresAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, ResolvedAt: row.ResolvedAt}
 }
 
 func toolCallFromRow(row toolCallRow) agentruntime.ToolCall {

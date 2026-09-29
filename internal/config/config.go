@@ -11,7 +11,6 @@ import (
 	"math"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -251,24 +250,52 @@ type PlatformSettings struct {
 
 // ExtensionSettings 汇总扩展页的三组内置行为，所有上限都在 Schema 校验。
 type ExtensionSettings struct {
-	SegmentedReplyEnabled     bool
-	SegmentOnlyLLM            bool
-	SegmentIntervalMethod     string
-	SegmentInterval           string
-	SegmentLogBase            float64
-	SegmentWordsThreshold     int
-	SegmentSplitMode          string
-	SegmentRegex              string
-	SegmentSplitWords         []string
-	SegmentCleanupRegex       string
-	GroupContextEnabled       bool
-	GroupMessageMaxCount      int
-	GroupImageCaption         bool
-	GroupImageCaptionModel    string
-	ProactiveReplyEnabled     bool
-	ProactiveReplyMethod      string
-	ProactiveReplyProbability float64
-	ProactiveReplyWhitelist   []string
+	RuntimeEnabled             bool
+	RuntimeMaxConcurrency      int
+	SourceQueueLimit           int
+	TurnWaitMilliseconds       int
+	GroupTurnWaitMilliseconds  int
+	AttachmentWaitMilliseconds int
+	MaxTurnMessages            int
+	PrivateMode                string
+	GroupParticipationMode     string
+	// RecordUnaddressedMessages 决定未唤醒的群消息是否写入持久背景；它不代表
+	// 允许机器人回复，避免“记录上下文”和“参与聊天”两个策略互相混淆。
+	RecordUnaddressedMessages bool
+	// ReactionEnabled 是行为层使用平台轻动作的总开关；真正的动作仍需经过
+	// action_permissions、平台能力和频率限制校验。
+	ReactionEnabled             bool
+	RelationEnabled             bool
+	AgentOnDemandEnabled        bool
+	GroupContextEnabled         bool
+	GroupMessageMaxCount        int
+	GroupImageCaption           bool
+	GroupImageCaptionModel      string
+	ExpressionEnabled           bool
+	ExpressionMaxSegments       int
+	ExpressionLongThreshold     int
+	ExpressionDelayMilliseconds int
+	ProactiveEnabled            bool
+	ProactiveDegree             string
+	CooldownSeconds             int
+	PrivateHourlyReplyLimit     int
+	GroupHourlyReplyLimit       int
+	HeartbeatSeconds            int
+	QuietHoursTimezone          string
+	QuietHoursStart             string
+	QuietHoursEnd               string
+	EmergencyBypassQuietHours   bool
+	RelationRetentionSeconds    int
+	FollowUpEnabled             bool
+	FollowUpMax                 int
+	FollowUpMaxRetries          int
+	FollowUpRetryDelaySeconds   int
+	FollowUpMaxDelaySeconds     int
+	FollowUpAllowedSources      []string
+	AllowedReadOnlyTools        []string
+	ToolBudget                  int
+	ActionPermissions           map[string]bool
+	MessageStyle                string
 }
 
 // Repository 是配置中心需要的持久化能力，SQLite 实现位于 storage/sqlite，便于单元测试替换。
@@ -531,22 +558,6 @@ func (s *Service) ValidateValues(ctx context.Context, values Values) error {
 	if err := validateSlidingCompactionValues(values); err != nil {
 		return err
 	}
-	// 正则和间隔在保存时检查，避免运行中的平台回复因无效配置丢失。
-	for _, key := range []string{"extensions.segment_regex", "extensions.segment_cleanup_regex"} {
-		if pattern := stringOr(values[key]); pattern != "" {
-			if len(pattern) > 512 {
-				return fmt.Errorf("%w: %s 长度不能超过 512", ErrInvalidRequest, key)
-			}
-			if _, err := regexp.Compile(pattern); err != nil {
-				return fmt.Errorf("%w: %s 正则表达式无效: %v", ErrInvalidRequest, key, err)
-			}
-		}
-	}
-	if _, exists := values["extensions.segment_interval"]; exists {
-		if _, _, err := parseSegmentInterval(stringOr(values["extensions.segment_interval"])); err != nil {
-			return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
-		}
-	}
 	if boolOr(values["extensions.group_image_caption"], false) && strings.TrimSpace(stringOr(values["extensions.group_image_caption_model"])) == "" {
 		return fmt.Errorf("%w: 自动理解群图片需要选择群图片转述模型", ErrInvalidRequest)
 	}
@@ -582,25 +593,11 @@ func (s *Service) ValidateValues(ctx context.Context, values Values) error {
 	return nil
 }
 
-// parseSegmentInterval 要求两个有界秒数且下限不大于上限，防止异常配置造成长时间阻塞。
-func parseSegmentInterval(value string) (float64, float64, error) {
-	// 严格拆分两个数字，拒绝带额外尾随内容的设置。
-	parts := strings.Split(value, ",")
-	if len(parts) != 2 {
-		return 0, 0, errors.New("分段随机间隔必须是 0-10 秒内的 最小值,最大值")
-	}
-	minimum, minErr := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-	maximum, maxErr := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-	if minErr != nil || maxErr != nil || math.IsNaN(minimum) || math.IsNaN(maximum) || math.IsInf(minimum, 0) || math.IsInf(maximum, 0) || minimum < 0 || maximum > 10 || minimum > maximum {
-		return 0, 0, errors.New("分段随机间隔必须是 0-10 秒内的 最小值,最大值")
-	}
-	return minimum, maximum, nil
-}
-
 // validateSlidingCompactionValues enforces the relationship between the two
 // sliding-window knobs. It is kept separate so direct callers and tests can
 // exercise the cross-field rule without needing a persistence implementation.
 func validateSlidingCompactionValues(values Values) error {
+	// 草稿中设置重叠却不显式设置间隔时拒绝，防止提交者误以为使用了旧的关闭状态。
 	interval := intOr(values["context.compaction.sliding_interval"], 0)
 	overlap := intOr(values["context.compaction.sliding_overlap"], 0)
 	if overlap > 0 && interval == 0 {
@@ -820,7 +817,7 @@ func buildSchema() Schema {
 		{Key: "ai.fallback_models", Group: "ai", Label: "回退对话模型", Type: "list", Default: []string{}, Help: "按顺序添加主模型失败后的回退模型；当前内置 Runtime 只使用已选主模型。"},
 		{Key: "ai.temperature", Group: "ai", Label: "温度", Type: "number", Default: 0.7, Min: floatPtr(0), Max: floatPtr(2), Help: "控制输出随机性；较低值更稳定，较高值更有创造性。"},
 		{Key: "ai.top_p", Group: "ai", Label: "Top P", Type: "number", Default: 1.0, Min: floatPtr(0.01), Max: floatPtr(1), Help: "限制采样候选范围；通常与温度二选一调整。"},
-		{Key: "ai.max_output_tokens", Group: "ai", Label: "最大输出 token", Type: "integer", Default: 0, Min: floatPtr(0), Max: floatPtr(1000000), Help: "0 表示使用模型目录或上游接口默认值。"},
+		{Key: "ai.max_output_tokens", Group: "ai", Label: "单次请求最大输出（token 数）", Type: "integer", Default: 0, Min: floatPtr(0), Max: floatPtr(1000000), Help: "填写整数 token 数；0 表示使用不超过 8192 token 的默认请求上限（模型能力未知时沿用上游默认），不会直接采用模型目录的理论最大输出。"},
 		{Key: "ai.request_retries", Group: "ai", Label: "请求失败重试次数", Type: "integer", Default: 2, Min: floatPtr(0), Max: floatPtr(5), Help: "仅在模型尚未返回任何内容时重试，避免流式输出重复。"},
 		{Key: "ai.reasoning_effort", Group: "ai", Label: "思考强度", Type: "select", Default: "", Options: []SchemaOption{{Value: "", Label: "不指定"}, {Value: "minimal", Label: "最少"}, {Value: "low", Label: "低"}, {Value: "medium", Label: "中"}, {Value: "high", Label: "高"}}, Help: "仅在模型能力支持时下发；聊天界面可以按请求临时覆盖。"},
 		{Key: "ai.health_mode", Group: "ai", Label: "健康模式", Type: "boolean", Default: false, Help: "向内置 Agent 注入安全和健康内容边界，避免将该设置误认为外部审核服务。"},
@@ -842,7 +839,7 @@ func buildSchema() Schema {
 		{Key: "context.compaction.trigger_ratio", Group: "context", Label: "压缩触发比例", Type: "number", Default: 0.8, Min: floatPtr(0.1), Max: floatPtr(0.99), Help: "上下文窗口达到该比例时触发压缩。"},
 		{Key: "context.compaction.safety_tokens", Group: "context", Label: "压缩安全余量", Type: "integer", Default: 512, Min: floatPtr(0), Max: floatPtr(100000), Help: "为模型输出预算保留的 token 余量。"},
 		{Key: "context.compaction.retention_events", Group: "context", Label: "压缩后保留事件数", Type: "integer", Default: 10, Min: floatPtr(1), Max: floatPtr(1000), Help: "压缩后保留的最近会话事件数量。"},
-		{Key: "context.compaction.sliding_interval", Group: "context", Label: "滑动窗口压缩间隔", Type: "integer", Default: 0, Min: floatPtr(0), Max: floatPtr(1000), Help: "每完成指定数量的用户轮次后生成一次滑动窗口摘要；0 表示关闭。"},
+		{Key: "context.compaction.sliding_interval", Group: "context", Label: "滑动窗口压缩间隔", Type: "integer", Default: 8, Min: floatPtr(0), Max: floatPtr(1000), Help: "默认每完成 8 个用户轮次生成一次摘要，避免大窗口模型长时间不触发 token 阈值压缩；设为 0 可关闭。"},
 		{Key: "context.compaction.sliding_overlap", Group: "context", Label: "滑动窗口重叠轮次", Type: "integer", Default: 0, Min: floatPtr(0), Max: floatPtr(100), Help: "下一次滑动窗口重复携带的已摘要轮次数；必须不大于压缩间隔。"},
 		{Key: "context.compaction.unknown_window_tokens", Group: "context", Label: "未知窗口兜底 token", Type: "integer", Default: 8192, Min: floatPtr(1024), Max: floatPtr(1000000), Help: "模型目录没有上下文窗口时使用的保守估计。"},
 		{Key: "agent.max_tool_calls", Group: "agent", Label: "单轮最大工具调用数", Type: "integer", Default: 20, Min: floatPtr(1), Max: floatPtr(100), Help: "达到上限后 Agent 会暂时移除工具声明，要求模型先给出当前结果。"},
@@ -858,7 +855,6 @@ func buildSchema() Schema {
 		{Key: "message.streaming_enabled", Group: "message", Label: "启用流式输出", Type: "boolean", Default: true, Help: "关闭后 WebUI 仍会等待同一轮结果，但不会逐片推送；平台消息不受影响。"},
 		{Key: "message.prompt_prefix", Group: "message", Label: "用户提示词前缀", Type: "string", Default: "", Help: "在每条用户消息前加入固定前缀；留空表示不注入。"},
 		{Key: "message.show_thinking", Group: "message", Label: "显示思考内容", Type: "boolean", Default: false, Help: "控制管理台是否显示模型返回的思考摘要，不改变内置 Agent 的安全边界。"},
-		{Key: "message.realtime_segmented_reply", Group: "message", Label: "实时分段回复", Type: "boolean", Default: false, Help: "平台不支持流式时按段投递；WebUI 使用 SSE。"},
 		{Key: "message.user_identification", Group: "message", Label: "用户识别", Type: "boolean", Default: true, Help: "将会话用户标识作为运行时元数据，而不是拼入用户提示词。"},
 		{Key: "message.group_name_awareness", Group: "message", Label: "显示群名称", Type: "boolean", Default: true, Help: "允许平台适配器提供群名称上下文。"},
 		{Key: "message.world_time_awareness", Group: "message", Label: "现实世界时间感知", Type: "boolean", Default: true, Help: "为内置 Agent 提供当前服务端时间。"},
@@ -904,27 +900,49 @@ func buildSchema() Schema {
 		{Key: "platform.check_response", Group: "platform", Label: "同时检查模型回复", Type: "boolean", Default: false, Help: "启用后，同样用内容屏蔽规则检查模型最终回复。"},
 		{Key: "platform.telegram_pre_ack_enabled", Group: "platform", Label: "Telegram 预回应表情", Type: "boolean", Default: false, Help: "接收有效消息后先对原消息添加表情；平台不允许时仅记录日志。"},
 		{Key: "platform.telegram_pre_ack_emoji", Group: "platform", Label: "预回应表情", Type: "select", Default: "👀", Options: []SchemaOption{{Value: "👀", Label: "👀"}, {Value: "👍", Label: "👍"}, {Value: "🤔", Label: "🤔"}, {Value: "❤", Label: "❤"}}, DisplayIf: map[string]any{"platform.telegram_pre_ack_enabled": true}},
-		// 分段回复只作用于平台文本投递；短消息按标点拆段，长消息保持原样。
-		{Key: "extensions.segmented_reply_enabled", Group: "extensions", Label: "启用分段回复", Type: "boolean", Default: false, Help: "按下列规则将 Bot 文本回复分段发送。"},
-		{Key: "extensions.segment_only_llm", Group: "extensions", Label: "仅对 LLM 结果分段", Type: "boolean", Default: true, DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}, Help: "开启时指令、审批和运行状态消息不会被拆分。"},
-		{Key: "extensions.segment_interval_method", Group: "extensions", Label: "分段间隔方法", Type: "select", Default: "random", Options: []SchemaOption{{Value: "random", Label: "随机间隔"}, {Value: "log", Label: "按字数计算"}}, DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}},
-		{Key: "extensions.segment_interval", Group: "extensions", Label: "随机间隔（秒）", Type: "string", Default: "1.5,3.5", DisplayIf: map[string]any{"extensions.segment_interval_method": "random", "extensions.segmented_reply_enabled": true}, Help: "填写最小值,最大值，例如 1.5,3.5。"},
-		{Key: "extensions.segment_log_base", Group: "extensions", Label: "对数底数", Type: "number", Default: 2.6, Min: floatPtr(1.01), Max: floatPtr(10), DisplayIf: map[string]any{"extensions.segment_interval_method": "log", "extensions.segmented_reply_enabled": true}},
-		{Key: "extensions.segment_words_threshold", Group: "extensions", Label: "分段字数阈值", Type: "integer", Default: 150, Min: floatPtr(1), Max: floatPtr(5000), DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}, Help: "超过阈值的长回复直接发送，不拆段。"},
-		{Key: "extensions.segment_split_mode", Group: "extensions", Label: "分段模式", Type: "select", Default: "regex", Options: []SchemaOption{{Value: "regex", Label: "正则表达式"}, {Value: "words", Label: "分段词列表"}}, DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}},
-		{Key: "extensions.segment_regex", Group: "extensions", Label: "分段正则表达式", Type: "string", Default: ".*?[。？！~…]+|.+$", DisplayIf: map[string]any{"extensions.segment_split_mode": "regex", "extensions.segmented_reply_enabled": true}, Help: "按正则匹配片段，使用 Go/RE2 语法。"},
-		{Key: "extensions.segment_split_words", Group: "extensions", Label: "分段词列表", Type: "list", Default: []string{"。", "？", "！", "~", "…"}, DisplayIf: map[string]any{"extensions.segment_split_mode": "words", "extensions.segmented_reply_enabled": true}, Help: "逐项添加分隔词；发送时保留命中的分隔词。"},
-		{Key: "extensions.segment_cleanup_regex", Group: "extensions", Label: "内容过滤正则表达式", Type: "string", Default: "", DisplayIf: map[string]any{"extensions.segmented_reply_enabled": true}, Help: "在拆分后移除匹配文本。"},
+		// Bot Runtime 配置直接驱动平台入口、自然话轮和表达计划，不保留旧概率与正则分段字段。
+		{Key: "extensions.runtime_enabled", Group: "extensions", Label: "启用 Bot Runtime", Type: "boolean", Default: true, Help: "平台消息先进入持久 Inbox 和自然话轮聚合器。"},
+		{Key: "extensions.runtime_max_concurrency", Group: "extensions", Label: "Bot 最大并发", Type: "integer", Default: 4, Min: floatPtr(1), Max: floatPtr(32), DisplayIf: map[string]any{"extensions.runtime_enabled": true}},
+		{Key: "extensions.source_queue_limit", Group: "extensions", Label: "每来源队列上限", Type: "integer", Default: 50, Min: floatPtr(1), Max: floatPtr(500), DisplayIf: map[string]any{"extensions.runtime_enabled": true}},
+		{Key: "extensions.turn_wait_ms", Group: "extensions", Label: "私聊聚合等待（毫秒）", Type: "integer", Default: 1500, Min: floatPtr(0), Max: floatPtr(30000), DisplayIf: map[string]any{"extensions.runtime_enabled": true}},
+		{Key: "extensions.group_turn_wait_ms", Group: "extensions", Label: "群聊聚合等待（毫秒）", Type: "integer", Default: 1200, Min: floatPtr(0), Max: floatPtr(30000), DisplayIf: map[string]any{"extensions.runtime_enabled": true}},
+		{Key: "extensions.attachment_wait_ms", Group: "extensions", Label: "附件说明等待（毫秒）", Type: "integer", Default: 4000, Min: floatPtr(0), Max: floatPtr(60000), DisplayIf: map[string]any{"extensions.runtime_enabled": true}},
+		{Key: "extensions.max_turn_messages", Group: "extensions", Label: "单话轮最多消息数", Type: "integer", Default: 12, Min: floatPtr(1), Max: floatPtr(100), DisplayIf: map[string]any{"extensions.runtime_enabled": true}},
+		{Key: "extensions.private_mode", Group: "extensions", Label: "私聊行为模式", Type: "select", Default: "responsive", Options: []SchemaOption{{Value: "responsive", Label: "正常响应"}, {Value: "observe_only", Label: "只记录不回复"}}, DisplayIf: map[string]any{"extensions.runtime_enabled": true}},
+		{Key: "extensions.group_participation_mode", Group: "extensions", Label: "群聊参与模式", Type: "select", Default: "addressed_only", Options: []SchemaOption{{Value: "addressed_only", Label: "仅被点名时响应"}, {Value: "observe_only", Label: "只观察"}}, DisplayIf: map[string]any{"extensions.runtime_enabled": true}, Help: "不使用随机概率插话；未点名消息只更新持久背景。"},
+		{Key: "extensions.record_unaddressed_messages", Group: "extensions", Label: "记录未唤醒群消息", Type: "boolean", Default: true, DisplayIf: map[string]any{"extensions.runtime_enabled": true}, Help: "只保存为同一群来源的背景，不会因此自动回复。"},
+		{Key: "extensions.reaction_enabled", Group: "extensions", Label: "允许表情回应", Type: "boolean", Default: true, DisplayIf: map[string]any{"extensions.runtime_enabled": true}, Help: "行为层可以选择平台轻动作；平台能力和动作权限仍会再次校验。"},
+		{Key: "extensions.relation_enabled", Group: "extensions", Label: "启用关系状态", Type: "boolean", Default: true, DisplayIf: map[string]any{"extensions.runtime_enabled": true}, Help: "保存称呼与最近互动时间等可解释投影，不参与权限判断。"},
+		{Key: "extensions.agent_on_demand_enabled", Group: "extensions", Label: "按需调用 Agent", Type: "boolean", Default: true, DisplayIf: map[string]any{"extensions.runtime_enabled": true}, Help: "关闭后仍可使用指令和审批，普通聊天只做确定性确认。"},
 		// 群聊历史记录所有入站群消息，包括未唤醒消息；仅在触发 AI 时注入同一 UMO 的有界历史。
 		{Key: "extensions.group_context_enabled", Group: "extensions", Label: "群聊上下文感知", Type: "boolean", Default: false, Help: "记录同一群来源的近期消息，并在触发 AI 时提供给模型。"},
 		{Key: "extensions.group_message_max_count", Group: "extensions", Label: "最多注入群消息数", Type: "integer", Default: 300, Min: floatPtr(1), Max: floatPtr(300), DisplayIf: map[string]any{"extensions.group_context_enabled": true}},
 		{Key: "extensions.group_image_caption", Group: "extensions", Label: "自动理解群图片", Type: "boolean", Default: false, DisplayIf: map[string]any{"extensions.group_context_enabled": true}, Help: "群图片转述需要选择支持图片的模型。"},
 		{Key: "extensions.group_image_caption_model", Group: "extensions", Label: "群图片转述模型", Type: "string", Default: "", DisplayIf: map[string]any{"extensions.group_image_caption": true, "extensions.group_context_enabled": true}, Help: "从已配置模型中选择；与普通图片降级模型独立。"},
-		// 主动回复只在未明确唤醒的群消息上抽样，来源白名单使用 /sid 显示的 UMO。
-		{Key: "extensions.proactive_reply_enabled", Group: "extensions", Label: "主动回复", Type: "boolean", Default: false, Help: "按概率回复未唤醒的群消息。"},
-		{Key: "extensions.proactive_reply_method", Group: "extensions", Label: "主动回复方法", Type: "select", Default: "possibility_reply", Options: []SchemaOption{{Value: "possibility_reply", Label: "概率回复"}}, DisplayIf: map[string]any{"extensions.proactive_reply_enabled": true}},
-		{Key: "extensions.proactive_reply_probability", Group: "extensions", Label: "主动回复概率", Type: "number", Default: 0.1, Min: floatPtr(0), Max: floatPtr(1), DisplayIf: map[string]any{"extensions.proactive_reply_enabled": true}},
-		{Key: "extensions.proactive_reply_whitelist", Group: "extensions", Label: "主动回复白名单", Type: "list", Default: []string{}, DisplayIf: map[string]any{"extensions.proactive_reply_enabled": true}, Help: "逐项添加 UMO 或群 ID；留空允许所有群。"},
+		{Key: "extensions.proactive_enabled", Group: "extensions", Label: "启用明确的主动行为", Type: "boolean", Default: false, Help: "仅执行用户承诺、管理员配置或待跟进事项，不使用随机概率插话。"},
+		{Key: "extensions.proactive_degree", Group: "extensions", Label: "主动参与程度", Type: "select", Default: "low", Options: []SchemaOption{{Value: "off", Label: "关闭"}, {Value: "low", Label: "低"}, {Value: "normal", Label: "正常"}, {Value: "high", Label: "高"}}, Help: "只影响已经通过明确来源、冷却和限额检查的主动行为。"},
+		{Key: "extensions.cooldown_seconds", Group: "extensions", Label: "机器人回复冷却（秒）", Type: "integer", Default: 30, Min: floatPtr(0), Max: floatPtr(86400), Help: "同一来源两次机器人主动动作之间的最短间隔。"},
+		{Key: "extensions.private_hourly_reply_limit", Group: "extensions", Label: "私聊每小时主动消息上限", Type: "integer", Default: 120, Min: floatPtr(0), Max: floatPtr(10000)},
+		{Key: "extensions.group_hourly_reply_limit", Group: "extensions", Label: "群聊每小时主动消息上限", Type: "integer", Default: 20, Min: floatPtr(0), Max: floatPtr(10000)},
+		{Key: "extensions.heartbeat_seconds", Group: "extensions", Label: "Runtime 心跳周期（秒）", Type: "integer", Default: 30, Min: floatPtr(5), Max: floatPtr(3600), Help: "扫描 Follow-up、清理租约并更新 Bot 生命周期。"},
+		{Key: "extensions.quiet_hours_timezone", Group: "extensions", Label: "Bot 安静时段时区", Type: "string", Default: "Asia/Shanghai"},
+		{Key: "extensions.quiet_hours_start", Group: "extensions", Label: "Bot 安静时段开始", Type: "string", Default: ""},
+		{Key: "extensions.quiet_hours_end", Group: "extensions", Label: "Bot 安静时段结束", Type: "string", Default: ""},
+		{Key: "extensions.emergency_bypass_quiet_hours", Group: "extensions", Label: "紧急 Follow-up 绕过安静时段", Type: "boolean", Default: false},
+		{Key: "extensions.expression_enabled", Group: "extensions", Label: "启用聊天表达层", Type: "boolean", Default: true, Help: "将模型 Markdown 转为平台安全格式，并按完整语义组织消息。"},
+		{Key: "extensions.expression_max_segments", Group: "extensions", Label: "最大语义段数", Type: "integer", Default: 4, Min: floatPtr(1), Max: floatPtr(8), DisplayIf: map[string]any{"extensions.expression_enabled": true}},
+		{Key: "extensions.expression_long_threshold", Group: "extensions", Label: "长回复阈值（字符）", Type: "integer", Default: 600, Min: floatPtr(100), Max: floatPtr(10000), DisplayIf: map[string]any{"extensions.expression_enabled": true}},
+		{Key: "extensions.expression_delay_ms", Group: "extensions", Label: "语义段间隔（毫秒）", Type: "integer", Default: 350, Min: floatPtr(0), Max: floatPtr(5000), DisplayIf: map[string]any{"extensions.expression_enabled": true}},
+		{Key: "extensions.relation_retention_seconds", Group: "extensions", Label: "关系状态保留时长（秒）", Type: "integer", Default: 2592000, Min: floatPtr(86400), Max: floatPtr(31536000)},
+		{Key: "extensions.follow_up_enabled", Group: "extensions", Label: "启用 Follow-up", Type: "boolean", Default: true},
+		{Key: "extensions.follow_up_max", Group: "extensions", Label: "单 Bot Follow-up 上限", Type: "integer", Default: 100, Min: floatPtr(1), Max: floatPtr(10000)},
+		{Key: "extensions.follow_up_max_retries", Group: "extensions", Label: "Follow-up 最大重试次数", Type: "integer", Default: 3, Min: floatPtr(0), Max: floatPtr(10), Help: "单次主动任务失败后的最大重试次数。"},
+		{Key: "extensions.follow_up_retry_delay_seconds", Group: "extensions", Label: "Follow-up 首次重试等待（秒）", Type: "integer", Default: 30, Min: floatPtr(0), Max: floatPtr(86400), Help: "重试使用指数退避，数值为首次等待时间。"},
+		{Key: "extensions.follow_up_max_delay_seconds", Group: "extensions", Label: "Follow-up 最大延迟（秒）", Type: "integer", Default: 3600, Min: floatPtr(0), Max: floatPtr(604800), Help: "单次失败重试的最大等待时间，0 表示使用调度器默认值。"},
+		{Key: "extensions.follow_up_allowed_sources", Group: "extensions", Label: "允许主动联系的来源", Type: "list", Default: []string{}, Help: "为空表示不额外限制；填写 UMO 后只允许这些来源收到主动消息。"},
+		{Key: "extensions.allowed_read_only_tools", Group: "extensions", Label: "Bot 允许的只读工具", Type: "list", Default: []string{}, Help: "主动任务和轻量行为只能从此白名单选择只读能力。"},
+		{Key: "extensions.tool_budget", Group: "extensions", Label: "Bot 单轮工具预算", Type: "integer", Default: 8, Min: floatPtr(0), Max: floatPtr(100)},
+		{Key: "extensions.message_style", Group: "extensions", Label: "普通聊天表达风格", Type: "select", Default: "natural", Options: []SchemaOption{{Value: "natural", Label: "自然聊天"}, {Value: "structured", Label: "结构化说明"}}, Help: "只影响表达层，不改变权限和事实约束。"},
 		{Key: "memory.enabled", Group: "memory", Label: "启用长期记忆", Type: "boolean", Default: false, Help: "开启后 Agent 可以检索并在用户明确要求时保存跨会话记忆。"},
 		{Key: "memory.auto_retrieve", Group: "memory", Label: "每轮自动检索", Type: "boolean", Default: false, DisplayIf: map[string]any{"memory.enabled": true}, Help: "每轮请求自动把相关记忆放入提示词；关闭时仍可由 Agent 按需检索。"},
 		{Key: "memory.max_results", Group: "memory", Label: "最多检索记忆数", Type: "integer", Default: 8, Min: floatPtr(1), Max: floatPtr(50), DisplayIf: map[string]any{"memory.enabled": true}, Help: "限制单轮注入或返回给 Agent 的记忆数量。"},
@@ -948,7 +966,7 @@ func runtimeFromValues(values Values) Runtime {
 		CompactionRatio:               numberOr(values["context.compaction.trigger_ratio"], 0.8),
 		CompactionSafetyTokens:        intOr(values["context.compaction.safety_tokens"], 512),
 		CompactionRetentionEvents:     intOr(values["context.compaction.retention_events"], 10),
-		CompactionInterval:            intOr(values["context.compaction.sliding_interval"], 0),
+		CompactionInterval:            intOr(values["context.compaction.sliding_interval"], 8),
 		CompactionOverlap:             intOr(values["context.compaction.sliding_overlap"], 0),
 		CompactionUnknownWindowTokens: intOr(values["context.compaction.unknown_window_tokens"], 8192),
 		AgentMaxToolCalls:             intOr(values["agent.max_tool_calls"], 20),
@@ -979,15 +997,22 @@ func runtimeFromValues(values Values) Runtime {
 			TelegramPreAckEnabled: boolOr(values["platform.telegram_pre_ack_enabled"], false), TelegramPreAckEmoji: stringOrDefault(values["platform.telegram_pre_ack_emoji"], "👀"),
 		},
 		Extensions: ExtensionSettings{
-			SegmentedReplyEnabled: boolOr(values["extensions.segmented_reply_enabled"], false), SegmentOnlyLLM: boolOr(values["extensions.segment_only_llm"], true),
-			SegmentIntervalMethod: stringOrDefault(values["extensions.segment_interval_method"], "random"), SegmentInterval: stringOrDefault(values["extensions.segment_interval"], "1.5,3.5"),
-			SegmentLogBase: numberOr(values["extensions.segment_log_base"], 2.6), SegmentWordsThreshold: intOr(values["extensions.segment_words_threshold"], 150),
-			SegmentSplitMode: stringOrDefault(values["extensions.segment_split_mode"], "regex"), SegmentRegex: stringOrDefault(values["extensions.segment_regex"], ".*?[。？！~…]+|.+$"),
-			SegmentSplitWords: stringListOr(values["extensions.segment_split_words"]), SegmentCleanupRegex: stringOr(values["extensions.segment_cleanup_regex"]),
+			RuntimeEnabled: boolOr(values["extensions.runtime_enabled"], true), RuntimeMaxConcurrency: intOr(values["extensions.runtime_max_concurrency"], 4),
+			SourceQueueLimit: intOr(values["extensions.source_queue_limit"], 50), TurnWaitMilliseconds: intOr(values["extensions.turn_wait_ms"], 1500),
+			GroupTurnWaitMilliseconds: intOr(values["extensions.group_turn_wait_ms"], 1200), AttachmentWaitMilliseconds: intOr(values["extensions.attachment_wait_ms"], 4000),
+			MaxTurnMessages: intOr(values["extensions.max_turn_messages"], 12),
+			PrivateMode:     stringOrDefault(values["extensions.private_mode"], "responsive"), GroupParticipationMode: stringOrDefault(values["extensions.group_participation_mode"], "addressed_only"),
+			RecordUnaddressedMessages: boolOr(values["extensions.record_unaddressed_messages"], true), ReactionEnabled: boolOr(values["extensions.reaction_enabled"], true),
+			RelationEnabled: boolOr(values["extensions.relation_enabled"], true), AgentOnDemandEnabled: boolOr(values["extensions.agent_on_demand_enabled"], true),
 			GroupContextEnabled: boolOr(values["extensions.group_context_enabled"], false), GroupMessageMaxCount: intOr(values["extensions.group_message_max_count"], 300),
 			GroupImageCaption: boolOr(values["extensions.group_image_caption"], false), GroupImageCaptionModel: stringOr(values["extensions.group_image_caption_model"]),
-			ProactiveReplyEnabled: boolOr(values["extensions.proactive_reply_enabled"], false), ProactiveReplyMethod: stringOrDefault(values["extensions.proactive_reply_method"], "possibility_reply"),
-			ProactiveReplyProbability: numberOr(values["extensions.proactive_reply_probability"], 0.1), ProactiveReplyWhitelist: stringListOr(values["extensions.proactive_reply_whitelist"]),
+			ExpressionEnabled: boolOr(values["extensions.expression_enabled"], true), ExpressionMaxSegments: intOr(values["extensions.expression_max_segments"], 4),
+			ExpressionLongThreshold: intOr(values["extensions.expression_long_threshold"], 600), ExpressionDelayMilliseconds: intOr(values["extensions.expression_delay_ms"], 350),
+			ProactiveEnabled: boolOr(values["extensions.proactive_enabled"], false), ProactiveDegree: stringOrDefault(values["extensions.proactive_degree"], "low"),
+			CooldownSeconds: intOr(values["extensions.cooldown_seconds"], 30), PrivateHourlyReplyLimit: intOr(values["extensions.private_hourly_reply_limit"], 120), GroupHourlyReplyLimit: intOr(values["extensions.group_hourly_reply_limit"], 20),
+			HeartbeatSeconds: intOr(values["extensions.heartbeat_seconds"], 30), QuietHoursTimezone: stringOrDefault(values["extensions.quiet_hours_timezone"], "Asia/Shanghai"), QuietHoursStart: stringOr(values["extensions.quiet_hours_start"]), QuietHoursEnd: stringOr(values["extensions.quiet_hours_end"]),
+			EmergencyBypassQuietHours: boolOr(values["extensions.emergency_bypass_quiet_hours"], false), RelationRetentionSeconds: intOr(values["extensions.relation_retention_seconds"], 2592000), FollowUpEnabled: boolOr(values["extensions.follow_up_enabled"], true), FollowUpMax: intOr(values["extensions.follow_up_max"], 100), FollowUpMaxRetries: intOr(values["extensions.follow_up_max_retries"], 3), FollowUpRetryDelaySeconds: intOr(values["extensions.follow_up_retry_delay_seconds"], 30), FollowUpMaxDelaySeconds: intOr(values["extensions.follow_up_max_delay_seconds"], 3600),
+			FollowUpAllowedSources: stringListOr(values["extensions.follow_up_allowed_sources"]), AllowedReadOnlyTools: stringListOr(values["extensions.allowed_read_only_tools"]), ToolBudget: intOr(values["extensions.tool_budget"], 8), MessageStyle: stringOrDefault(values["extensions.message_style"], "natural"),
 		},
 		MemoryEnabled:       boolOr(values["memory.enabled"], false),
 		MemoryAutoRetrieve:  boolOr(values["memory.auto_retrieve"], false),

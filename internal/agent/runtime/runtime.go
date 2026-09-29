@@ -102,16 +102,17 @@ func compactionFailureEvent(invocationID string, cause error, consecutive int, n
 type InvocationStatus string
 
 const (
-	InvocationQueued          InvocationStatus = "queued"
-	InvocationRunning         InvocationStatus = "running"
-	InvocationWaitingApproval InvocationStatus = "waiting_approval"
-	InvocationWaitingTool     InvocationStatus = "waiting_tool"
-	InvocationWaitingUser     InvocationStatus = "waiting_user"
-	InvocationCancelling      InvocationStatus = "cancelling"
-	InvocationCompleted       InvocationStatus = "completed"
-	InvocationFailed          InvocationStatus = "failed"
-	InvocationCancelled       InvocationStatus = "cancelled"
-	InvocationExpired         InvocationStatus = "expired"
+	InvocationQueued           InvocationStatus = "queued"
+	InvocationRunning          InvocationStatus = "running"
+	InvocationWaitingApproval  InvocationStatus = "waiting_approval"
+	InvocationWaitingTool      InvocationStatus = "waiting_tool"
+	InvocationWaitingUser      InvocationStatus = "waiting_user"
+	InvocationWaitingSubagents InvocationStatus = "waiting_subagents"
+	InvocationCancelling       InvocationStatus = "cancelling"
+	InvocationCompleted        InvocationStatus = "completed"
+	InvocationFailed           InvocationStatus = "failed"
+	InvocationCancelled        InvocationStatus = "cancelled"
+	InvocationExpired          InvocationStatus = "expired"
 )
 
 func (s InvocationStatus) Terminal() bool {
@@ -143,14 +144,20 @@ type Invocation struct {
 	// safe audit projection exposed to clients.
 	ConfigSnapshot       string `json:"-"`
 	ConfigSnapshotDigest string `json:"config_snapshot_digest,omitempty"`
-	Message              string `json:"message,omitempty"`
+	// RuntimeOptionsJSON 保存 Follow-up/排队恢复所需的无秘密运行参数，系统
+	// 指令正文不会写入此字段；普通用户请求保持为空。
+	RuntimeOptionsJSON string `json:"-"`
+	Message            string `json:"message,omitempty"`
 	// QueuedBehind 只用于本次接收回执，不写入持久化记录或公开 API。
 	QueuedBehind bool `json:"-" gorm:"-"`
 	// 群历史是低信任背景，持久化供排队任务重启恢复，但不公开为任务目标。
 	GroupContext string                   `json:"-"`
 	BotDelivery  *agent.BotDeliveryTarget `json:"-"`
-	// 主动回复标记随任务持久化，确保恢复后仍保持无工具权限。
-	Proactive bool `json:"-"`
+	// Proactive、AllowedTools 和 ToolBudget 是主动任务的不可变执行边界；
+	// 它们随 Invocation 持久化，重启恢复时不能退回普通聊天权限。
+	Proactive    bool     `json:"-"`
+	AllowedTools []string `json:"-"`
+	ToolBudget   int      `json:"-"`
 	// Attachments are persisted with the accepted input so a queued
 	// invocation recovered after restart is semantically identical. They are
 	// intentionally excluded from the API envelope; future Artifact refs can
@@ -159,6 +166,10 @@ type Invocation struct {
 	Status           InvocationStatus   `json:"status"`
 	Error            string             `json:"error,omitempty"`
 	ActiveApprovalID string             `json:"active_approval_id,omitempty"`
+	// WaitingGroupID/WaitingReason 让管理台和重启恢复能够区分“等待子 Agent
+	// 结果屏障”和其他等待点；它们只在 waiting_subagents 阶段有值。
+	WaitingGroupID string `json:"waiting_group_id,omitempty"`
+	WaitingReason  string `json:"waiting_reason,omitempty"`
 	// Lease fields are runtime-internal and deliberately excluded from the API
 	// envelope. A worker must hold the short lease before entering the ADK
 	// loop; a lost lease is treated as an unknown side-effect boundary.
@@ -191,6 +202,21 @@ const (
 	EventInvocationFailed              = "invocation.failed"
 	EventInvocationCancelled           = "invocation.cancelled"
 	EventInvocationExpired             = "invocation.expired"
+	EventSubAgentRequested             = "subagent.requested"
+	EventSubAgentQueued                = "subagent.queued"
+	EventSubAgentStarted               = "subagent.started"
+	EventSubAgentProgress              = "subagent.progress"
+	EventSubAgentCompleted             = "subagent.completed"
+	EventSubAgentFailed                = "subagent.failed"
+	EventSubAgentCancelled             = "subagent.cancelled"
+	EventSubAgentExpired               = "subagent.expired"
+	EventRetrievalRequested            = "retrieval.requested"
+	EventRetrievalSourceStarted        = "retrieval.source_started"
+	EventRetrievalSourceCompleted      = "retrieval.source_completed"
+	EventRetrievalDeduplicated         = "retrieval.deduplicated"
+	EventRetrievalReranked             = "retrieval.reranked"
+	EventRetrievalSummarized           = "retrieval.summarized"
+	EventRetrievalStale                = "retrieval.stale"
 	EventAssistantDelta                = "assistant.delta"
 	EventAssistantMessage              = "assistant.message"
 	EventUserMessage                   = "user.message"
@@ -305,6 +331,9 @@ type Approval struct {
 	Args                map[string]any   `json:"args,omitempty"`
 	Hint                string           `json:"hint,omitempty"`
 	Choices             []ApprovalChoice `json:"choices,omitempty"`
+	SelectedChoices     []string         `json:"selected_choices,omitempty"`
+	Scope               string           `json:"scope,omitempty"`
+	Supplement          string           `json:"supplement,omitempty"`
 	Status              ApprovalStatus   `json:"status"`
 	DecisionReason      string           `json:"decision_reason,omitempty"`
 	ExpiresAt           *time.Time       `json:"expires_at,omitempty"`
@@ -317,9 +346,13 @@ type Approval struct {
 // Approved 只描述该选项是否允许当前工具继续执行；ChoiceID 会随恢复请求
 // 一并进入审计数据，避免把按钮选择重新压成自然语言关键词或丢失为单一 bool。
 type ApprovalChoice struct {
-	ID       string `json:"id"`
-	Label    string `json:"label"`
-	Approved bool   `json:"approved"`
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+	Risk        string `json:"risk,omitempty"`
+	Default     bool   `json:"default,omitempty"`
+	MultiSelect bool   `json:"multi_select,omitempty"`
+	Approved    bool   `json:"approved"`
 }
 
 // DefaultApprovalChoices 是当前内置 Workspace 工具的最小交互集合。返回副本
@@ -1016,17 +1049,20 @@ type InvocationResumeCommitRepository interface {
 // SQLite/Memory commit the Runtime-owned Approval, ToolCall, Invocation,
 // private handoff/outbox and ordered audit events together.
 type ApprovalResumeCommit struct {
-	ApprovalID           string
-	ApprovalFromStatus   ApprovalStatus
-	ApprovalToStatus     ApprovalStatus
-	InvocationID         string
-	InvocationFromStatus InvocationStatus
-	InvocationToStatus   InvocationStatus
-	ToolCallID           string
-	ToolCallStatus       ToolCallStatus
-	Reason               string
-	Resume               InvocationResume
-	Outbox               InvocationResumeOutbox
+	ApprovalID              string
+	ApprovalFromStatus      ApprovalStatus
+	ApprovalToStatus        ApprovalStatus
+	InvocationID            string
+	InvocationFromStatus    InvocationStatus
+	InvocationToStatus      InvocationStatus
+	ToolCallID              string
+	ToolCallStatus          ToolCallStatus
+	Reason                  string
+	ApprovalSelectedChoices []string
+	ApprovalScope           string
+	ApprovalSupplement      string
+	Resume                  InvocationResume
+	Outbox                  InvocationResumeOutbox
 	// RejectionDelivery is populated only for a configured cross-service
 	// rejection-intent route. Implementations that support the stronger
 	// ApprovalRejectionDeliveryCommitRepository persist it in the same local
@@ -1726,6 +1762,20 @@ func NewCoordinator(kernel *agent.Kernel, repo Repository) (*Coordinator, error)
 		}
 		_, _ = coordinator.appendAndPublish(context.WithoutCancel(ctx), event)
 	})
+	kernel.SetCompactionSuccessObserver(func(ctx context.Context, invocationID, adkEventID string, timestamp time.Time) {
+		invocationID = strings.TrimSpace(invocationID)
+		if invocationID == "" {
+			return
+		}
+		if timestamp.IsZero() {
+			timestamp = time.Now().UTC()
+		}
+		// ADK 的压缩事件直接写会话库而不走 Runner 流；补一条元数据事件供日志和追踪显示。
+		_, _ = coordinator.appendAndPublish(context.WithoutCancel(ctx), AgentEvent{
+			ID: newID("event"), InvocationID: invocationID, Type: EventContextCompacted, Timestamp: timestamp,
+			Data: map[string]any{"adk_event_id": adkEventID, "scope": "compaction", "message": "会话摘要已保存"},
+		})
+	})
 	kernel.SetCompactionUsageObserver(func(ctx context.Context, invocationID string, usage map[string]any) {
 		invocationID = strings.TrimSpace(invocationID)
 		if invocationID == "" {
@@ -1961,7 +2011,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	}
 	// 重启时每个对话只启动队首，等待审批的对话不能越过当前任务。
 	blocked := make(map[string]bool)
-	waiting, err := c.repo.ListInvocations(ctx, "", []InvocationStatus{InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationCancelling})
+	waiting, err := c.repo.ListInvocations(ctx, "", []InvocationStatus{InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationWaitingSubagents, InvocationCancelling})
 	if err != nil {
 		return fmt.Errorf("读取待恢复任务失败: %w", err)
 	}
@@ -2180,7 +2230,8 @@ func (c *Coordinator) dispatchDueResumeOutbox(ctx context.Context, now time.Time
 		request := agent.ChatRequest{
 			UserID: invocation.UserID, IdempotencyKey: invocation.IdempotencyKey, BotID: invocation.BotID, ConversationID: invocation.ConversationID,
 			SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID, WorkspaceID: workspaceID, TargetPath: invocation.TargetPath,
-			ConfigSnapshot: invocation.ConfigSnapshot, Proactive: invocation.Proactive, Stream: true,
+			ConfigSnapshot: invocation.ConfigSnapshot, Proactive: invocation.Proactive, AllowedTools: append([]string(nil), invocation.AllowedTools...), ToolBudget: invocation.ToolBudget,
+			BotDelivery: invocation.BotDelivery, RuntimeOverride: runtimeOverrideForInvocation(invocation), Stream: true,
 		}
 		if resume, resumeErr := c.resumeContentForInvocation(ctx, invocation.ID); resumeErr != nil {
 			continue
@@ -4098,7 +4149,7 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 			if lookupErr == nil {
 				// 平台重试同一消息时仍告知它在队列中，不能覆盖当前任务指针。
 				if request.QueueIfBusy && existing.Status == InvocationQueued {
-					pending, pendingErr := c.repo.ListInvocations(ctx, request.UserID, []InvocationStatus{InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationCancelling})
+					pending, pendingErr := c.repo.ListInvocations(ctx, request.UserID, []InvocationStatus{InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationWaitingSubagents, InvocationCancelling})
 					if pendingErr != nil {
 						return Invocation{}, pendingErr
 					}
@@ -4117,7 +4168,7 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 		}
 	}
 	active, err := c.repo.ListInvocations(ctx, request.UserID, []InvocationStatus{
-		InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationCancelling,
+		InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationWaitingSubagents, InvocationCancelling,
 	})
 	if err != nil {
 		return Invocation{}, err
@@ -4167,11 +4218,28 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 			baseline = &normalized
 		}
 	}
+	runtimeOptionsJSON := ""
+	if request.RuntimeOverride != nil {
+		// RuntimeOverride 是排队任务真正冻结的路由来源；把它同步到 Invocation
+		// 顶层字段，便于重启恢复、能力校验和管理台按任务展示实际模型。
+		if strings.TrimSpace(request.ProviderID) == "" {
+			request.ProviderID = strings.TrimSpace(request.RuntimeOverride.ProviderID)
+		}
+		if strings.TrimSpace(request.ModelID) == "" {
+			request.ModelID = strings.TrimSpace(request.RuntimeOverride.ModelID)
+		}
+		encoded, encodeErr := agent.EncodeRuntimeOptionsOverride(*request.RuntimeOverride)
+		if encodeErr != nil {
+			return Invocation{}, encodeErr
+		}
+		runtimeOptionsJSON = encoded
+	}
 	item := Invocation{
 		ID: newID("invocation"), UserID: request.UserID, IdempotencyKey: request.IdempotencyKey, BotID: request.BotID,
 		ConversationID: request.ConversationID, WorkspaceID: workspaceID, TargetPath: strings.TrimSpace(request.TargetPath), SessionID: request.SessionID,
-		ProviderID: strings.TrimSpace(request.ProviderID), ModelID: strings.TrimSpace(request.ModelID),
-		Message: request.Message, GroupContext: request.GroupContext, BotDelivery: request.BotDelivery, Proactive: request.Proactive, Attachments: cloneAttachments(request.Attachments),
+		ProviderID: strings.TrimSpace(request.ProviderID), ModelID: strings.TrimSpace(request.ModelID), RuntimeOptionsJSON: runtimeOptionsJSON,
+		Message: request.Message, GroupContext: request.GroupContext, BotDelivery: request.BotDelivery, Attachments: cloneAttachments(request.Attachments),
+		Proactive: request.Proactive, AllowedTools: append([]string(nil), request.AllowedTools...), ToolBudget: request.ToolBudget,
 		Status: InvocationQueued, CreatedAt: now, UpdatedAt: now,
 	}
 	if err := c.repo.CreateInvocation(ctx, item); err != nil {
@@ -4241,6 +4309,20 @@ func (c *Coordinator) StartInvocation(ctx context.Context, request agent.ChatReq
 
 func (c *Coordinator) GetInvocation(ctx context.Context, id string) (Invocation, error) {
 	return c.repo.GetInvocation(ctx, strings.TrimSpace(id))
+}
+
+// runtimeOverrideForInvocation 恢复排队任务创建时的无秘密运行策略。旧记录没有
+// 该字段时返回 nil，继续走当前 RuntimeConfigResolver；损坏快照也不把错误文本
+// 暴露给平台，后续标准 ConfigSnapshot 校验会阻止错误恢复。
+func runtimeOverrideForInvocation(invocation Invocation) *agent.RuntimeOptions {
+	if strings.TrimSpace(invocation.RuntimeOptionsJSON) == "" {
+		return nil
+	}
+	value, err := agent.DecodeRuntimeOptionsOverride(invocation.RuntimeOptionsJSON)
+	if err != nil {
+		return nil
+	}
+	return &value
 }
 
 // GetWorkspaceBaseline returns the immutable admission-time worktree fact for
@@ -4682,7 +4764,9 @@ func (c *Coordinator) validateResumeSnapshots(ctx context.Context, invocation In
 		_, currentConfig, currentErr := c.kernel.ResolveRuntimeConfigSnapshot(ctx, agent.ChatRequest{
 			UserID: invocation.UserID, BotID: invocation.BotID, InvocationID: invocation.ID, ConversationID: invocation.ConversationID,
 			SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID,
-			WorkspaceID: workspaceID, TargetPath: invocation.TargetPath,
+			WorkspaceID: workspaceID, TargetPath: invocation.TargetPath, Proactive: invocation.Proactive,
+			AllowedTools: append([]string(nil), invocation.AllowedTools...), ToolBudget: invocation.ToolBudget, BotDelivery: invocation.BotDelivery,
+			RuntimeOverride: runtimeOverrideForInvocation(invocation),
 		})
 		if currentErr != nil {
 			return fmt.Errorf("%w: 当前 Runtime 配置无法解析", ErrConflict)
@@ -4751,7 +4835,7 @@ func (c *Coordinator) CancelConversationInvocations(ctx context.Context, userID,
 	}
 	statuses := []InvocationStatus{
 		InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool,
-		InvocationWaitingUser, InvocationCancelling,
+		InvocationWaitingUser, InvocationWaitingSubagents, InvocationCancelling,
 	}
 	items, err := c.repo.ListInvocations(ctx, userID, statuses)
 	if err != nil {
@@ -5890,6 +5974,127 @@ func (c *Coordinator) Subscribe(ctx context.Context, invocationID string, after 
 	return backlog, ch, func() { c.unsubscribe(invocationID, ch) }, nil
 }
 
+// RecordRuntimeEvent 供 Bot Runtime、子 Agent Manager 和检索编排器写入
+// 结构化运行事件。调用方只能提交有界 metadata；事件仍遵循同一条持久化、
+// SSE 发布和终态栅栏，不能绕过 Invocation 存在性检查。
+func (c *Coordinator) RecordRuntimeEvent(ctx context.Context, invocationID, eventType string, data map[string]any) error {
+	if c == nil {
+		return ErrNotStarted
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	invocationID = strings.TrimSpace(invocationID)
+	eventType = strings.TrimSpace(eventType)
+	if invocationID == "" || eventType == "" {
+		return ErrConflict
+	}
+	if _, err := c.repo.GetInvocation(ctx, invocationID); err != nil {
+		return err
+	}
+	normalized, _ := sanitizeRuntimeValue(data).(map[string]any)
+	if normalized == nil {
+		normalized = map[string]any{}
+	}
+	_, err := c.appendAndPublish(ctx, AgentEvent{ID: newID("event"), InvocationID: invocationID, Type: eventType, Timestamp: time.Now().UTC(), Data: normalized})
+	return err
+}
+
+// SetInvocationWaitingForSubagents 把父 Invocation 的等待原因持久化为
+// waiting_subagents。子 Agent 只能通过这个窄接口影响父任务状态，不能自行
+// 修改其他状态或伪造用户可见终态。
+func (c *Coordinator) SetInvocationWaitingForSubagents(ctx context.Context, invocationID, groupID string) error {
+	return c.transitionSubagentWait(ctx, invocationID, groupID, true)
+}
+
+// ResumeInvocationFromSubagents 清除父任务的子 Agent 等待标记。Group 屏障
+// 已经持久化结果后才调用它，因而重启或重复回调不会提前恢复父任务。
+func (c *Coordinator) ResumeInvocationFromSubagents(ctx context.Context, invocationID, groupID string) error {
+	return c.transitionSubagentWait(ctx, invocationID, groupID, false)
+}
+
+func (c *Coordinator) transitionSubagentWait(ctx context.Context, invocationID, groupID string, waiting bool) error {
+	if c == nil || c.repo == nil {
+		return ErrNotStarted
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	invocationID = strings.TrimSpace(invocationID)
+	groupID = strings.TrimSpace(groupID)
+	if invocationID == "" || groupID == "" {
+		return ErrConflict
+	}
+	item, err := c.repo.GetInvocation(ctx, invocationID)
+	if err != nil {
+		return err
+	}
+	if item.Status.Terminal() {
+		return nil
+	}
+	if waiting {
+		if item.Status == InvocationWaitingSubagents && item.WaitingGroupID == groupID {
+			return nil
+		}
+		if item.Status != InvocationRunning {
+			// 取消、审批或其他等待已经赢得状态 CAS 时，子 Agent 不能把
+			// 父任务重新改回 waiting_subagents。
+			return fmt.Errorf("%w: 父 Invocation 当前状态为 %s", ErrConflict, item.Status)
+		}
+		ok, transitionErr := c.repo.TransitionInvocation(ctx, invocationID, InvocationRunning, InvocationWaitingSubagents, "等待子 Agent 结果")
+		if transitionErr != nil {
+			return transitionErr
+		}
+		if !ok {
+			return ErrConflict
+		}
+		item.Status = InvocationWaitingSubagents
+		item.WaitingGroupID = groupID
+		item.WaitingReason = "subagents"
+	} else {
+		if item.Status == InvocationRunning {
+			// 重复屏障收口是幂等成功，不清理后来建立的其他等待点。
+			return nil
+		}
+		if item.Status != InvocationWaitingSubagents {
+			return nil
+		}
+		if item.WaitingGroupID != "" && item.WaitingGroupID != groupID {
+			return fmt.Errorf("%w: 子 Agent Group 不匹配", ErrConflict)
+		}
+		ok, transitionErr := c.repo.TransitionInvocation(ctx, invocationID, InvocationWaitingSubagents, InvocationRunning, "子 Agent 结果已收口")
+		if transitionErr != nil {
+			return transitionErr
+		}
+		if !ok {
+			return ErrConflict
+		}
+		item.Status = InvocationRunning
+		item.WaitingGroupID = ""
+		item.WaitingReason = ""
+	}
+	item.UpdatedAt = time.Now().UTC()
+	if err := c.repo.UpdateInvocation(ctx, item); err != nil {
+		// TransitionInvocation 已经完成而字段投影失败时，waiting 状态不能
+		// 悬挂；尽力回滚状态，后续屏障仍可按 Group 事实重新投影。
+		if waiting {
+			_, _ = c.repo.TransitionInvocation(context.WithoutCancel(ctx), invocationID, InvocationWaitingSubagents, InvocationRunning, "子 Agent 等待字段写入失败")
+		}
+		return err
+	}
+	data := map[string]any{"reason": "subagents", "group_id": groupID, "status": string(item.Status)}
+	eventType := EventInvocationResumed
+	if waiting {
+		eventType = EventInvocationWaiting
+	}
+	_, _ = c.appendAndPublish(context.WithoutCancel(ctx), AgentEvent{
+		ID: newID("event"), InvocationID: invocationID, Type: eventType, Timestamp: time.Now().UTC(), Data: data,
+	})
+	// 等待字段和 CAS 状态已经成功持久化；事件属于可观测旁路，写入失败
+	// 不能让 Manager 把已经结束的 Group 误判成父任务仍未恢复。
+	return nil
+}
+
 func (c *Coordinator) CancelInvocation(ctx context.Context, id string) (Invocation, error) {
 	c.approvalMu.Lock()
 	defer c.approvalMu.Unlock()
@@ -5950,8 +6155,8 @@ func validInvocationTransition(from, to InvocationStatus) bool {
 	case InvocationQueued:
 		return to == InvocationRunning || to == InvocationCancelling || to == InvocationCancelled || to == InvocationFailed
 	case InvocationRunning:
-		return to == InvocationWaitingApproval || to == InvocationWaitingTool || to == InvocationWaitingUser || to == InvocationQueued || to == InvocationCompleted || to == InvocationFailed || to == InvocationCancelling || to == InvocationCancelled
-	case InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser:
+		return to == InvocationWaitingApproval || to == InvocationWaitingTool || to == InvocationWaitingUser || to == InvocationWaitingSubagents || to == InvocationQueued || to == InvocationCompleted || to == InvocationFailed || to == InvocationCancelling || to == InvocationCancelled
+	case InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationWaitingSubagents:
 		return to == InvocationQueued || to == InvocationCancelling || to == InvocationCancelled || to == InvocationExpired || to == InvocationFailed
 	case InvocationCancelling:
 		return to == InvocationCancelled || to == InvocationFailed
@@ -6082,11 +6287,14 @@ func (c *Coordinator) ResolveApproval(ctx context.Context, approvalID string, ap
 	return c.ResolveApprovalChoice(ctx, approvalID, choiceID, reason)
 }
 
-// ResolveApprovalChoice resolves the exact option displayed to the user. The
-// choice is validated against the durable approval record before any state
-// transition, so a client cannot invent a permissive option by sending a
-// boolean or arbitrary text.
+// ResolveApprovalChoice 是单选客户端的窄入口；多选客户端提交完整数组。
 func (c *Coordinator) ResolveApprovalChoice(ctx context.Context, approvalID, choiceID, reason string) (Approval, error) {
+	return c.ResolveApprovalChoices(ctx, approvalID, []string{choiceID}, "once", "", reason)
+}
+
+// ResolveApprovalChoices 只解析用户实际看到并提交的完整选项集合。状态迁移前会针对
+// 持久化审批记录逐项校验，不能用布尔值或任意文本伪造更宽松的授权选项。
+func (c *Coordinator) ResolveApprovalChoices(ctx context.Context, approvalID string, selectedChoices []string, scope, supplement, reason string) (Approval, error) {
 	c.approvalMu.Lock()
 	defer c.approvalMu.Unlock()
 	approval, err := c.repo.GetApproval(ctx, strings.TrimSpace(approvalID))
@@ -6094,18 +6302,46 @@ func (c *Coordinator) ResolveApprovalChoice(ctx context.Context, approvalID, cho
 		return Approval{}, err
 	}
 	choices := normalizeApprovalChoices(approval.Choices)
-	choiceID = strings.TrimSpace(choiceID)
-	var choice ApprovalChoice
+	choiceByID := make(map[string]ApprovalChoice, len(choices))
+	multiSelect := false
 	for _, candidate := range choices {
-		if candidate.ID == choiceID {
-			choice = candidate
-			break
+		choiceByID[candidate.ID] = candidate
+		multiSelect = multiSelect || candidate.MultiSelect
+	}
+	selected := make([]string, 0, len(selectedChoices))
+	seenSelected := make(map[string]struct{}, len(selectedChoices))
+	approved := true
+	for _, choiceID := range selectedChoices {
+		choiceID = strings.TrimSpace(choiceID)
+		if choiceID == "" {
+			continue
+		}
+		if _, duplicate := seenSelected[choiceID]; duplicate {
+			return Approval{}, fmt.Errorf("%w: 审批选项重复", ErrConflict)
+		}
+		choice, exists := choiceByID[choiceID]
+		if !exists {
+			return Approval{}, fmt.Errorf("%w: 选项 %q 不属于该审批", ErrConflict, choiceID)
+		}
+		seenSelected[choiceID] = struct{}{}
+		selected = append(selected, choiceID)
+		if !choice.Approved {
+			approved = false
 		}
 	}
-	if choice.ID == "" {
-		return Approval{}, fmt.Errorf("%w: 选项 %q 不属于该审批", ErrConflict, choiceID)
+	if len(selected) == 0 || (!multiSelect && len(selected) != 1) || len(selected) > maxInvocationResumeItems {
+		return Approval{}, fmt.Errorf("%w: 审批选项数量无效", ErrConflict)
 	}
-	approved := choice.Approved
+	scope = strings.ToLower(strings.TrimSpace(scope))
+	if scope == "" {
+		scope = "once"
+	}
+	switch scope {
+	case "once", "session", "group", "persistent":
+	default:
+		return Approval{}, fmt.Errorf("%w: 审批范围无效", ErrConflict)
+	}
+	supplement = limitGenericRuntimeText(strings.TrimSpace(supplement), 4096)
 	status := ApprovalRejected
 	if approved {
 		status = ApprovalApproved
@@ -6114,13 +6350,17 @@ func (c *Coordinator) ResolveApprovalChoice(ctx context.Context, approvalID, cho
 		if approval.Status == status {
 			return approval, nil
 		}
-		return Approval{}, fmt.Errorf("%w: 当前状态为 %s，不能改为 %s", ErrAlreadyResolved, approval.Status, status)
+		code := "subagent_approval_rejected"
+		if approval.Status == ApprovalExpired {
+			code = "subagent_approval_expired"
+		}
+		return Approval{}, fmt.Errorf("%w: %s；当前状态为 %s，不能改为 %s", ErrAlreadyResolved, code, approval.Status, status)
 	}
 	if approval.ExpiresAt != nil && !time.Now().UTC().Before(approval.ExpiresAt.UTC()) {
 		if err := c.expireApprovalLocked(context.WithoutCancel(ctx), approval, time.Now().UTC()); err != nil {
 			return Approval{}, err
 		}
-		return Approval{}, ErrApprovalExpired
+		return Approval{}, fmt.Errorf("%w: subagent_approval_expired", ErrApprovalExpired)
 	}
 	invocation, err := c.repo.GetInvocation(ctx, approval.InvocationID)
 	if err != nil {
@@ -6159,7 +6399,13 @@ func (c *Coordinator) ResolveApprovalChoice(ctx context.Context, approvalID, cho
 	// so a crash after the CAS cannot turn an accepted decision into a replay
 	// of the original user message. Custom repositories keep the existing
 	// in-process launch path for compatibility.
-	resumePayload := map[string]any{"choice_id": choice.ID}
+	resumePayload := map[string]any{"selected_choices": selected, "scope": scope}
+	if len(selected) == 1 {
+		resumePayload["choice_id"] = selected[0]
+	}
+	if supplement != "" {
+		resumePayload["supplement"] = supplement
+	}
 	if approval.OperationID != "" {
 		resumePayload["operation_id"] = approval.OperationID
 		resumePayload["invocation_id"] = invocation.ID
@@ -6207,9 +6453,10 @@ func (c *Coordinator) ResolveApprovalChoice(ctx context.Context, approvalID, cho
 		InvocationID: invocation.ID, InvocationFromStatus: invocation.Status, InvocationToStatus: InvocationQueued,
 		ToolCallID: approval.ToolCallID, ToolCallStatus: toolStatus, Reason: reason,
 		Resume: resumeHandoff, Outbox: resumeOutbox, RejectionDelivery: rejectionDelivery,
+		ApprovalSelectedChoices: append([]string(nil), selected...), ApprovalScope: scope, ApprovalSupplement: supplement,
 		Events: []AgentEvent{
-			{ID: newID("event"), InvocationID: invocation.ID, Type: EventApprovalResolved, Timestamp: time.Now().UTC(), Data: map[string]any{"approval_id": approval.ID, "confirmed": approved, "choice_id": choice.ID, "reason": reason}},
-			{ID: newID("event"), InvocationID: invocation.ID, Type: EventInvocationResumed, Timestamp: time.Now().UTC(), Data: map[string]any{"approval_id": approval.ID, "confirmed": approved, "choice_id": choice.ID, "request_digest": resumeFingerprint}},
+			{ID: newID("event"), InvocationID: invocation.ID, Type: EventApprovalResolved, Timestamp: time.Now().UTC(), Data: map[string]any{"approval_id": approval.ID, "confirmed": approved, "selected_choices": selected, "scope": scope, "reason": reason}},
+			{ID: newID("event"), InvocationID: invocation.ID, Type: EventInvocationResumed, Timestamp: time.Now().UTC(), Data: map[string]any{"approval_id": approval.ID, "confirmed": approved, "selected_choices": selected, "scope": scope, "request_digest": resumeFingerprint}},
 		},
 	}
 	atomicCommitted := false
@@ -6325,9 +6572,22 @@ func (c *Coordinator) ResolveApprovalChoice(ctx context.Context, approvalID, cho
 	c.launch(invocation.ID, agent.ChatRequest{
 		UserID: invocation.UserID, BotID: invocation.BotID, ConversationID: invocation.ConversationID,
 		SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID, WorkspaceID: workspaceID, TargetPath: invocation.TargetPath,
-		ConfigSnapshot: invocation.ConfigSnapshot, Proactive: invocation.Proactive, ResumeContent: resume, Stream: true,
+		ConfigSnapshot: invocation.ConfigSnapshot, Proactive: invocation.Proactive, AllowedTools: append([]string(nil), invocation.AllowedTools...), ToolBudget: invocation.ToolBudget,
+		BotDelivery: invocation.BotDelivery, RuntimeOverride: runtimeOverrideForInvocation(invocation), ResumeContent: resume, Stream: true,
 	})
 	return approval, nil
+}
+
+func limitGenericRuntimeText(value string, maxBytes int) string {
+	value = strings.TrimSpace(value)
+	if maxBytes <= 0 || len([]byte(value)) <= maxBytes {
+		return value
+	}
+	result := []rune(value)
+	for len(result) > 0 && len([]byte(string(result))) > maxBytes {
+		result = result[:len(result)-1]
+	}
+	return strings.TrimSpace(string(result))
 }
 
 const (
@@ -6895,7 +7155,8 @@ func (c *Coordinator) ResumeInvocation(ctx context.Context, invocationID string,
 	c.launch(invocationID, agent.ChatRequest{
 		UserID: invocation.UserID, BotID: invocation.BotID, ConversationID: invocation.ConversationID,
 		SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID,
-		WorkspaceID: workspaceID, TargetPath: invocation.TargetPath, ConfigSnapshot: invocation.ConfigSnapshot, Proactive: invocation.Proactive, ResumeContent: resume, Stream: true,
+		WorkspaceID: workspaceID, TargetPath: invocation.TargetPath, ConfigSnapshot: invocation.ConfigSnapshot, Proactive: invocation.Proactive,
+		AllowedTools: append([]string(nil), invocation.AllowedTools...), ToolBudget: invocation.ToolBudget, BotDelivery: invocation.BotDelivery, RuntimeOverride: runtimeOverrideForInvocation(invocation), ResumeContent: resume, Stream: true,
 	})
 	return invocation, nil
 }
@@ -8206,7 +8467,8 @@ func (c *Coordinator) launchQueuedInvocation(ctx context.Context, invocation Inv
 	request := agent.ChatRequest{
 		UserID: invocation.UserID, IdempotencyKey: invocation.IdempotencyKey, BotID: invocation.BotID, ConversationID: invocation.ConversationID,
 		SessionID: invocation.SessionID, ProviderID: invocation.ProviderID, ModelID: invocation.ModelID, WorkspaceID: workspaceID, TargetPath: invocation.TargetPath,
-		Message: invocation.Message, GroupContext: invocation.GroupContext, Proactive: invocation.Proactive, Attachments: cloneAttachments(invocation.Attachments), ConfigSnapshot: invocation.ConfigSnapshot, Stream: true,
+		Message: invocation.Message, GroupContext: invocation.GroupContext, Attachments: cloneAttachments(invocation.Attachments), ConfigSnapshot: invocation.ConfigSnapshot,
+		Proactive: invocation.Proactive, AllowedTools: append([]string(nil), invocation.AllowedTools...), ToolBudget: invocation.ToolBudget, BotDelivery: invocation.BotDelivery, RuntimeOverride: runtimeOverrideForInvocation(invocation), Stream: true,
 	}
 	if resume, resumeErr := c.resumeContentForInvocation(ctx, invocation.ID); resumeErr != nil {
 		message := "runtime_recovery: 读取待恢复工具响应失败: " + resumeErr.Error()
@@ -8301,11 +8563,33 @@ type approvalData struct {
 
 var approvalChoiceIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
 
-// normalizeApprovalChoices 固定审批为“允许一次/拒绝”两个互斥选项。
-// 普通业务选项必须走 UserInputRequest，否则用户可能把多选答案误当成
-// 工具授权，造成审批语义和实际副作用不一致。
-func normalizeApprovalChoices(_ []ApprovalChoice) []ApprovalChoice {
-	return DefaultApprovalChoices()
+// normalizeApprovalChoices 保留工具声明的结构化选项，只补齐缺省二元审批。
+// 选项 ID、描述和多选标记会随 Approval 冻结；恢复时仍按这份快照校验，
+// 不能把用户输入的自然语言重新解释成授权。
+func normalizeApprovalChoices(values []ApprovalChoice) []ApprovalChoice {
+	if len(values) == 0 {
+		return DefaultApprovalChoices()
+	}
+	result := make([]ApprovalChoice, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value.ID = strings.TrimSpace(value.ID)
+		value.Label = strings.TrimSpace(value.Label)
+		value.Description = strings.TrimSpace(value.Description)
+		value.Risk = strings.TrimSpace(value.Risk)
+		if value.ID == "" || !approvalChoiceIDPattern.MatchString(value.ID) || value.Label == "" {
+			continue
+		}
+		if _, exists := seen[value.ID]; exists {
+			continue
+		}
+		seen[value.ID] = struct{}{}
+		result = append(result, value)
+	}
+	if len(result) == 0 {
+		return DefaultApprovalChoices()
+	}
+	return result
 }
 
 // approvalChoicesFromValue 从确认 payload 读取结构化选项。缺少 approved 字段
@@ -8316,9 +8600,13 @@ func approvalChoicesFromValue(value any) []ApprovalChoice {
 		return nil
 	}
 	var wire []struct {
-		ID       string `json:"id"`
-		Label    string `json:"label"`
-		Approved *bool  `json:"approved"`
+		ID          string `json:"id"`
+		Label       string `json:"label"`
+		Description string `json:"description"`
+		Risk        string `json:"risk"`
+		Default     bool   `json:"default"`
+		MultiSelect bool   `json:"multi_select"`
+		Approved    *bool  `json:"approved"`
 	}
 	if err := json.Unmarshal(encoded, &wire); err != nil {
 		return nil
@@ -8328,7 +8616,7 @@ func approvalChoicesFromValue(value any) []ApprovalChoice {
 		if item.Approved == nil {
 			continue
 		}
-		items = append(items, ApprovalChoice{ID: item.ID, Label: item.Label, Approved: *item.Approved})
+		items = append(items, ApprovalChoice{ID: item.ID, Label: item.Label, Description: item.Description, Risk: item.Risk, Default: item.Default, MultiSelect: item.MultiSelect, Approved: *item.Approved})
 	}
 	if len(items) == 0 {
 		return nil
@@ -8339,9 +8627,18 @@ func approvalChoicesFromValue(value any) []ApprovalChoice {
 // approvalChoicesFromConfirmation 允许工具在 confirmation payload 中声明多选
 // 交互，同时为旧工具补上默认的允许/拒绝选项。
 func approvalChoicesFromConfirmation(call *genai.FunctionCall) []ApprovalChoice {
-	// 工具授权固定为二元审批。多选、单选和自由文本属于 RequestInput
-	// 的普通用户问题，不能把任意 payload 中的 choices 混进授权卡片，
-	// 否则用户会误以为选择某个业务选项就等同于批准副作用。
+	if call != nil {
+		if value, ok := call.Args["choices"]; ok {
+			if choices := approvalChoicesFromValue(value); len(choices) > 0 {
+				return choices
+			}
+		}
+		if value, ok := call.Args["toolConfirmation"].(map[string]any); ok {
+			if choices := approvalChoicesFromValue(value["choices"]); len(choices) > 0 {
+				return choices
+			}
+		}
+	}
 	return DefaultApprovalChoices()
 }
 
@@ -8630,7 +8927,7 @@ func MapSessionEvent(invocationID string, event *session.Event) ([]AgentEvent, [
 				operationID := confirmationOperationID(call)
 				choices := approvalChoicesFromConfirmation(call)
 				approvalEventData := map[string]any{
-					"approval_call_id": call.ID, "original_call_id": original.ID,
+					"code": "subagent_approval_required", "approval_call_id": call.ID, "original_call_id": original.ID,
 					"tool_name": original.Name, "args": sanitizeRuntimeValue(original.Args), "hint": hint, "choices": choices,
 				}
 				if operationID != "" {

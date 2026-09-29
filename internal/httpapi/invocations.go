@@ -821,10 +821,13 @@ func (s *Server) listApprovals(writer http.ResponseWriter, request *http.Request
 type approvalResolvePayload struct {
 	// ChoiceID 是结构化审批交互的首选字段，Runtime 会按该审批已持久化的
 	// 选项校验它；Approved/Decision 仅保留给旧客户端兼容。
-	ChoiceID string `json:"choice_id"`
-	Approved *bool  `json:"approved"`
-	Decision string `json:"decision"`
-	Reason   string `json:"reason"`
+	ChoiceID        string   `json:"choice_id"`
+	SelectedChoices []string `json:"selected_choices"`
+	Scope           string   `json:"scope"`
+	Supplement      string   `json:"supplement"`
+	Approved        *bool    `json:"approved"`
+	Decision        string   `json:"decision"`
+	Reason          string   `json:"reason"`
 }
 
 func (s *Server) resolveApproval(writer http.ResponseWriter, request *http.Request) {
@@ -836,6 +839,15 @@ func (s *Server) resolveApproval(writer http.ResponseWriter, request *http.Reque
 	var payload approvalResolvePayload
 	if err := decodeJSON(writer, request, &payload); err != nil {
 		writeError(writer, fmt.Errorf("请求体无效: %w", err))
+		return
+	}
+	if len(payload.SelectedChoices) > 0 {
+		item, err := runtime.ResolveApprovalChoices(request.Context(), request.PathValue("id"), payload.SelectedChoices, payload.Scope, payload.Supplement, strings.TrimSpace(payload.Reason))
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeJSON(writer, http.StatusAccepted, item)
 		return
 	}
 	if choiceID := strings.TrimSpace(payload.ChoiceID); choiceID != "" {

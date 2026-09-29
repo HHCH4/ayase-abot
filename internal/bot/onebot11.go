@@ -22,7 +22,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const oneBotMessageLimit = 5000
+const (
+	oneBotMessageLimit         = 5000
+	oneBotMessageWorkerCount   = 4
+	oneBotMessageQueueLimit    = 128
+	oneBotMessageOverflowLimit = 256
+)
 
 // oneBotPlatform 连接 NapCat/Lagrange 等 OneBot v11 反向 WebSocket 服务端。
 type oneBotPlatform struct {
@@ -42,14 +47,27 @@ type oneBotPlatform struct {
 
 type oneBotEvent struct {
 	PostType    string          `json:"post_type"`
+	Time        int64           `json:"time"`
+	NoticeType  string          `json:"notice_type"`
+	SubType     string          `json:"sub_type"`
+	NotifyType  string          `json:"notify_type"`
 	SelfID      json.RawMessage `json:"self_id"`
 	MessageType string          `json:"message_type"`
-	SubType     string          `json:"sub_type"`
 	MessageID   json.RawMessage `json:"message_id"`
 	UserID      json.RawMessage `json:"user_id"`
 	GroupID     json.RawMessage `json:"group_id"`
+	OperatorID  json.RawMessage `json:"operator_id"`
+	TargetID    json.RawMessage `json:"target_id"`
+	EmojiID     json.RawMessage `json:"emoji_id"`
+	Set         bool            `json:"set"`
 	Sender      *oneBotSender   `json:"sender"`
 	Message     json.RawMessage `json:"message"`
+}
+
+// oneBotMessageJob 是读取循环交给固定 worker 的消息任务。附件解析可能需要
+// 通过同一 WebSocket 请求 get_file，因此不能在唯一读循环中同步执行。
+type oneBotMessageJob struct {
+	event oneBotEvent
 }
 
 // oneBotSender 是 OneBot v11 事件中可选的用户展示信息；不同实现可能只
@@ -114,8 +132,9 @@ func newOneBotPlatform(item Bot) (*oneBotPlatform, error) {
 	}, nil
 }
 
-// Run 根据连接模式启动正向客户端或反向服务端，并只消费 OneBot 的 message 事件。
-func (p *oneBotPlatform) Run(ctx context.Context, handler Handler) error {
+// runEvents 是 OneBot 两种连接模式共用的事件循环，避免正向和反向模式的
+// 平台通知解析出现行为分叉。
+func (p *oneBotPlatform) runEvents(ctx context.Context, handler EventHandler) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -125,8 +144,20 @@ func (p *oneBotPlatform) Run(ctx context.Context, handler Handler) error {
 	return p.runReverseServer(ctx, handler)
 }
 
+// RunEvents 将 OneBot 全部业务通知统一成 PlatformEvent；Manager 只从这一层
+// 接收消息、撤回、反应、成员变化和戳一戳事件。
+func (p *oneBotPlatform) RunEvents(ctx context.Context, handler EventHandler) error {
+	return p.runEvents(ctx, handler)
+}
+
+// Capabilities 描述 OneBot v11 的常用动作能力，具体平台实现不支持时仍会在
+// DispatchAction 中返回明确错误，不能伪装成已发送。
+func (p *oneBotPlatform) Capabilities() PlatformCapabilities {
+	return PlatformCapabilities{PlainText: true, Reply: true, Mention: true, Reaction: true, Image: true, Audio: true, File: true, Poke: true, Recall: true, MaxTextLength: oneBotMessageLimit}
+}
+
 // runClient 保留正向 WebSocket 客户端模式，兼容连接 NapCat WS 服务端的旧配置。
-func (p *oneBotPlatform) runClient(ctx context.Context, handler Handler) error {
+func (p *oneBotPlatform) runClient(ctx context.Context, handler EventHandler) error {
 	header := http.Header{}
 	if token := strings.TrimSpace(p.bot.OneBotAccessToken); token != "" {
 		header.Set("Authorization", "Bearer "+token)
@@ -138,8 +169,14 @@ func (p *oneBotPlatform) runClient(ctx context.Context, handler Handler) error {
 	}
 	p.setConn(conn)
 	defer func() {
+		if err := handler(context.WithoutCancel(ctx), p.lifecycleEvent(PlatformEventPlatformDisconnected)); err != nil {
+			slog.Warn("OneBot 断开事件处理失败", "adapter_id", p.bot.ID, "event_type", PlatformEventPlatformDisconnected, "error", err)
+		}
 		p.closeConn()
 	}()
+	if err := handler(ctx, p.lifecycleEvent(PlatformEventPlatformConnected)); err != nil {
+		slog.Warn("OneBot 连接事件处理失败", "adapter_id", p.bot.ID, "event_type", PlatformEventPlatformConnected, "error", err)
+	}
 	stopCloser := make(chan struct{})
 	go func() {
 		select {
@@ -154,7 +191,7 @@ func (p *oneBotPlatform) runClient(ctx context.Context, handler Handler) error {
 }
 
 // runReverseServer 启动反向 WebSocket 服务端，等待 NapCat 的 WebSocket 客户端连入。
-func (p *oneBotPlatform) runReverseServer(ctx context.Context, handler Handler) error {
+func (p *oneBotPlatform) runReverseServer(ctx context.Context, handler EventHandler) error {
 	host, address, path, err := p.bot.oneBotListenConfig()
 	if err != nil {
 		return err
@@ -210,9 +247,17 @@ func (p *oneBotPlatform) runReverseServer(ctx context.Context, handler Handler) 
 			if conn == nil {
 				continue
 			}
+			if handlerErr := handler(ctx, p.lifecycleEvent(PlatformEventPlatformConnected)); handlerErr != nil {
+				slog.Warn("OneBot 连接事件处理失败", "adapter_id", p.bot.ID, "event_type", PlatformEventPlatformConnected, "error", handlerErr)
+			}
 			if err := p.consumeConnection(ctx, conn, handler); err != nil && ctx.Err() == nil {
 				// NapCat 重连是正常行为，单次断开不能让监听服务退出。
 				slog.Warn("OneBot 反向 WebSocket 连接断开", "adapter_id", p.bot.ID, "error", err)
+			}
+			if ctx.Err() == nil {
+				if handlerErr := handler(ctx, p.lifecycleEvent(PlatformEventPlatformDisconnected)); handlerErr != nil {
+					slog.Warn("OneBot 断开事件处理失败", "adapter_id", p.bot.ID, "event_type", PlatformEventPlatformDisconnected, "error", handlerErr)
+				}
 			}
 			p.clearConn(conn)
 		case err := <-serveErr:
@@ -222,6 +267,13 @@ func (p *oneBotPlatform) runReverseServer(ctx context.Context, handler Handler) 
 			return fmt.Errorf("OneBot 反向 WebSocket 服务异常: %w", err)
 		}
 	}
+}
+
+// lifecycleEvent 只在实际建立或断开平台连接时生成生命周期事实，避免把“开始
+// 监听端口”误报为已经在线。
+func (p *oneBotPlatform) lifecycleEvent(eventType PlatformEventType) PlatformEvent {
+	now := time.Now().UTC()
+	return PlatformEvent{ID: newRuntimeID(string(eventType), p.bot.ID, fmt.Sprint(now.UnixNano())), BotID: p.bot.ID, Platform: TypeOneBot11, EventType: eventType, NativeCapabilities: p.Capabilities(), OccurredAt: now, ReceivedAt: now}
 }
 
 // acceptReverseConnection 完成 NapCat 客户端的鉴权和升级，并替换旧连接。
@@ -279,12 +331,53 @@ func (p *oneBotPlatform) authorizeReverseRequest(request *http.Request) bool {
 // consumeConnection 读取一个 OneBot 连接；心跳、生命周期事件和动作响应不会进入 Agent。
 // 消息事件交给独立 goroutine 处理，保证处理 file_id 时等待 get_file 响应不会阻塞
 // 唯一的 WebSocket 读循环。
-func (p *oneBotPlatform) consumeConnection(ctx context.Context, conn *websocket.Conn, handler Handler) (returnErr error) {
-	// 连接断开时唤醒所有等待中的动作请求，避免文件下载协程永久等待。
+func (p *oneBotPlatform) consumeConnection(ctx context.Context, conn *websocket.Conn, handler EventHandler) (returnErr error) {
+	// 消息解析固定在有限 worker 中运行；读取循环仍然独占 WebSocket 读端，
+	// 可以继续接收 get_file 等动作响应，同时避免每条消息派生 goroutine。
+	jobs := make(chan oneBotMessageJob, oneBotMessageQueueLimit)
+	// 读循环不能直接阻塞在 jobs 发送上：附件解析 worker 可能正在等待
+	// get_file 响应，阻塞会让同一条 WebSocket 永远无法读到响应。溢出区只
+	// 保存有限数量的已归一化事件，达到上限后主动断开，让平台重新建立连接。
+	overflow := make([]oneBotMessageJob, 0, oneBotMessageOverflowLimit)
+	var workers sync.WaitGroup
+	for index := 0; index < oneBotMessageWorkerCount; index++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+					p.handleMessageEvent(ctx, conn, job.event, handler)
+				}
+			}
+		}()
+	}
+	// 连接断开时先唤醒所有等待中的动作请求，再停止固定 worker；否则附件
+	// 解析 worker 可能在等待 get_file 响应时无法结束，造成连接泄漏。
 	defer func() {
 		p.failActionWaiters(conn, returnErr)
+		close(jobs)
+		workers.Wait()
 	}()
 	for {
+		// 每次读新帧前尽可能把溢出事件送入固定队列，避免内存中的事件长期滞留。
+		for len(overflow) > 0 {
+			select {
+			case jobs <- overflow[0]:
+				overflow = overflow[1:]
+			default:
+				// 当前队列已满，继续读 WebSocket 以便处理动作响应。
+				break
+			}
+			if len(overflow) > 0 {
+				break
+			}
+		}
 		// 先读取原始 WebSocket 帧并打印，再解析事件，确保消息和动作响应不会因结构体字段不足而丢失。
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
@@ -303,30 +396,102 @@ func (p *oneBotPlatform) consumeConnection(ctx context.Context, conn *websocket.
 			slog.Error("OneBot WebSocket 响应解析失败", "adapter_id", p.bot.ID, "payload", string(payload), "error", err)
 			continue
 		}
-		if event.PostType != "message" {
-			continue
-		}
 		if value := rawID(event.SelfID); value != "" {
 			p.mu.Lock()
 			p.selfID = value
 			p.mu.Unlock()
 		}
-		// 文件消息需要通过同一条连接请求 get_file；异步处理可让读循环继续接收该响应。
-		go p.handleMessageEvent(ctx, conn, event, handler)
+		if event.PostType == "message" {
+			// 文件消息需要通过同一条连接请求 get_file；固定 worker 处理可让
+			// 读循环继续接收该响应，队列满时先进入有限溢出区而不是无界占用内存。
+			select {
+			case jobs <- oneBotMessageJob{event: event}:
+			case <-ctx.Done():
+				return nil
+			default:
+				if len(overflow) >= oneBotMessageOverflowLimit {
+					return fmt.Errorf("OneBot 消息处理队列已满，关闭连接等待平台重连")
+				}
+				overflow = append(overflow, oneBotMessageJob{event: event})
+			}
+			continue
+		}
+		if platformEvent, ok := p.eventFromNotice(payload, event); ok {
+			if handlerErr := handler(ctx, platformEvent); handlerErr != nil {
+				slog.Warn("OneBot 平台事件交给机器人处理失败", "adapter_id", p.bot.ID, "event_type", platformEvent.EventType, "error", handlerErr)
+			}
+		}
 	}
 }
 
 // handleMessageEvent 在独立 goroutine 中解析并投递单条消息，保留解析失败原因，
 // 这样平台文件协议异常不会再被静默吞掉。
-func (p *oneBotPlatform) handleMessageEvent(ctx context.Context, conn *websocket.Conn, event oneBotEvent, handler Handler) {
+func (p *oneBotPlatform) handleMessageEvent(ctx context.Context, conn *websocket.Conn, event oneBotEvent, handler EventHandler) {
 	message, err := p.messageFromEventOnConn(ctx, conn, event)
 	if err != nil {
 		slog.Warn("OneBot 入站消息处理失败", "adapter_id", p.bot.ID, "message_id", rawID(event.MessageID), "error", err)
 		return
 	}
-	if handlerErr := handler(ctx, message); handlerErr != nil {
+	if handlerErr := handler(ctx, platformEventFromMessage(message, PlatformEventMessageCreated, p.Capabilities())); handlerErr != nil {
 		slog.Warn("OneBot 入站消息交给机器人处理失败", "adapter_id", p.bot.ID, "message_id", message.ID, "error", handlerErr)
 	}
+}
+
+// eventFromNotice 将 OneBot notice 归一化为平台事件。未知通知仍保留在
+// WebSocket 日志中，但不会伪装成聊天消息进入 Agent。
+func (p *oneBotPlatform) eventFromNotice(raw []byte, event oneBotEvent) (PlatformEvent, bool) {
+	notice := strings.ToLower(strings.TrimSpace(event.NoticeType))
+	notify := strings.ToLower(strings.TrimSpace(event.NotifyType))
+	eventType := PlatformEventType("")
+	switch {
+	case notice == "group_recall" || notice == "friend_recall" || notice == "private_recall":
+		eventType = PlatformEventMessageRecalled
+	case notice == "group_increase":
+		eventType = PlatformEventMemberJoined
+	case notice == "group_decrease":
+		eventType = PlatformEventMemberLeft
+	case notice == "group_msg_emoji_like" || notice == "message_reaction":
+		if event.Set {
+			eventType = PlatformEventReactionAdded
+		} else {
+			eventType = PlatformEventReactionRemoved
+		}
+	case notice == "notify" && (notify == "poke" || notify == "lucky_king"):
+		// 只有 poke 需要进入统一动作语义；其他 notify 不改变 Bot 状态。
+		if notify == "poke" {
+			eventType = PlatformEventPokeReceived
+		}
+	}
+	if eventType == "" {
+		return PlatformEvent{}, false
+	}
+	chatType := strings.TrimSpace(event.MessageType)
+	if chatType == "" && rawID(event.GroupID) != "" {
+		chatType = "group"
+	}
+	if chatType == "" {
+		chatType = "private"
+	}
+	chatID := rawID(event.GroupID)
+	if chatID == "" {
+		chatID = rawID(event.UserID)
+	}
+	userID := rawID(event.UserID)
+	if userID == "" {
+		userID = rawID(event.OperatorID)
+	}
+	message := Message{AdapterID: p.bot.ID, Platform: TypeOneBot11, UserID: userID, ChatID: chatID, ChatType: chatType}
+	occurred := time.Now().UTC()
+	if event.Time > 0 {
+		occurred = time.Unix(event.Time, 0).UTC()
+	}
+	return PlatformEvent{
+		ID: newRuntimeID("onebot-event", p.bot.ID, string(eventType), string(raw)), BotID: p.bot.ID, Platform: TypeOneBot11,
+		SourceUMO: messageSource(message), ChatType: chatType, ChatID: chatID, UserID: userID, EventType: eventType,
+		MessageID: rawID(event.MessageID), MentionedUserIDs: nil, NativeCapabilities: p.Capabilities(), OccurredAt: occurred, ReceivedAt: time.Now().UTC(), RawRef: newRuntimeID("onebot-raw", string(raw)),
+		// 非消息通知不构造聊天 Message，避免被任何上层误投递到 Agent。
+		Message: nil,
+	}, true
 }
 
 // Test 在服务端模式检查监听地址是否可用；正在运行时由 Manager 直接报告监听正常。
@@ -354,25 +519,88 @@ func (p *oneBotPlatform) Test(ctx context.Context) error {
 	return conn.Close()
 }
 
-// Send 使用 OneBot v11 send_msg 动作发回私聊或群聊消息。
-func (p *oneBotPlatform) Send(ctx context.Context, message Message, text string) error {
+// DispatchAction 把 Runtime 的抽象动作投影为 OneBot v11 API，并在支持 echo 的
+// 动作上等待平台结果；适配器不再暴露绕过动作计划的直接发送入口。
+func (p *oneBotPlatform) DispatchAction(ctx context.Context, action PlatformAction) (PlatformActionResult, error) {
+	switch strings.TrimSpace(action.Type) {
+	case "send_text":
+		if action.Approval != nil {
+			return p.dispatchSendText(ctx, action.Message, approvalPromptText(*action.Approval))
+		}
+		if action.UserInput != nil {
+			return p.dispatchSendText(ctx, action.Message, userInputOptionsText(*action.UserInput))
+		}
+		return p.dispatchSendText(ctx, action.Message, action.Text)
+	case "send_image", "send_audio", "send_file":
+		return p.dispatchSendAttachment(ctx, action)
+	case "recall_message":
+		return p.dispatchOneBotSimpleAction(ctx, "delete_msg", map[string]any{"message_id": oneBotIDValue(action.TargetID)})
+	case "add_reaction":
+		params := map[string]any{"message_id": oneBotIDValue(action.TargetID), "emoji_id": action.Emoji, "set": true}
+		return p.dispatchOneBotSimpleAction(ctx, "set_msg_emoji_like", params)
+	case "poke":
+		params := map[string]any{"user_id": oneBotIDValue(action.TargetID)}
+		if isGroupChat(action.Message.ChatType) {
+			params["group_id"] = oneBotIDValue(action.Message.ChatID)
+		}
+		return p.dispatchOneBotSimpleAction(ctx, "send_poke", params)
+	default:
+		return PlatformActionResult{}, fmt.Errorf("OneBot 不支持抽象动作 %q", action.Type)
+	}
+}
+
+// dispatchSendAttachment 将 Runtime 的附件数据编码为 OneBot 约定的
+// base64:// 文件引用；适配器负责构造平台消息段，业务层不拼接 CQ 码。
+func (p *oneBotPlatform) dispatchSendAttachment(ctx context.Context, action PlatformAction) (PlatformActionResult, error) {
+	if action.Attachment == nil || len(action.Attachment.Data) == 0 {
+		return PlatformActionResult{}, errors.New("OneBot 媒体动作缺少附件数据")
+	}
+	value := "base64://" + base64.StdEncoding.EncodeToString(action.Attachment.Data)
+	segmentType := "image"
+	data := map[string]any{"file": value}
+	switch strings.TrimSpace(action.Type) {
+	case "send_audio":
+		segmentType = "record"
+	case "send_file":
+		segmentType = "file"
+		if name := cleanFileName(action.Attachment.Name); name != "" {
+			data["name"] = name
+		}
+	}
+	params := map[string]any{"message_type": action.Message.ChatType, "message": []map[string]any{{"type": segmentType, "data": data}}}
+	if isGroupChat(action.Message.ChatType) {
+		params["group_id"] = oneBotIDValue(action.Message.ChatID)
+	} else {
+		params["message_type"] = "private"
+		params["user_id"] = oneBotIDValue(action.Message.ChatID)
+	}
+	echo := fmt.Sprintf("abot-action-%d", time.Now().UnixNano())
+	actionPayload := map[string]any{"action": "send_msg", "params": params, "echo": echo}
+	slog.Info("OneBot WebSocket 请求", "adapter_id", p.bot.ID, "action", actionPayload)
 	p.mu.Lock()
 	conn := p.conn
 	p.mu.Unlock()
 	if conn == nil {
-		return ErrNotRunning
+		return PlatformActionResult{}, ErrNotRunning
 	}
-	for index, chunk := range splitText(text, oneBotMessageLimit) {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		params := map[string]any{
-			"message_type": message.ChatType,
-			"message":      chunk,
-		}
-		// OneBot 使用结构化消息段实现引用与 @，不拼接可被平台误解析的 CQ 文本。
+	payload, err := p.requestAction(ctx, conn, actionPayload, echo)
+	if err != nil {
+		return PlatformActionResult{}, err
+	}
+	return oneBotActionResultFromPayload(payload)
+}
+
+func (p *oneBotPlatform) dispatchSendText(ctx context.Context, message Message, text string) (PlatformActionResult, error) {
+	p.mu.Lock()
+	conn := p.conn
+	p.mu.Unlock()
+	if conn == nil {
+		return PlatformActionResult{}, ErrNotRunning
+	}
+	var lastID string
+	chunks := splitText(text, oneBotMessageLimit)
+	for index, chunk := range chunks {
+		params := map[string]any{"message_type": message.ChatType, "message": chunk}
 		if index == 0 && (message.ReplyQuote || message.ReplyMention && isGroupChat(message.ChatType)) {
 			segments := make([]map[string]any, 0, 3)
 			if message.ReplyQuote && message.ReplyMessageID != "" {
@@ -384,31 +612,68 @@ func (p *oneBotPlatform) Send(ctx context.Context, message Message, text string)
 			segments = append(segments, map[string]any{"type": "text", "data": map[string]any{"text": chunk}})
 			params["message"] = segments
 		}
-		if params["message_type"] == "group" {
+		if isGroupChat(message.ChatType) {
 			params["group_id"] = oneBotIDValue(message.ChatID)
 		} else {
 			params["message_type"] = "private"
 			params["user_id"] = oneBotIDValue(message.ChatID)
 		}
-		action := map[string]any{"action": "send_msg", "params": params, "echo": fmt.Sprintf("abot-%d", time.Now().UnixNano())}
-		// 记录发给 OneBot 的完整动作；对应的异步响应由 consumeConnection 原文记录。
-		slog.Info("OneBot WebSocket 请求", "adapter_id", p.bot.ID, "action", action)
-		p.mu.Lock()
-		if p.conn == nil {
-			p.mu.Unlock()
-			slog.Error("OneBot WebSocket 请求失败", "adapter_id", p.bot.ID, "action", action, "error", ErrNotRunning)
-			return ErrNotRunning
-		}
-		conn = p.conn
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		err := conn.WriteJSON(action)
-		p.mu.Unlock()
+		echo := fmt.Sprintf("abot-action-%d", time.Now().UnixNano())
+		actionPayload := map[string]any{"action": "send_msg", "params": params, "echo": echo}
+		slog.Info("OneBot WebSocket 请求", "adapter_id", p.bot.ID, "action", actionPayload)
+		payload, err := p.requestAction(ctx, conn, actionPayload, echo)
 		if err != nil {
-			slog.Error("OneBot WebSocket 请求失败", "adapter_id", p.bot.ID, "action", action, "error", err)
-			return fmt.Errorf("OneBot 发送消息失败: %w", err)
+			return PlatformActionResult{}, err
+		}
+		result, err := oneBotActionResultFromPayload(payload)
+		if err != nil {
+			return PlatformActionResult{}, err
+		}
+		if result.MessageID != "" {
+			lastID = result.MessageID
 		}
 	}
-	return nil
+	return PlatformActionResult{MessageID: lastID}, nil
+}
+
+func (p *oneBotPlatform) dispatchOneBotSimpleAction(ctx context.Context, name string, params map[string]any) (PlatformActionResult, error) {
+	p.mu.Lock()
+	conn := p.conn
+	p.mu.Unlock()
+	if conn == nil {
+		return PlatformActionResult{}, ErrNotRunning
+	}
+	echo := fmt.Sprintf("abot-action-%d", time.Now().UnixNano())
+	action := map[string]any{"action": name, "params": params, "echo": echo}
+	slog.Info("OneBot WebSocket 请求", "adapter_id", p.bot.ID, "action", action)
+	payload, err := p.requestAction(ctx, conn, action, echo)
+	if err != nil {
+		return PlatformActionResult{}, err
+	}
+	return oneBotActionResultFromPayload(payload)
+}
+
+func oneBotActionResultFromPayload(payload []byte) (PlatformActionResult, error) {
+	var response oneBotActionResponse
+	if err := json.Unmarshal(payload, &response); err != nil {
+		return PlatformActionResult{}, fmt.Errorf("OneBot 动作响应解析失败: %w", err)
+	}
+	if response.RetCode != 0 || strings.EqualFold(strings.TrimSpace(response.Status), "failed") {
+		message := strings.TrimSpace(response.Message)
+		if message == "" {
+			message = strings.TrimSpace(response.Wording)
+		}
+		return PlatformActionResult{}, fmt.Errorf("OneBot 动作失败（retcode=%d）: %s", response.RetCode, message)
+	}
+	var result struct {
+		MessageID json.RawMessage `json:"message_id"`
+	}
+	if len(response.Data) > 0 && string(response.Data) != "null" {
+		if err := json.Unmarshal(response.Data, &result); err != nil {
+			return PlatformActionResult{}, fmt.Errorf("OneBot 动作结果解析失败: %w", err)
+		}
+	}
+	return PlatformActionResult{MessageID: rawID(result.MessageID), Raw: string(payload)}, nil
 }
 
 // Close 关闭当前 WebSocket 和反向监听服务，使阻塞中的读取或监听立即返回。
@@ -625,19 +890,35 @@ func (p *oneBotPlatform) messageFromEventOnConn(ctx context.Context, conn *webso
 		return Message{}, errors.New("OneBot 消息不包含文本或支持的附件")
 	}
 	return Message{
-		ID:             rawID(event.MessageID),
-		Platform:       TypeOneBot11,
-		UserID:         userID,
-		ChatID:         chatID,
-		ChatType:       chatType,
-		AutoName:       oneBotMessageAutoName(event, chatID, userID),
-		Text:           strings.TrimSpace(text),
-		Attachments:    attachments,
-		Mentioned:      !isGroupChat(chatType) || p.oneBotMessageMentioned(event),
-		ReplyMessageID: rawID(event.MessageID),
-		IsSelf:         userID != "" && userID == rawID(event.SelfID),
-		AtAll:          oneBotAtAll(event.Message),
+		ID:               rawID(event.MessageID),
+		Platform:         TypeOneBot11,
+		UserID:           userID,
+		ChatID:           chatID,
+		ChatType:         chatType,
+		AutoName:         oneBotMessageAutoName(event, chatID, userID),
+		Text:             strings.TrimSpace(text),
+		Attachments:      attachments,
+		Mentioned:        !isGroupChat(chatType) || p.oneBotMessageMentioned(event),
+		ReplyMessageID:   rawID(event.MessageID),
+		ReplyToMessageID: oneBotReplyToMessageID(event.Message),
+		IsSelf:           userID != "" && userID == rawID(event.SelfID),
+		AtAll:            oneBotAtAll(event.Message),
 	}, nil
+}
+
+// oneBotReplyToMessageID 提取结构化 reply 消息段中的被引用消息 ID；普通入站
+// 消息没有该字段，不会影响正常回复引用原消息的行为。
+func oneBotReplyToMessageID(raw json.RawMessage) string {
+	var segments []oneBotSegment
+	if json.Unmarshal(raw, &segments) != nil {
+		return ""
+	}
+	for _, segment := range segments {
+		if segment.Type == "reply" {
+			return stringValue(segment.Data["id"])
+		}
+	}
+	return ""
 }
 
 // oneBotAtAll 只识别结构化 @全体 消息，避免普通文字误触发过滤。
@@ -909,13 +1190,13 @@ func readOneBotLocalFileWithRoot(name, localFileRoot string) ([]byte, error) {
 }
 
 // oneBotLocalFileCandidates 只为 NapCat 的已知容器路径生成候选宿主机路径；
-// 环境变量优先，默认值适配常见的 ~/napcat/ntqq 挂载目录。
+// 生产解析使用机器人页面保存的实例目录，空配置时才尝试本机约定目录。
 func oneBotLocalFileCandidates(name string) []string {
 	return oneBotLocalFileCandidatesWithRoot(name, "")
 }
 
 // oneBotLocalFileCandidatesWithRoot 仅为已知的 NapCat 容器前缀生成宿主机候选
-// 路径；实例配置优先，环境变量和默认目录只用于兼容未迁移的旧配置。
+// 路径；宿主机目录来自当前机器人配置，不读取全局环境变量，避免不同机器人互相串附件。
 func oneBotLocalFileCandidatesWithRoot(name, localFileRoot string) []string {
 	candidates := []string{name}
 	const containerRoot = "/app/.config/QQ"
@@ -926,9 +1207,6 @@ func oneBotLocalFileCandidatesWithRoot(name, localFileRoot string) []string {
 	relative := strings.TrimPrefix(name, prefix)
 	roots := make([]string, 0, 3)
 	if root := strings.TrimSpace(localFileRoot); root != "" {
-		roots = append(roots, root)
-	}
-	if root := strings.TrimSpace(os.Getenv("ABOT_ONEBOT_FILE_ROOT")); root != "" {
 		roots = append(roots, root)
 	}
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {

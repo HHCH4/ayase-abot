@@ -104,7 +104,7 @@ func (s *Server) pauseScheduledTask(writer http.ResponseWriter, request *http.Re
 }
 
 func (s *Server) resumeScheduledTask(writer http.ResponseWriter, request *http.Request) {
-	s.setScheduledTaskStatus(writer, request, schedule.StatusActive)
+	s.setScheduledTaskStatus(writer, request, schedule.StatusScheduled)
 }
 
 func (s *Server) setScheduledTaskStatus(writer http.ResponseWriter, request *http.Request, status schedule.Status) {

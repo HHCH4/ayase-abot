@@ -116,12 +116,63 @@ export interface Bot {
   group_trigger_mode?: 'mention' | 'all' | string
   /** 聊天指令的全局管理员；只能在 WebUI 配置，聊天中无法授予。 */
   admin_user_ids?: string[]
+  runtime_config?: BotRuntimeConfig
   telegram_token_configured?: boolean
   onebot_access_token_configured?: boolean
   enabled: boolean
   status: string
   status_message?: string
   updated_at?: string
+}
+
+/** 机器人页面的运行时显式覆盖；未返回的字段表示继续继承配置文件。 */
+export interface BotRuntimeConfig {
+  runtime_enabled?: boolean
+  runtime_max_concurrency?: number
+  source_queue_limit?: number
+  turn_wait_ms?: number
+  group_turn_wait_ms?: number
+  attachment_wait_ms?: number
+  max_turn_messages?: number
+  private_mode?: string
+  group_participation_mode?: string
+  record_unaddressed_messages?: boolean
+  reaction_enabled?: boolean
+  group_context_enabled?: boolean
+  group_message_max_count?: number
+  group_image_caption?: boolean
+  group_image_caption_model?: string
+  proactive_enabled?: boolean
+  proactive_degree?: string
+  cooldown_seconds?: number
+  private_hourly_reply_limit?: number
+  group_hourly_reply_limit?: number
+  heartbeat_seconds?: number
+  quiet_hours_timezone?: string
+  quiet_hours_start?: string
+  quiet_hours_end?: string
+  emergency_bypass_quiet_hours?: boolean
+  relation_enabled?: boolean
+  relation_retention_seconds?: number
+  follow_up_enabled?: boolean
+  follow_up_max?: number
+  follow_up_max_retries?: number
+  follow_up_retry_delay_seconds?: number
+  follow_up_max_delay_seconds?: number
+  follow_up_allowed_sources?: string[]
+  expression_enabled?: boolean
+  expression_max_segments?: number
+  expression_long_threshold?: number
+  expression_delay_ms?: number
+  reply_mention?: boolean
+  reply_quote?: boolean
+  private_reply_quote?: boolean
+  agent_on_demand_enabled?: boolean
+  allowed_read_only_tools?: string[]
+  tool_budget?: number
+  subagent_enabled?: boolean
+  action_permissions?: Record<string, boolean>
+  message_style?: string
 }
 
 export interface Workspace {
@@ -416,6 +467,179 @@ export interface InvocationTrace {
   usage: InvocationUsage
 }
 
+export interface SubAgentBudgetSnapshot {
+  max_depth?: number
+  max_groups?: number
+  max_children?: number
+  max_concurrency?: number
+  input_bytes?: number
+  context_tokens?: number
+  output_tokens?: number
+  result_bytes?: number
+  image_bytes?: number
+  artifact_count?: number
+  network_requests?: number
+  retry_count?: number
+  deadline_at?: string
+}
+
+export interface SubAgentCapabilitySnapshot {
+  allowed_tools?: string[]
+  filesystem_mode?: string
+  filesystem_roots?: string[]
+  network_mode?: string
+  network_allowlist?: string[]
+  can_write?: boolean
+  can_delete?: boolean
+  can_spawn_children?: boolean
+  approval_mode?: string
+  provider_id?: string
+  model_id?: string
+}
+
+export interface SubAgentUsage {
+  reserved?: number
+  consumed?: number
+  released?: number
+  unknown?: number
+  runs?: number
+  succeeded?: number
+  failed?: number
+}
+
+export interface SubAgentGroup {
+  id: string
+  root_invocation_id?: string
+  parent_invocation_id?: string
+  conversation_id?: string
+  parent_node_id?: string
+  profile?: string
+  purpose?: string
+  status: string
+  failure_policy?: string
+  expected_count?: number
+  queued_count?: number
+  running_count?: number
+  completed_count?: number
+  failed_count?: number
+  cancelled_count?: number
+  minimum_successes?: number
+  max_concurrency?: number
+  budget?: SubAgentBudgetSnapshot
+  capabilities?: SubAgentCapabilitySnapshot
+  source_scope?: string[]
+  query_digest?: string
+  parent_plan_id?: string
+  usage?: SubAgentUsage
+  result_text?: string
+  result_digest?: string
+  error_code?: string
+  error_message?: string
+  created_at?: string
+  started_at?: string
+  finished_at?: string
+  updated_at?: string
+  revision?: number
+}
+
+export interface SubAgentRun {
+  id: string
+  group_id: string
+  ordinal?: number
+  stage?: string
+  depends_on_run_ids?: string[]
+  profile?: string
+  status: string
+  attempt?: number
+  idempotency_key?: string
+  provider_id?: string
+  model_id?: string
+  capabilities?: SubAgentCapabilitySnapshot
+  input_artifact_refs?: ArtifactRef[]
+  input_metadata?: Record<string, string>
+  result_text?: string
+  result_artifact_refs?: ArtifactRef[]
+  result_metadata?: Record<string, string>
+  result_digest?: string
+  error_code?: string
+  error_message?: string
+  error_retryable?: boolean
+  lease_owner?: string
+  lease_expires_at?: string
+  created_at?: string
+  queued_at?: string
+  started_at?: string
+  finished_at?: string
+  updated_at?: string
+  revision?: number
+}
+
+export interface EvidenceItem {
+  evidence_id: string
+  source_kind: string
+  source_id: string
+  source_name?: string
+  locator?: string
+  title?: string
+  excerpt?: string
+  content_digest?: string
+  retrieval_score?: number
+  rerank_score?: number
+  retrieved_at?: string
+  published_at?: string
+  freshness?: string
+  trust_level?: string
+  citation?: string
+  metadata?: Record<string, string>
+  truncated?: boolean
+  stale?: boolean
+  source_failed?: boolean
+  error_message?: string
+}
+
+export interface RetrievalFailure {
+  source_kind: string
+  source_id?: string
+  code: string
+  message: string
+  retryable?: boolean
+}
+
+export interface RetrievalResult {
+  request_id: string
+  items: EvidenceItem[]
+  failures?: RetrievalFailure[]
+  source_counts?: Record<string, number>
+  query_digest?: string
+  permission_digest?: string
+  cached?: boolean
+  partial?: boolean
+  retrieved_at?: string
+}
+
+export interface RetrievalRequestPayload {
+  invocation_id?: string
+  query: string
+  query_type?: string
+  user_id: string
+  conversation_id?: string
+  session_id?: string
+  source_kinds: string[]
+  source_ids?: string[]
+  scope?: string[]
+  filters?: Record<string, string>
+  top_k?: number
+  rerank_enabled?: boolean
+  freshness?: string
+  max_query_count?: number
+  max_result_bytes?: number
+  web_search_daily_call_limit?: number
+  web_search_max_calls_per_invocation?: number
+  web_search_alert_percent?: number
+  permission_digest?: string
+  requested_by?: string
+}
+
 export interface ToolSetSnapshot {
   invocation_id: string
   digest: string
@@ -529,6 +753,52 @@ export interface SessionRule {
   knowledge_bases?: string[]
   knowledge_top_k: number
   knowledge_rerank: boolean
+  private_mode?: string
+  group_participation_mode?: string
+  record_unaddressed_messages?: boolean
+  reaction_enabled?: boolean
+  group_context_enabled?: boolean
+  proactive_enabled?: boolean
+  private_hourly_reply_limit?: number
+  group_hourly_reply_limit?: number
+  quiet_hours_timezone?: string
+  quiet_hours_start?: string
+  quiet_hours_end?: string
+  emergency_bypass_quiet_hours?: boolean
+  reply_quote?: boolean
+  private_reply_quote?: boolean
+  follow_up_enabled?: boolean
+  relation_enabled?: boolean
+  runtime_enabled?: boolean
+  runtime_max_concurrency?: number
+  source_queue_limit?: number
+  turn_wait_ms?: number
+  group_turn_wait_ms?: number
+  attachment_wait_ms?: number
+  max_turn_messages?: number
+  group_message_max_count?: number
+  group_image_caption?: boolean
+  group_image_caption_model?: string
+  proactive_degree?: string
+  cooldown_seconds?: number
+  heartbeat_seconds?: number
+  relation_retention_seconds?: number
+  follow_up_max?: number
+  follow_up_max_retries?: number
+  follow_up_retry_delay_seconds?: number
+  follow_up_max_delay_seconds?: number
+  follow_up_allowed_sources?: string[]
+  expression_enabled?: boolean
+  expression_max_segments?: number
+  expression_long_threshold?: number
+  expression_delay_ms?: number
+  reply_mention?: boolean
+  agent_on_demand_enabled?: boolean
+  allowed_read_only_tools?: string[]
+  tool_budget?: number
+  subagent_enabled?: boolean
+  action_permissions?: Record<string, boolean>
+  message_style?: string
   configured_fields?: string[]
   created_at?: string
   updated_at?: string
@@ -564,6 +834,15 @@ export interface ScheduledTask {
   id: string
   name: string
   request: string
+  source_umo?: string
+  origin_turn_id?: string
+  kind?: string
+  goal?: string
+  recurrence?: string
+  config_snapshot?: string
+  delivery_policy?: string
+  retry_policy?: string
+  result_ref?: string
   mode: ScheduledTaskMode
   start_at?: string
   interval_seconds?: number
@@ -575,11 +854,18 @@ export interface ScheduledTask {
   conversation_id?: string
   adapter_id?: string
   chat_id?: string
-  status: 'active' | 'paused' | 'completed' | string
   next_run_at?: string
   last_run_at?: string
   last_invocation_id?: string
   last_error?: string
+  retry_count?: number
+  max_retries?: number
+  retry_delay_seconds?: number
+  max_delay_seconds?: number
+  quiet_hours_start?: string
+  quiet_hours_end?: string
+  timezone?: string
+	status: 'pending' | 'scheduled' | 'running' | 'waiting' | 'paused' | 'completed' | 'failed' | 'cancelled' | string
   running: boolean
   created_at?: string
   updated_at?: string
@@ -606,6 +892,15 @@ export interface DataLogEntry {
   level: string
   message: string
   attributes?: Record<string, string>
+}
+
+export interface RuntimeEvent {
+  id: string
+  invocation_id: string
+  sequence: number
+  type: string
+  timestamp: string
+  data?: Record<string, unknown>
 }
 
 export interface SystemSettings {
@@ -790,6 +1085,33 @@ export interface Artifact extends ArtifactRef {
   expires_at?: string
   created_at?: string
   updated_at?: string
+}
+
+export interface DocumentArtifactBlock {
+  locator: string
+  text: string
+}
+
+export interface DocumentArtifactImage {
+  locator: string
+  name?: string
+  mime_type: string
+  size: number
+  digest: string
+}
+
+export interface DocumentArtifactView {
+  artifact: ArtifactRef
+  name: string
+  mime_type: string
+  kind: string
+  parsed: boolean
+  page_count?: number
+  truncated: boolean
+  rendered?: string
+  blocks?: DocumentArtifactBlock[]
+  images?: DocumentArtifactImage[]
+  warnings?: string[]
 }
 
 export interface Operation {

@@ -59,9 +59,15 @@ const reasoningEffortOptions = [
   { label: '思考：中', value: 'medium' },
   { label: '思考：高', value: 'high' },
 ]
+const approvalScopeOptions = [
+  { label: '仅本次', value: 'once' },
+  { label: '当前会话', value: 'session' },
+  { label: '当前任务组', value: 'group' },
+  { label: '永久配置', value: 'persistent' },
+]
 type RuntimeTimelineItem = { type: string; text: string; timestamp: string; data?: Record<string, unknown> }
-type PendingApprovalChoice = { id: string; label: string; approved: boolean }
-type PendingApproval = { id: string; toolName: string; hint: string; args: Record<string, unknown>; choices: PendingApprovalChoice[] }
+type PendingApprovalChoice = { id: string; label: string; description?: string; risk?: string; default?: boolean; multi_select?: boolean; approved: boolean }
+type PendingApproval = { id: string; toolName: string; hint: string; args: Record<string, unknown>; choices: PendingApprovalChoice[]; selectedIDs: string[]; scope: string; supplement: string }
 type PendingUserInputOption = { id: string; label: string; description?: string; recommended?: boolean }
 type PendingUserInput = {
   id: string; invocationID: string; title: string; question: string; kind: string; options: PendingUserInputOption[]
@@ -527,23 +533,52 @@ function runtimeEventText(type: string, data: Record<string, unknown>) {
   return type
 }
 
+const pendingApprovalAllowsMultiple = computed(() => Boolean(pendingApproval.value?.choices.some((choice) => choice.multi_select)))
+
 async function resolvePendingApproval(choice: PendingApprovalChoice) {
-	const approval = pendingApproval.value
-	if (!approval || resolvingApproval.value) return
-	resolvingApproval.value = true
-	try {
-		await request(`/api/v1/approvals/${encodeURIComponent(approval.id)}/resolve`, {
-			method: 'POST', body: JSON.stringify({ choice_id: choice.id, reason: `WebUI 选择：${choice.label}` }),
-		})
-		appendRuntimeEvent('approval.resolved', choice.approved ? `已选择“${choice.label}”，Agent 正在恢复` : `已选择“${choice.label}”，Agent 正在处理拒绝结果`)
-		pendingApproval.value = null
-		statusText.value = choice.approved ? 'Agent 恢复运行中…' : '已拒绝，Agent 处理中…'
+  const approval = pendingApproval.value
+  if (!approval || resolvingApproval.value) return
+  if (pendingApprovalAllowsMultiple.value) {
+    togglePendingApprovalChoice(choice)
+    return
+  }
+  await resolvePendingApprovalChoices([choice.id], choice.label)
+}
+
+async function resolvePendingApprovalChoices(choiceIDs: string[], label = '') {
+  const approval = pendingApproval.value
+  if (!approval || resolvingApproval.value || !choiceIDs.length) return
+  resolvingApproval.value = true
+  try {
+    await request(`/api/v1/approvals/${encodeURIComponent(approval.id)}/resolve`, {
+      method: 'POST', body: JSON.stringify({ selected_choices: choiceIDs, scope: approval.scope || 'once', supplement: approval.supplement.trim(), reason: `WebUI 选择：${label || choiceIDs.join(',')}` }),
+    })
+    const choices = approval.choices.filter((choice) => choiceIDs.includes(choice.id))
+    const approved = choices.length > 0 && choices.every((choice) => choice.approved)
+    appendRuntimeEvent('approval.resolved', approved ? `已选择“${choices.map((choice) => choice.label).join('、')}”，Agent 正在恢复` : `已选择“${choices.map((choice) => choice.label).join('、')}”，Agent 正在处理拒绝结果`)
+    pendingApproval.value = null
+    statusText.value = approved ? 'Agent 恢复运行中…' : '已拒绝，Agent 处理中…'
     if (currentInvocationID.value) void loadRuntimeDetails(currentInvocationID.value)
   } catch (error) {
     message.error(error instanceof Error ? error.message : '审批处理失败')
   } finally {
     resolvingApproval.value = false
   }
+}
+
+function togglePendingApprovalChoice(choice: PendingApprovalChoice) {
+  const approval = pendingApproval.value
+  if (!approval || resolvingApproval.value) return
+  const index = approval.selectedIDs.indexOf(choice.id)
+  if (index >= 0) approval.selectedIDs.splice(index, 1)
+  else approval.selectedIDs.push(choice.id)
+}
+
+function submitPendingApproval() {
+  const approval = pendingApproval.value
+  if (!approval || !approval.selectedIDs.length) return
+  const label = approval.choices.filter((choice) => approval.selectedIDs.includes(choice.id)).map((choice) => choice.label).join('、')
+  void resolvePendingApprovalChoices(approval.selectedIDs, label)
 }
 
 // togglePendingUserInputOption 只修改当前问题卡片的本地选择，不把选项文案
@@ -664,14 +699,15 @@ async function send() {
         if (data.invocation_id) currentInvocationID.value = String(data.invocation_id)
         pendingUserInput.value = null
         const rawChoices = (Array.isArray(data.choices) ? data.choices : [])
-          .map((item: any) => ({ id: String(item?.id || ''), label: String(item?.label || ''), approved: Boolean(item?.approved) }))
-          .filter((item: PendingApprovalChoice) => (item.id === 'approve' || item.id === 'reject') && item.label)
+          .map((item: any) => ({ id: String(item?.id || ''), label: String(item?.label || ''), description: String(item?.description || ''), risk: String(item?.risk || ''), default: Boolean(item?.default), multi_select: Boolean(item?.multi_select), approved: Boolean(item?.approved) }))
+          .filter((item: PendingApprovalChoice) => item.id && item.label)
         const approvalDefaults = [{ id: 'approve', label: '允许一次', approved: true }, { id: 'reject', label: '拒绝', approved: false }]
-        // 审批永远是二元权限决策；普通多选题由 input 事件单独渲染。
-        const choices = approvalDefaults.map((fallback) => rawChoices.find((item: PendingApprovalChoice) => item.id === fallback.id) || fallback)
+        const choices = rawChoices.length ? rawChoices : approvalDefaults
+        const defaults = choices.filter((item: PendingApprovalChoice) => item.default).map((item: PendingApprovalChoice) => item.id)
         pendingApproval.value = {
           id: String(data.approval_id || ''), toolName: String(data.tool_name || '工作区操作'),
           hint: String(data.hint || '该操作需要确认'), args: (data.args || {}) as Record<string, unknown>, choices,
+          selectedIDs: defaults, scope: 'once', supplement: '',
         }
         appendRuntimeEvent('approval.requested', pendingApproval.value.hint)
         statusText.value = '等待用户批准…'
@@ -874,8 +910,9 @@ onMounted(async () => {
             <code v-if="Object.keys(pendingApproval.args).length">{{ JSON.stringify(pendingApproval.args) }}</code>
           </div>
           <NSpace class="approval-actions">
-            <NButton v-for="(choice, index) in pendingApproval.choices" :key="choice.id" size="small" :type="index === 0 && choice.approved ? 'primary' : 'default'" :secondary="index !== 0 || !choice.approved" :loading="resolvingApproval" @click="resolvePendingApproval(choice)">{{ choice.label }}</NButton>
+            <NButton v-for="(choice, index) in pendingApproval.choices" :key="choice.id" size="small" :type="pendingApproval.selectedIDs.includes(choice.id) ? 'primary' : (index === 0 && choice.approved ? 'primary' : 'default')" :secondary="!pendingApproval.selectedIDs.includes(choice.id) && (index !== 0 || !choice.approved)" :loading="resolvingApproval" @click="resolvePendingApproval(choice)">{{ pendingApprovalAllowsMultiple && pendingApproval.selectedIDs.includes(choice.id) ? '✓ ' : '' }}{{ choice.label }}</NButton>
           </NSpace>
+          <div v-if="pendingApprovalAllowsMultiple" class="approval-multi-options"><small>此审批支持多选，请选择后提交。</small><NSelect v-model:value="pendingApproval.scope" :options="approvalScopeOptions" size="small" style="width: 130px" /><NInput v-model:value="pendingApproval.supplement" size="small" placeholder="可选补充说明" /><NButton size="small" type="primary" :disabled="!pendingApproval.selectedIDs.length" :loading="resolvingApproval" @click="submitPendingApproval">提交选择</NButton></div>
         </div>
         <div v-if="pendingUserInput" class="chat-user-input-card">
           <div class="user-input-heading">

@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { NAlert, NButton, NCard, NEmpty, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, NSpace, NSwitch, NTag, useMessage } from 'naive-ui'
-import { artifactContentURL, cancelCommandRun, commandOutputDownloadURL, readCommandRuns, readLocalDirectories, readOperations, readRemoteDirectories, readWorkspaceFiles, request } from '@/api'
+import { artifactContentURL, cancelCommandRun, commandOutputDownloadURL, readArtifactDocument, readCommandRuns, readLocalDirectories, readOperations, readRemoteDirectories, readWorkspaceFiles, request } from '@/api'
 import AppIcon from '@/components/AppIcon.vue'
 import { useAppStore } from '@/stores/app'
 import { useRoute, useRouter } from 'vue-router'
-import type { ArtifactExtraction, ArtifactRef, CommandRun, Conversation, DirectoryListing, Operation, TestResult, Workspace } from '@/types'
+import type { ArtifactExtraction, ArtifactRef, CommandRun, Conversation, DirectoryListing, DocumentArtifactView, Operation, TestResult, Workspace } from '@/types'
 
 const store = useAppStore()
 const message = useMessage()
@@ -49,6 +49,10 @@ const showArtifactSummary = ref(false)
 const artifactSummaryTitle = ref('')
 const artifactSummaryRef = ref<ArtifactRef | null>(null)
 const artifactSummary = ref<ArtifactExtraction | null>(null)
+const showArtifactDocument = ref(false)
+const artifactDocument = ref<DocumentArtifactView | null>(null)
+const artifactDocumentTitle = ref('')
+const artifactDocumentLoading = ref(false)
 
 const form = reactive({
   id: '', name: '', type: 'local', root_path: '', remote_target_id: '', host: '', port: 22, user: '', auth_type: 'agent', key_path: '', password: '', host_key_fingerprint: '', enabled: true,
@@ -292,10 +296,30 @@ async function openArtifactSummary(ref: ArtifactRef, title: string) {
     const extraction = await request<ArtifactExtraction>(`/api/v1/artifacts/${encodeURIComponent(ref.id)}/extract`, { method: 'POST', body: '{}' })
     artifactSummaryRef.value = ref
     artifactSummary.value = extraction
+    artifactDocument.value = null
     artifactSummaryTitle.value = `${title} · ${ref.name || ref.id}`
     showArtifactSummary.value = true
   } catch (error) {
     message.error(error instanceof Error ? error.message : '读取摘要失败')
+  }
+}
+
+function isDocumentArtifact(ref?: ArtifactRef | null) {
+  if (!ref) return false
+  const name = (ref.name || '').toLowerCase()
+  return /\.(pdf|doc|docx|docm|xls|xlsx|xlsm|ppt|pptx|csv|tsv)$/i.test(name) || /pdf|word|excel|sheet|powerpoint|csv|tab-separated/i.test(ref.mime_type || '')
+}
+
+async function openArtifactDocument(ref: ArtifactRef, title: string) {
+  artifactDocumentLoading.value = true
+  try {
+    artifactDocument.value = await readArtifactDocument(ref.id, workspaceUserID)
+    artifactDocumentTitle.value = `${title} · ${ref.name || ref.id}`
+    showArtifactDocument.value = true
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '读取结构化文档失败')
+  } finally {
+    artifactDocumentLoading.value = false
   }
 }
 
@@ -501,6 +525,35 @@ onMounted(() => {
         <pre v-if="artifactSummary.preview" class="diff-viewer">{{ artifactSummary.preview }}</pre>
         <p v-if="artifactSummary.truncated" class="muted">预览已截断，下载原件可查看完整内容。</p>
         <p v-if="!artifactSummary.preview && artifactSummary.kind === 'metadata'" class="muted">该格式只提供元数据，不提取正文内容。</p>
+        <NSpace v-if="isDocumentArtifact(artifactSummaryRef)" justify="end">
+          <NButton secondary :loading="artifactDocumentLoading" @click="artifactSummaryRef && openArtifactDocument(artifactSummaryRef, '文档解析')">查看页/表格结构</NButton>
+        </NSpace>
+      </div>
+    </NModal>
+
+    <NModal v-model:show="showArtifactDocument" preset="card" style="width: min(980px, calc(100vw - 32px))" :title="artifactDocumentTitle || '文档解析'">
+      <div v-if="artifactDocument" class="artifact-document-viewer">
+        <NSpace align="center" :wrap="true">
+          <NTag size="small">{{ artifactDocument.kind }}</NTag>
+          <NTag v-if="artifactDocument.page_count" size="small" type="info">{{ artifactDocument.page_count }} 页</NTag>
+          <span class="muted">{{ artifactDocument.mime_type }} · {{ artifactDocument.artifact.size }} bytes</span>
+        </NSpace>
+        <NAlert v-for="warning in artifactDocument.warnings" :key="warning" type="warning" :show-icon="false" class="form-tip">{{ warning }}</NAlert>
+        <p v-if="artifactDocument.truncated" class="muted">解析结果已按边界截断，原始 Artifact 未修改。</p>
+        <pre v-if="artifactDocument.rendered" class="diff-viewer">{{ artifactDocument.rendered }}</pre>
+        <div v-if="artifactDocument.blocks?.length" class="document-block-list">
+          <strong>来源块（{{ artifactDocument.blocks.length }}）</strong>
+          <div v-for="block in artifactDocument.blocks" :key="`${block.locator}:${block.text.slice(0, 32)}`" class="document-block">
+            <code>{{ block.locator }}</code><span>{{ block.text }}</span>
+          </div>
+        </div>
+        <div v-if="artifactDocument.images?.length" class="document-block-list">
+          <strong>内嵌图片（{{ artifactDocument.images.length }}）</strong>
+          <div v-for="image in artifactDocument.images" :key="image.digest" class="document-block">
+            <code>{{ image.locator }}</code><span>{{ image.name || '图片' }} · {{ image.mime_type }} · {{ image.size }} bytes · {{ image.digest }}</span>
+          </div>
+        </div>
+        <NEmpty v-if="!artifactDocument.rendered && !artifactDocument.blocks?.length && !artifactDocument.images?.length" description="没有可展示的结构化内容" />
       </div>
     </NModal>
   </div>

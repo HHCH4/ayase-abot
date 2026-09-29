@@ -58,6 +58,12 @@ const (
 	AuditDashboardUpdate  = "dashboard_update"
 	AuditCommandPolicy    = "command_policy"
 	AuditCommandDenied    = "command_denied"
+	AuditSessionList      = "session_list"
+	AuditSessionArchive   = "session_archive"
+	AuditSessionRestore   = "session_restore"
+	AuditSessionDelete    = "session_delete"
+	AuditApprovalList     = "approval_list"
+	AuditApprovalDecision = "approval_decision"
 )
 
 // The following repositories are optional extensions. A Bot repository that

@@ -42,7 +42,7 @@ func TestTelegramTestAndSend(t *testing.T) {
 	if err := platform.Test(context.Background()); err != nil {
 		t.Fatalf("Telegram getMe 测试失败: %v", err)
 	}
-	if err := platform.Send(context.Background(), Message{ChatID: "42"}, strings.Repeat("中", telegramMessageLimit+1)); err != nil {
+	if _, err := platform.DispatchAction(context.Background(), PlatformAction{Type: "send_text", Message: Message{ChatID: "42"}, Text: strings.Repeat("中", telegramMessageLimit+1)}); err != nil {
 		t.Fatalf("Telegram 发送失败: %v", err)
 	}
 	if len(sent) != 2 || len([]rune(sent[0])) != telegramMessageLimit || len([]rune(sent[1])) != 1 {
@@ -143,7 +143,7 @@ func TestTelegramSendApprovalUsesInlineKeyboard(t *testing.T) {
 	}))
 	defer server.Close()
 	platform := &telegramPlatform{bot: Bot{TelegramToken: "token"}, client: server.Client(), base: server.URL}
-	if err := platform.SendApproval(context.Background(), Message{ChatID: "42"}, ApprovalPrompt{ApprovalID: "approval-1", ToolName: "write_file", Hint: "即将修改文件"}); err != nil {
+	if _, err := platform.DispatchAction(context.Background(), PlatformAction{Type: "send_text", Message: Message{ChatID: "42"}, Approval: &ApprovalPrompt{ApprovalID: "approval-1", ToolName: "write_file", Hint: "即将修改文件"}}); err != nil {
 		t.Fatalf("发送 Telegram 审批消息失败: %v", err)
 	}
 	markup, ok := payload["reply_markup"].(map[string]any)

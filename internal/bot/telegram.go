@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,9 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -46,9 +49,13 @@ type telegramEnvelope[T any] struct {
 }
 
 type telegramUpdate struct {
-	UpdateID      int64                  `json:"update_id"`
-	Message       *telegramMessage       `json:"message"`
-	CallbackQuery *telegramCallbackQuery `json:"callback_query"`
+	UpdateID            int64                      `json:"update_id"`
+	Message             *telegramMessage           `json:"message"`
+	EditedMessage       *telegramMessage           `json:"edited_message"`
+	CallbackQuery       *telegramCallbackQuery     `json:"callback_query"`
+	MessageReaction     *telegramMessageReaction   `json:"message_reaction"`
+	ChatMemberUpdated   *telegramChatMemberUpdated `json:"chat_member"`
+	MyChatMemberUpdated *telegramChatMemberUpdated `json:"my_chat_member"`
 }
 
 type telegramMessage struct {
@@ -63,6 +70,7 @@ type telegramMessage struct {
 	Document        *telegramDocument `json:"document"`
 	Voice           *telegramVoice    `json:"voice"`
 	Audio           *telegramAudio    `json:"audio"`
+	ReplyToMessage  *telegramMessage  `json:"reply_to_message"`
 }
 
 type telegramUser struct {
@@ -84,6 +92,28 @@ type telegramCallbackQuery struct {
 	From    *telegramUser    `json:"from"`
 	Data    string           `json:"data"`
 	Message *telegramMessage `json:"message"`
+}
+
+// telegramMessageReaction 和 telegramChatMemberUpdated 只保留统一事件需要的
+// 元数据，不把平台完整 payload 带进业务层。
+type telegramMessageReaction struct {
+	Chat        telegramChat  `json:"chat"`
+	MessageID   int64         `json:"message_id"`
+	User        *telegramUser `json:"user"`
+	OldReaction []any         `json:"old_reaction"`
+	NewReaction []any         `json:"new_reaction"`
+}
+
+type telegramChatMemberUpdated struct {
+	Chat          telegramChat       `json:"chat"`
+	From          *telegramUser      `json:"from"`
+	OldChatMember telegramChatMember `json:"old_chat_member"`
+	NewChatMember telegramChatMember `json:"new_chat_member"`
+}
+
+type telegramChatMember struct {
+	User   *telegramUser `json:"user"`
+	Status string        `json:"status"`
 }
 
 type telegramChat struct {
@@ -132,8 +162,8 @@ func newTelegramPlatform(item Bot) (*telegramPlatform, error) {
 	return &telegramPlatform{bot: item, client: &http.Client{Timeout: 35 * time.Second}, base: telegramAPIBase}, nil
 }
 
-// Run 持续拉取更新，并保证 offset 只向前推进，避免同一条消息在一次运行中重复处理。
-func (p *telegramPlatform) Run(ctx context.Context, handler Handler) error {
+// runEvents 是 Telegram 长轮询的统一事件循环。
+func (p *telegramPlatform) runEvents(ctx context.Context, handler EventHandler) error {
 	if p.username == "" {
 		// Gateways and test doubles may omit getMe; without a known username only
 		// Telegram's explicit bare bot-command entity is accepted as a trigger.
@@ -143,6 +173,15 @@ func (p *telegramPlatform) Run(ctx context.Context, handler Handler) error {
 			p.selfID = result.Result.ID
 		}
 	}
+	connected := false
+	defer func() {
+		if !connected {
+			return
+		}
+		if err := handler(context.WithoutCancel(ctx), p.lifecycleEvent(PlatformEventPlatformDisconnected)); err != nil {
+			slog.Warn("Telegram 断开事件处理失败", "adapter_id", p.bot.ID, "event_type", PlatformEventPlatformDisconnected, "error", err)
+		}
+	}()
 	var offset int64
 	for {
 		updates, err := p.getUpdates(ctx, offset)
@@ -152,14 +191,20 @@ func (p *telegramPlatform) Run(ctx context.Context, handler Handler) error {
 			}
 			return err
 		}
+		if !connected {
+			connected = true
+			if handlerErr := handler(ctx, p.lifecycleEvent(PlatformEventPlatformConnected)); handlerErr != nil {
+				slog.Warn("Telegram 连接事件处理失败", "adapter_id", p.bot.ID, "event_type", PlatformEventPlatformConnected, "error", handlerErr)
+			}
+		}
 		for _, update := range updates {
 			if update.UpdateID >= offset {
 				offset = update.UpdateID + 1
 			}
-			if update.Message == nil && update.CallbackQuery == nil {
+			if update.Message == nil && update.EditedMessage == nil && update.CallbackQuery == nil && update.MessageReaction == nil && update.ChatMemberUpdated == nil && update.MyChatMemberUpdated == nil {
 				continue
 			}
-			message, err := p.messageFromUpdate(ctx, update)
+			event, err := p.eventFromUpdate(ctx, update)
 			if err != nil {
 				// 附件下载失败不应让 Telegram 长轮询整体退出；文字仍然可以交给 Agent。
 				if update.CallbackQuery != nil {
@@ -167,7 +212,7 @@ func (p *telegramPlatform) Run(ctx context.Context, handler Handler) error {
 				}
 				continue
 			}
-			handlerErr := handler(ctx, message)
+			handlerErr := handler(ctx, event)
 			if update.CallbackQuery != nil {
 				// Always dismiss Telegram's callback spinner, even when the command
 				// itself is rejected by the Manager.
@@ -179,6 +224,81 @@ func (p *telegramPlatform) Run(ctx context.Context, handler Handler) error {
 			}
 		}
 	}
+}
+
+// lifecycleEvent 只反映 getUpdates 已经成功返回后的真实在线状态，不把 getMe
+// 或轮询循环启动误当成平台连接成功。
+func (p *telegramPlatform) lifecycleEvent(eventType PlatformEventType) PlatformEvent {
+	now := time.Now().UTC()
+	return PlatformEvent{ID: newRuntimeID(string(eventType), p.bot.ID, fmt.Sprint(now.UnixNano())), BotID: p.bot.ID, Platform: TypeTelegram, EventType: eventType, NativeCapabilities: p.Capabilities(), OccurredAt: now, ReceivedAt: now}
+}
+
+// RunEvents 将 Telegram 更新转换为统一 PlatformEvent；连接生命周期由 Manager
+// 负责记录，消息和审批回调则共用同一个事件审计入口。
+func (p *telegramPlatform) RunEvents(ctx context.Context, handler EventHandler) error {
+	return p.runEvents(ctx, handler)
+}
+
+// eventFromUpdate 将 Telegram 的消息、审批回调、反应和成员变更映射为
+// PlatformEvent；编辑消息按新的消息事件重新进入去重/聚合链。
+func (p *telegramPlatform) eventFromUpdate(ctx context.Context, update telegramUpdate) (PlatformEvent, error) {
+	if update.CallbackQuery != nil {
+		message, err := p.messageFromUpdate(ctx, update)
+		if err != nil {
+			return PlatformEvent{}, err
+		}
+		return platformEventFromMessage(message, PlatformEventApprovalCallback, p.Capabilities()), nil
+	}
+	if update.Message != nil || update.EditedMessage != nil {
+		if update.Message == nil {
+			update.Message = update.EditedMessage
+		}
+		message, err := p.messageFromUpdate(ctx, update)
+		if err != nil {
+			return PlatformEvent{}, err
+		}
+		return platformEventFromMessage(message, PlatformEventMessageCreated, p.Capabilities()), nil
+	}
+	if reaction := update.MessageReaction; reaction != nil {
+		chatType := reaction.Chat.Type
+		userID := ""
+		if reaction.User != nil {
+			userID = strconv.FormatInt(reaction.User.ID, 10)
+		}
+		message := Message{AdapterID: p.bot.ID, Platform: TypeTelegram, UserID: userID, ChatID: strconv.FormatInt(reaction.Chat.ID, 10), ChatType: chatType}
+		eventType := PlatformEventReactionRemoved
+		if len(reaction.NewReaction) > 0 {
+			eventType = PlatformEventReactionAdded
+		}
+		now := time.Now().UTC()
+		return PlatformEvent{ID: fmt.Sprintf("telegram-update:%d", update.UpdateID), BotID: p.bot.ID, Platform: TypeTelegram, SourceUMO: messageSource(message), ChatType: chatType, ChatID: message.ChatID, UserID: userID, EventType: eventType, MessageID: strconv.FormatInt(reaction.MessageID, 10), NativeCapabilities: p.Capabilities(), OccurredAt: now, ReceivedAt: now}, nil
+	}
+	member := update.ChatMemberUpdated
+	if member == nil {
+		member = update.MyChatMemberUpdated
+	}
+	if member != nil {
+		userID := ""
+		if member.NewChatMember.User != nil {
+			userID = strconv.FormatInt(member.NewChatMember.User.ID, 10)
+		} else if member.From != nil {
+			userID = strconv.FormatInt(member.From.ID, 10)
+		}
+		message := Message{AdapterID: p.bot.ID, Platform: TypeTelegram, UserID: userID, ChatID: strconv.FormatInt(member.Chat.ID, 10), ChatType: member.Chat.Type}
+		eventType := PlatformEventMemberLeft
+		if member.NewChatMember.Status == "member" || member.NewChatMember.Status == "administrator" || member.NewChatMember.Status == "creator" {
+			eventType = PlatformEventMemberJoined
+		}
+		now := time.Now().UTC()
+		return PlatformEvent{ID: fmt.Sprintf("telegram-update:%d", update.UpdateID), BotID: p.bot.ID, Platform: TypeTelegram, SourceUMO: messageSource(message), ChatType: message.ChatType, ChatID: message.ChatID, UserID: userID, EventType: eventType, NativeCapabilities: p.Capabilities(), OccurredAt: now, ReceivedAt: now}, nil
+	}
+	return PlatformEvent{}, errors.New("Telegram 更新类型不支持")
+}
+
+// Capabilities 声明 Telegram 适配器可以执行的抽象动作；富文本由表达层先
+// 转为安全 HTML，适配器不接收模型原始 Markdown。
+func (p *telegramPlatform) Capabilities() PlatformCapabilities {
+	return PlatformCapabilities{PlainText: true, RichText: true, Reply: true, Mention: true, Reaction: true, Image: true, Audio: true, File: true, Recall: true, MaxTextLength: telegramMessageLimit}
 }
 
 // Test 调用 getMe，能同时验证 Token 和 Telegram API 可达性。
@@ -193,18 +313,98 @@ func (p *telegramPlatform) Test(ctx context.Context) error {
 	return nil
 }
 
-// Send 将 Agent 回复按 Telegram 单条消息限制拆分后发回原聊天。
-func (p *telegramPlatform) Send(ctx context.Context, message Message, text string) error {
+// DispatchAction 将 Bot Runtime 的抽象动作投影为 Telegram Bot API；只有完成
+// API 调用并拿到消息结果后才向上层返回成功。
+func (p *telegramPlatform) DispatchAction(ctx context.Context, action PlatformAction) (PlatformActionResult, error) {
+	switch strings.TrimSpace(action.Type) {
+	case "send_text":
+		if action.Approval != nil {
+			return p.dispatchApproval(ctx, action.Message, *action.Approval)
+		}
+		if action.UserInput != nil {
+			return p.dispatchSendText(ctx, action.Message, userInputOptionsText(*action.UserInput))
+		}
+		return p.dispatchSendText(ctx, action.Message, action.Text)
+	case "send_image", "send_audio", "send_file":
+		return p.dispatchSendAttachment(ctx, action)
+	case "recall_message":
+		messageID, err := strconv.ParseInt(strings.TrimSpace(action.TargetID), 10, 64)
+		if err != nil || messageID <= 0 {
+			return PlatformActionResult{}, errors.New("Telegram 撤回消息 ID 无效")
+		}
+		var result telegramEnvelope[bool]
+		if err := p.call(ctx, "deleteMessage", map[string]any{"chat_id": action.Message.ChatID, "message_id": messageID}, &result); err != nil {
+			return PlatformActionResult{}, err
+		}
+		if !result.OK {
+			return PlatformActionResult{}, fmt.Errorf("Telegram 撤回消息失败: %s", result.Description)
+		}
+		return PlatformActionResult{MessageID: action.TargetID}, nil
+	case "add_reaction":
+		messageID, err := strconv.ParseInt(strings.TrimSpace(action.TargetID), 10, 64)
+		if err != nil || messageID <= 0 || strings.TrimSpace(action.Emoji) == "" {
+			return PlatformActionResult{}, errors.New("Telegram 表情动作参数无效")
+		}
+		var result telegramEnvelope[bool]
+		if err := p.call(ctx, "setMessageReaction", map[string]any{"chat_id": action.Message.ChatID, "message_id": messageID, "reaction": []map[string]string{{"type": "emoji", "emoji": action.Emoji}}}, &result); err != nil {
+			return PlatformActionResult{}, err
+		}
+		if !result.OK {
+			return PlatformActionResult{}, fmt.Errorf("Telegram 添加表情失败: %s", result.Description)
+		}
+		return PlatformActionResult{MessageID: action.TargetID}, nil
+	default:
+		return PlatformActionResult{}, fmt.Errorf("Telegram 不支持抽象动作 %q", action.Type)
+	}
+}
+
+// dispatchSendAttachment 使用 Telegram multipart API 发送媒体；附件必须由
+// 上游在动作执行前取得，适配器不会把一个不可读的 Artifact ref 伪装成成功。
+func (p *telegramPlatform) dispatchSendAttachment(ctx context.Context, action PlatformAction) (PlatformActionResult, error) {
+	if action.Attachment == nil || len(action.Attachment.Data) == 0 {
+		return PlatformActionResult{}, errors.New("Telegram 媒体动作缺少附件数据")
+	}
+	fieldName := "photo"
+	method := "sendPhoto"
+	switch strings.TrimSpace(action.Type) {
+	case "send_audio":
+		fieldName = "audio"
+		method = "sendAudio"
+	case "send_file":
+		fieldName = "document"
+		method = "sendDocument"
+	}
+	fields := map[string]string{"chat_id": strings.TrimSpace(action.Message.ChatID)}
+	if fields["chat_id"] == "" {
+		return PlatformActionResult{}, errors.New("Telegram 媒体目标聊天 ID 为空")
+	}
+	if strings.TrimSpace(action.Text) != "" {
+		fields["caption"] = action.Text
+	}
+	if action.Message.ReplyQuote {
+		if replyID, err := strconv.ParseInt(action.Message.ReplyMessageID, 10, 64); err == nil && replyID > 0 {
+			replyBytes, _ := json.Marshal(map[string]any{"message_id": replyID, "allow_sending_without_reply": true})
+			fields["reply_parameters"] = string(replyBytes)
+		}
+	}
+	return p.callMultipart(ctx, method, fields, fieldName, cleanFileName(action.Attachment.Name), normalizeFileMIME(action.Attachment.Name, action.Attachment.MIMEType), action.Attachment.Data)
+}
+
+func (p *telegramPlatform) dispatchSendText(ctx context.Context, message Message, text string) (PlatformActionResult, error) {
 	chatID := strings.TrimSpace(message.ChatID)
 	if chatID == "" {
-		return errors.New("Telegram 目标聊天 ID 为空")
+		return PlatformActionResult{}, errors.New("Telegram 目标聊天 ID 为空")
 	}
 	limit := telegramMessageLimit
 	if message.ReplyMention && isGroupChat(message.ChatType) {
 		limit -= 16
 	}
-	for index, chunk := range splitText(text, limit) {
+	chunks := splitText(text, limit)
+	for index, chunk := range chunks {
 		payload := map[string]any{"chat_id": chatID, "text": chunk}
+		if message.TextFormat == "html" {
+			payload["parse_mode"] = "HTML"
+		}
 		// Telegram 使用官方 reply_parameters；@用户以 HTML 链接标记，普通正文转义后避免注入标记。
 		if index == 0 && message.ReplyQuote {
 			if replyID, parseErr := strconv.ParseInt(message.ReplyMessageID, 10, 64); parseErr == nil && replyID > 0 {
@@ -213,44 +413,38 @@ func (p *telegramPlatform) Send(ctx context.Context, message Message, text strin
 		}
 		if index == 0 && message.ReplyMention && isGroupChat(message.ChatType) {
 			if userID, parseErr := strconv.ParseInt(message.UserID, 10, 64); parseErr == nil && userID > 0 {
-				payload["text"] = fmt.Sprintf(`<a href="tg://user?id=%d">@用户</a> %s`, userID, html.EscapeString(chunk))
+				body := html.EscapeString(chunk)
+				if message.TextFormat == "html" {
+					body = chunk
+				}
+				payload["text"] = fmt.Sprintf(`<a href="tg://user?id=%d">@用户</a> %s`, userID, body)
 				payload["parse_mode"] = "HTML"
 			}
 		}
 		var result telegramEnvelope[telegramMessage]
 		if err := p.call(ctx, "sendMessage", payload, &result); err != nil {
-			return err
+			return PlatformActionResult{}, err
 		}
 		if !result.OK {
-			return fmt.Errorf("Telegram 发送消息失败: %s", result.Description)
+			return PlatformActionResult{}, fmt.Errorf("Telegram 发送消息失败: %s", result.Description)
+		}
+		lastID := ""
+		if result.Result.MessageID > 0 {
+			lastID = strconv.FormatInt(result.Result.MessageID, 10)
+		}
+		if index == len(chunks)-1 {
+			return PlatformActionResult{MessageID: lastID}, nil
 		}
 	}
-	return nil
+	return PlatformActionResult{}, nil
 }
 
-// PreAcknowledge 通过 Telegram Bot API 为原消息添加一个普通表情，不影响任务接收结果。
-func (p *telegramPlatform) PreAcknowledge(ctx context.Context, message Message, emoji string) error {
-	messageID, err := strconv.ParseInt(message.ReplyMessageID, 10, 64)
-	if err != nil || messageID <= 0 {
-		return errors.New("Telegram 原消息 ID 无效")
-	}
-	var result telegramEnvelope[bool]
-	if err := p.call(ctx, "setMessageReaction", map[string]any{
-		"chat_id": message.ChatID, "message_id": messageID,
-		"reaction": []map[string]string{{"type": "emoji", "emoji": emoji}},
-	}, &result); err != nil {
-		return err
-	}
-	if !result.OK {
-		return fmt.Errorf("Telegram 预回应失败: %s", result.Description)
-	}
-	return nil
-}
-
-func (p *telegramPlatform) SendApproval(ctx context.Context, message Message, prompt ApprovalPrompt) error {
+// dispatchApproval 将审批提示作为结构化平台动作渲染；动作计划已经在
+// Bot Runtime 中落库，这里只负责调用 Telegram 的原生按钮接口。
+func (p *telegramPlatform) dispatchApproval(ctx context.Context, message Message, prompt ApprovalPrompt) (PlatformActionResult, error) {
 	chatID := strings.TrimSpace(message.ChatID)
 	if chatID == "" {
-		return errors.New("Telegram 目标聊天 ID 为空")
+		return PlatformActionResult{}, errors.New("Telegram 目标聊天 ID 为空")
 	}
 	toolName := strings.TrimSpace(prompt.ToolName)
 	if toolName == "" {
@@ -281,25 +475,19 @@ func (p *telegramPlatform) SendApproval(ctx context.Context, message Message, pr
 	}
 	var result telegramEnvelope[telegramMessage]
 	if err := p.call(ctx, "sendMessage", payload, &result); err != nil {
-		return err
+		return PlatformActionResult{}, err
 	}
 	if !result.OK {
-		return fmt.Errorf("Telegram 发送审批消息失败: %s", result.Description)
+		return PlatformActionResult{}, fmt.Errorf("Telegram 发送审批消息失败: %s", result.Description)
 	}
-	return nil
-}
-
-// SendUserInput 展示普通问题的结构化选项。Telegram 审批使用一次性回调按钮，
-// 普通问题则保留序号文本协议，因而可以自然表达“1,3”这类多选答案。
-func (p *telegramPlatform) SendUserInput(ctx context.Context, message Message, input agentruntime.UserInputRequest) error {
-	return p.Send(ctx, message, userInputOptionsText(input))
+	return PlatformActionResult{MessageID: strconv.FormatInt(result.Result.MessageID, 10)}, nil
 }
 
 // Close 通过取消 Run 的 context 结束请求；这里无需持有额外长连接。
 func (p *telegramPlatform) Close() error { return nil }
 
 func (p *telegramPlatform) getUpdates(ctx context.Context, offset int64) ([]telegramUpdate, error) {
-	payload := map[string]any{"timeout": telegramPollTimeout, "allowed_updates": []string{"message", "callback_query"}}
+	payload := map[string]any{"timeout": telegramPollTimeout, "allowed_updates": []string{"message", "edited_message", "callback_query", "message_reaction", "chat_member", "my_chat_member"}}
 	if offset > 0 {
 		payload["offset"] = offset
 	}
@@ -327,6 +515,7 @@ func (p *telegramPlatform) messageFromUpdate(ctx context.Context, update telegra
 	}
 	message := Message{
 		ID:             strconv.FormatInt(update.UpdateID, 10),
+		AdapterID:      p.bot.ID,
 		Platform:       TypeTelegram,
 		UserID:         userID,
 		ChatID:         strconv.FormatInt(item.Chat.ID, 10),
@@ -335,6 +524,9 @@ func (p *telegramPlatform) messageFromUpdate(ctx context.Context, update telegra
 		Text:           strings.TrimSpace(item.Text),
 		Mentioned:      p.telegramMessageMentioned(item),
 		ReplyMessageID: strconv.FormatInt(item.MessageID, 10),
+	}
+	if item.ReplyToMessage != nil && item.ReplyToMessage.MessageID > 0 {
+		message.ReplyToMessageID = strconv.FormatInt(item.ReplyToMessage.MessageID, 10)
 	}
 	if item.From != nil {
 		message.IsSelf = p.selfID != 0 && item.From.ID == p.selfID
@@ -412,7 +604,7 @@ func (p *telegramPlatform) messageFromCallback(callback *telegramCallbackQuery) 
 		userID = strconv.FormatInt(callback.From.ID, 10)
 	}
 	return Message{
-		ID: "callback:" + callback.ID, Platform: TypeTelegram, UserID: userID,
+		ID: "callback:" + callback.ID, AdapterID: p.bot.ID, Platform: TypeTelegram, UserID: userID,
 		ChatID: strconv.FormatInt(callback.Message.Chat.ID, 10), ChatType: callback.Message.Chat.Type,
 		AutoName:  telegramCallbackAutoName(callback, userID),
 		Mentioned: true, Control: &MessageControl{Kind: "approval", ApprovalID: parts[2], ChoiceID: choiceID, Decision: decision, CallbackID: callback.ID},
@@ -610,10 +802,83 @@ func (p *telegramPlatform) call(ctx context.Context, method string, payload map[
 	return nil
 }
 
+func (p *telegramPlatform) callMultipart(ctx context.Context, method string, fields map[string]string, fileField, fileName, mimeType string, data []byte) (PlatformActionResult, error) {
+	endpoint := strings.TrimRight(p.base, "/") + "/bot" + url.PathEscape(p.bot.TelegramToken) + "/" + method
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range fields {
+		if err := writer.WriteField(key, value); err != nil {
+			return PlatformActionResult{}, fmt.Errorf("Telegram multipart 字段写入失败: %w", err)
+		}
+	}
+	if fileName == "" {
+		fileName = "attachment"
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fileField, fileName))
+	header.Set("Content-Type", mimeType)
+	part, err := writer.CreatePart(header)
+	if err != nil {
+		return PlatformActionResult{}, fmt.Errorf("Telegram multipart 文件字段创建失败: %w", err)
+	}
+	if _, err := part.Write(data); err != nil {
+		return PlatformActionResult{}, fmt.Errorf("Telegram multipart 文件写入失败: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return PlatformActionResult{}, fmt.Errorf("Telegram multipart 请求收尾失败: %w", err)
+	}
+	slog.Info("Telegram 请求", "adapter_id", p.bot.ID, "method", method, "endpoint", endpoint, "fields", fields, "file_name", fileName, "mime_type", mimeType, "file_bytes", len(data))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &body)
+	if err != nil {
+		return PlatformActionResult{}, fmt.Errorf("Telegram multipart 请求创建失败: %w", err)
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response, err := p.client.Do(request)
+	if err != nil {
+		slog.Error("Telegram 请求失败", "adapter_id", p.bot.ID, "method", method, "endpoint", endpoint, "fields", fields, "file_name", fileName, "error", err)
+		return PlatformActionResult{}, fmt.Errorf("Telegram API 请求失败: %w", err)
+	}
+	defer response.Body.Close()
+	const responseLimit = 8 << 20
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, responseLimit+1))
+	truncated := len(responseBody) > responseLimit
+	if truncated {
+		responseBody = responseBody[:responseLimit]
+	}
+	slog.Info("Telegram 响应", "adapter_id", p.bot.ID, "method", method, "endpoint", endpoint, "status", response.StatusCode, "body", string(responseBody), "body_truncated", truncated)
+	if readErr != nil {
+		return PlatformActionResult{}, fmt.Errorf("读取 Telegram API 响应失败: %w", readErr)
+	}
+	if truncated {
+		return PlatformActionResult{}, fmt.Errorf("Telegram API 响应超过 %d MB", responseLimit>>20)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return PlatformActionResult{}, fmt.Errorf("Telegram API 返回 HTTP %d", response.StatusCode)
+	}
+	var result telegramEnvelope[telegramMessage]
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		return PlatformActionResult{}, fmt.Errorf("Telegram API 响应无效: %w", err)
+	}
+	if !result.OK {
+		return PlatformActionResult{}, fmt.Errorf("Telegram 媒体发送失败: %s", result.Description)
+	}
+	messageID := ""
+	if result.Result.MessageID > 0 {
+		messageID = strconv.FormatInt(result.Result.MessageID, 10)
+	}
+	return PlatformActionResult{MessageID: messageID, Raw: string(responseBody)}, nil
+}
+
 func splitText(text string, limit int) []string {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return nil
+	}
+	if limit <= 0 {
+		limit = telegramMessageLimit
 	}
 	runes := []rune(text)
 	result := make([]string, 0, (len(runes)+limit-1)/limit)
@@ -621,8 +886,20 @@ func splitText(text string, limit int) []string {
 		size := limit
 		if len(runes) < size {
 			size = len(runes)
+		} else {
+			// 适配器只做最终长度兜底，优先在段落、句末或空白边界切开，
+			// 避免把表达层已经组织好的完整语义从句中间截断。
+			for index := size; index > 0 && index >= size-240; index-- {
+				if strings.ContainsRune("\n。！？!?；;，,、 \t", runes[index-1]) {
+					size = index
+					break
+				}
+			}
 		}
-		result = append(result, string(runes[:size]))
+		part := strings.TrimSpace(string(runes[:size]))
+		if part != "" {
+			result = append(result, part)
+		}
 		runes = runes[size:]
 	}
 	return result

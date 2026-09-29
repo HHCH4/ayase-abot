@@ -87,21 +87,31 @@ type ToolExecutionRecord struct {
 type ToolExecutionObserver func(context.Context, ToolExecutionRecord)
 
 type ToolExecutorOptions struct {
-	Policy   ToolExecutionPolicy
-	Observer ToolExecutionObserver
+	Policy         ToolExecutionPolicy
+	Observer       ToolExecutionObserver
+	MaxConcurrency int
 }
+
+const defaultToolGlobalConcurrency = 16
 
 // ToolExecutor applies the descriptor limits that can be enforced without
 // knowing the concrete tool implementation. A timeout uses a derived context
 // and is therefore cooperative: an implementation that ignores cancellation
 // remains responsible for its own process-group termination.
 type ToolExecutor struct {
-	policy   ToolExecutionPolicy
-	observer ToolExecutionObserver
+	policy        ToolExecutionPolicy
+	observer      ToolExecutionObserver
+	globalPermits chan struct{}
 }
 
 func NewToolExecutor(options ToolExecutorOptions) *ToolExecutor {
-	return &ToolExecutor{policy: options.Policy, observer: options.Observer}
+	limit := options.MaxConcurrency
+	if limit <= 0 {
+		limit = defaultToolGlobalConcurrency
+	}
+	// 共享执行器统一限制所有主 Agent 和通用子 Agent 的工具调用，避免
+	// 不同 Invocation 各自满足局部上限却在树莓派上同时打满内存与网络。
+	return &ToolExecutor{policy: options.Policy, observer: options.Observer, globalPermits: make(chan struct{}, limit)}
 }
 
 // SetObserver installs the metadata-only audit sink before a run starts. The
@@ -423,6 +433,15 @@ func (t *executableTool) Run(ctx adkagent.Context, args any) (map[string]any, er
 			defer func() { <-t.permits }()
 		case <-ctx.Done():
 			return nil, toolExecutionError("tool_cancelled", ToolErrorCancelled, false, "工具等待并发许可时已取消", ctx.Err())
+		}
+	}
+	if t.executor != nil && t.executor.globalPermits != nil {
+		// 全局工具并发许可必须可取消，避免某个长任务阻塞时把后续会话永久挂起。
+		select {
+		case t.executor.globalPermits <- struct{}{}:
+			defer func() { <-t.executor.globalPermits }()
+		case <-ctx.Done():
+			return nil, toolExecutionError("tool_cancelled", ToolErrorCancelled, false, "工具等待全局并发许可时已取消", ctx.Err())
 		}
 	}
 	runnable, ok := t.inner.(interface {

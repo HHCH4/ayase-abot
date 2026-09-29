@@ -104,6 +104,22 @@ func DynamicContextBudget(contextWindow, outputReserve, safetyReserve, fixedInpu
 	return contextWindow - outputReserve - safetyReserve - fixedInput
 }
 
+// outputReserveTokens 区分模型能力上限和单次请求预算；未设置请求上限时只预留有界的默认值。
+func outputReserveTokens(requested, modelMaximum, contextWindow int) int {
+	if requested > 0 {
+		// 传入的请求值由内核在协商阶段裁剪；保留直接调用者的原值供预算诊断。
+		return requested
+	}
+	reserve := 8192
+	if contextWindow > 0 && contextWindow/4 < reserve {
+		reserve = contextWindow / 4
+	}
+	if modelMaximum > 0 && modelMaximum < reserve {
+		reserve = modelMaximum
+	}
+	return reserve
+}
+
 // ContextManifest is a metadata-only description of one model request. It
 // deliberately stores digests and references, not the potentially sensitive
 // prompt body. Runtime persists it so a user can explain where the context
@@ -419,16 +435,19 @@ func buildContextManifestWithWorkingSet(request *adkmodel.LLMRequest, invocation
 	manifest := ContextManifest{
 		ID: "manifest:" + modelCallID, InvocationID: strings.TrimSpace(invocationID), ModelCallID: modelCallID,
 		BuilderVersion: ContextBuilderVersion, EstimatorVersion: tokenizer.Version, EstimatorName: tokenizer.Name, EstimateQuality: tokenizer.Quality, EstimateMultiplier: tokenizer.Calibration.SafetyMultiplier, Model: model.ID,
-		ContextWindow: model.ContextWindow, OutputReserve: runtime.AIMaxOutputTokens, SafetyReserve: runtime.CompactionSafetyTokens,
+		ContextWindow: model.ContextWindow, SafetyReserve: runtime.CompactionSafetyTokens,
 		CreatedAt: time.Now().UTC(), Included: make([]ContextManifestItem, 0), Excluded: make([]ContextExcludedItem, 0),
 	}
 	if toolSet != nil {
 		manifest.ToolSetSnapshotID = toolSet.ID
 		manifest.ToolSetDigest = toolSet.Digest
 	}
-	if manifest.OutputReserve <= 0 {
-		manifest.OutputReserve = model.MaxOutputTokens
+	// 仅请求中明确设置的 MaxOutputTokens 才是本轮实际输出上限；模型目录值只是能力上限。
+	requestedOutput := runtime.AIMaxOutputTokens
+	if request != nil && request.Config != nil && request.Config.MaxOutputTokens > 0 {
+		requestedOutput = int(request.Config.MaxOutputTokens)
 	}
+	manifest.OutputReserve = outputReserveTokens(requestedOutput, model.MaxOutputTokens, model.ContextWindow)
 	add := func(item ContextManifestItem) {
 		if item.TokenEstimate < 0 {
 			item.TokenEstimate = 0
@@ -466,14 +485,17 @@ func buildContextManifestWithWorkingSet(request *adkmodel.LLMRequest, invocation
 	}
 	if contract != nil {
 		encoded, _ := json.Marshal(contract)
-		add(ContextManifestItem{ID: "contract:v" + fmt.Sprint(contract.Version), Kind: "task_contract", Priority: "P0", SourceRef: "contract:" + fmt.Sprint(contract.Version), Trust: "runtime", ContentDigest: digestContextText(string(encoded)), TokenEstimate: ScaleTokenEstimate(EstimateTextTokens(string(encoded)), tokenizer.Calibration.SafetyMultiplier), SelectionReason: "always_required", Freshness: "current"})
+		// 契约已经包含在 system:instruction 中；保留来源记录但不重复计入 token。
+		add(ContextManifestItem{ID: "contract:v" + fmt.Sprint(contract.Version), Kind: "task_contract", Priority: "P0", SourceRef: "contract:" + fmt.Sprint(contract.Version), Trust: "runtime", ContentDigest: digestContextText(string(encoded)), TokenEstimate: 0, SelectionReason: "included_in_system_instruction", Freshness: "current"})
 	}
 	if snapshot != nil {
 		encoded, _ := json.Marshal(snapshot)
-		add(ContextManifestItem{ID: "runtime_snapshot:v" + fmt.Sprint(snapshot.Revision), Kind: "runtime_snapshot", Priority: "P0", SourceRef: "runtime_snapshot:" + fmt.Sprint(snapshot.Revision), Trust: "runtime", ContentDigest: digestContextText(string(encoded)), TokenEstimate: ScaleTokenEstimate(EstimateTextTokens(string(encoded)), tokenizer.Calibration.SafetyMultiplier), SelectionReason: "always_required", Freshness: "current"})
+		// Snapshot 同样已进入 system:instruction，不能按序列化后的整份对象再估算一次。
+		add(ContextManifestItem{ID: "runtime_snapshot:v" + fmt.Sprint(snapshot.Revision), Kind: "runtime_snapshot", Priority: "P0", SourceRef: "runtime_snapshot:" + fmt.Sprint(snapshot.Revision), Trust: "runtime", ContentDigest: digestContextText(string(encoded)), TokenEstimate: 0, SelectionReason: "included_in_system_instruction", Freshness: "current"})
 	}
 	for _, instruction := range instructions {
-		add(ContextManifestItem{ID: "instruction:" + instruction.Path, Kind: "project_instruction", Priority: "P0", SourceRef: instruction.Path, Trust: "untrusted_project_data", ContentDigest: instruction.ContentDigest, TokenEstimate: ScaleTokenEstimate(EstimateTextTokens(instruction.Content), tokenizer.Calibration.SafetyMultiplier), SelectionReason: "scoped_workspace", Freshness: "current"})
+		// 项目指令随系统指令发送，目录条目仅用于解释来源而不重复消耗预算。
+		add(ContextManifestItem{ID: "instruction:" + instruction.Path, Kind: "project_instruction", Priority: "P0", SourceRef: instruction.Path, Trust: "untrusted_project_data", ContentDigest: instruction.ContentDigest, TokenEstimate: 0, SelectionReason: "included_in_system_instruction", Freshness: "current"})
 	}
 	for _, item := range workingSet {
 		freshness := item.Freshness
@@ -484,7 +506,8 @@ func buildContextManifestWithWorkingSet(request *adkmodel.LLMRequest, invocation
 			manifest.Excluded = append(manifest.Excluded, ContextExcludedItem{ID: item.ID, Kind: item.Kind, Reason: freshness})
 			continue
 		}
-		add(ContextManifestItem{ID: "working_set:" + item.ID, Kind: item.Kind, Priority: fmt.Sprintf("P%d", item.Priority), SourceRef: item.SourceRef, Trust: item.Trust, ContentDigest: item.ContentDigest, TokenEstimate: ScaleTokenEstimate(item.TokenEstimate, tokenizer.Calibration.SafetyMultiplier), SelectionReason: "working_set", Freshness: freshness})
+		// Working Set 引用也已注入系统指令，只记录来源以免再次计费。
+		add(ContextManifestItem{ID: "working_set:" + item.ID, Kind: item.Kind, Priority: fmt.Sprintf("P%d", item.Priority), SourceRef: item.SourceRef, Trust: item.Trust, ContentDigest: item.ContentDigest, TokenEstimate: 0, SelectionReason: "included_in_system_instruction", Freshness: freshness})
 	}
 	if manifest.ContextWindow > 0 && budgetExceedsWindow(manifest.EstimatedInput, manifest.OutputReserve, manifest.SafetyReserve, manifest.ContextWindow) {
 		manifest.Warnings = append(manifest.Warnings, "estimated_context_exceeds_hard_window")

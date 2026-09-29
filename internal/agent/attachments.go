@@ -140,13 +140,15 @@ func limitAttachmentText(value string, maxBytes int) string {
 // The delegate sees a defensive request copy and the original request remains
 // metadata-only for the rest of ADK.
 type attachmentMaterializingLLM struct {
-	delegate       adkmodel.LLM
-	resolver       AttachmentResolver
-	userID         string
-	invocationID   string
-	conversationID string
-	runtime        RuntimeOptions
-	subAgentRunner SubAgentRunner
+	delegate        adkmodel.LLM
+	resolver        AttachmentResolver
+	userID          string
+	invocationID    string
+	conversationID  string
+	runtime         RuntimeOptions
+	subAgentRunner  SubAgentRunner
+	subAgentManager SubAgentGroupRunner
+	artifactWriter  DerivedArtifactWriter
 }
 
 func (m *attachmentMaterializingLLM) Name() string {
@@ -229,7 +231,10 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 		}
 		// 除了文件名和 MIME 外，再检查实际文件签名，兼容 OneBot/NapCat 把文档
 		// 文件名改成内部 ID 或把 MIME 标成 application/octet-stream 的情况。
-		if document.IsDocumentData(ref.Name, ref.MIMEType, data) {
+		documentKind := document.DetectDocumentKind(ref.Name, ref.MIMEType, data)
+		// 纯文本/Markdown 本身就是模型可消费的内容，保留原生 inline data，
+		// 解析层只负责办公文档、PDF、表格等模型通常不能直接读取的格式。
+		if document.IsDocumentData(ref.Name, ref.MIMEType, data) && documentKind != "txt" && documentKind != "md" {
 			// PDF、Word、Excel 等格式通常不能直接作为通用模型的 file 输入；
 			// 在 provider 边界转换为带来源定位的文本，原始 Artifact 仍保持不变。
 			parseStartedAt := time.Now()
@@ -264,10 +269,7 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 			)
 			if len(parsed.Images) > 0 && parsed.NeedsImageAnalysis(query) && m.runtime.SubAgentsEnabled() && m.subAgentRunner != nil {
 				imagePrompt := documentImageAnalysisPrompt(ref.Name, query, parsed.Images)
-				imageSummary, analyzeErr := m.subAgentRunner.RunSubAgent(ctx, SubAgentRequest{
-					InvocationID: m.invocationID, UserID: m.userID, ConversationID: m.conversationID,
-					Purpose: "分析文档内嵌图片", Prompt: imagePrompt, Runtime: m.runtime, Images: parsed.Images,
-				})
+				imageSummary, analyzeErr := m.analyzeDocumentImages(ctx, ref, imagePrompt, parsed.Images)
 				if analyzeErr != nil {
 					slog.Warn("文档图片子Agent调用失败", "name", ref.Name, "images", len(parsed.Images), "query", query, "error", analyzeErr)
 					rendered += "\n[图片解析提示] 视觉子 Agent 执行失败：" + limitAttachmentText(analyzeErr.Error(), 2048)
@@ -287,6 +289,51 @@ func (m *attachmentMaterializingLLM) materializeContent(ctx context.Context, con
 		}})
 	}
 	return copyContent, nil
+}
+
+// analyzeDocumentImages 统一通过 document_image Group 处理文档图片。每张图片
+// 是一个有序 Run，Group 屏障完成后再一次性汇总给主 Agent，避免子 Agent 增量
+// 或工具过程直接流入平台聊天。
+func (m *attachmentMaterializingLLM) analyzeDocumentImages(ctx context.Context, parentRef AttachmentRef, prompt string, images []document.Image) (string, error) {
+	if m.subAgentManager != nil {
+		runs := make([]SubAgentRunRequest, 0, len(images))
+		for index, image := range images {
+			inputRefs := []AttachmentRef{parentRef}
+			if m.artifactWriter != nil {
+				derived, writeErr := m.artifactWriter(ctx, m.userID, m.conversationID, m.invocationID, parentRef, image)
+				if writeErr != nil {
+					slog.Warn("文档图片派生Artifact保存失败", "name", parentRef.Name, "locator", image.Locator, "error", writeErr)
+				} else if strings.TrimSpace(derived.ID) != "" {
+					inputRefs = append(inputRefs, derived)
+				}
+			}
+			runs = append(runs, SubAgentRunRequest{
+				ID: fmt.Sprintf("image-%d", index+1), Prompt: prompt, Images: []document.Image{image},
+				InputArtifactRefs: inputRefs,
+				InputMetadata:     map[string]string{"document": safeAttachmentLabel(parentRef.Name), "locator": image.Locator},
+			})
+		}
+		group, err := m.subAgentManager.RunSubAgentGroup(ctx, SubAgentGroupRequest{
+			Parent:  SubAgentRequest{InvocationID: m.invocationID, UserID: m.userID, ConversationID: m.conversationID, Purpose: "分析文档内嵌图片", Runtime: m.runtime},
+			Profile: SubAgentProfileDocumentImage, Purpose: "分析文档内嵌图片", FailurePolicy: SubAgentFailureBestEffort,
+			MaxConcurrency: m.runtime.SubAgent.MaxConcurrency, Runs: runs,
+		})
+		if err != nil && strings.TrimSpace(group.Text) == "" {
+			return "", err
+		}
+		if len(group.Failures) > 0 {
+			return group.Text + fmt.Sprintf("\n[图片解析失败 %d 个]", len(group.Failures)), err
+		}
+		return group.Text, err
+	}
+	if m.subAgentRunner == nil {
+		return "", errors.New("通用子 Agent 未装配")
+	}
+	return m.subAgentRunner.RunSubAgent(ctx, SubAgentRequest{
+		InvocationID: m.invocationID, UserID: m.userID, ConversationID: m.conversationID,
+		Purpose: "分析文档内嵌图片", Prompt: prompt, Runtime: m.runtime, Images: images,
+		InputArtifactRefs: []AttachmentRef{parentRef},
+	})
 }
 
 // documentImageAnalysisPrompt 将图片定位和用户问题交给通用子 Agent，图片字节仅

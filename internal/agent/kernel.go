@@ -53,6 +53,9 @@ type Config struct {
 	Tools          []tool.Tool
 	// WebSearchToolFactory 仅在有效配置明确启用网页搜索时，为当前运行创建搜索工具。
 	WebSearchToolFactory func(context.Context, RuntimeOptions, string, string) (tool.Tool, error)
+	// RetrievalToolFactory 创建统一只读检索工具；具体来源和权限由宿主编排器
+	// 冻结，模型只能提交查询，不能注册适配器或扩大 source_scope。
+	RetrievalToolFactory func(context.Context, RuntimeOptions, string, string, string, string) (tool.Tool, error)
 	// WorkspaceTools 是旧版兼容回调；新代码应使用 WorkspaceToolsForConversation。
 	WorkspaceTools func(context.Context, string) ([]tool.Tool, error)
 	// WorkspaceToolsForConversation 根据对话固定的工作区创建工具，并把操作绑定到对话。
@@ -78,6 +81,8 @@ type Config struct {
 	// materialize a context compaction summary. The callback is persistence-
 	// only; a compaction failure must not erase already persisted model output.
 	CompactionFailureObserver CompactionFailureObserver
+	// CompactionSuccessObserver 在 ADK 真正持久化压缩摘要后记录事件，而非把一次模型用量误当成成功。
+	CompactionSuccessObserver CompactionSuccessObserver
 	// CompactionUsageObserver receives metadata for each context summarizer
 	// attempt. It is separate from normal model usage so compaction cost cannot
 	// be mistaken for a user-facing model response.
@@ -133,6 +138,9 @@ type Config struct {
 	// authorization check; the model-facing tool never accepts an arbitrary
 	// Artifact ID from model input.
 	AttachmentListResolver AttachmentListResolver
+	// DerivedArtifactWriter 持久化文档图片的受控派生引用；为空时仍可在当前
+	// 请求内分析图片，但不会把图片伪装成已持久化的 Artifact。
+	DerivedArtifactWriter DerivedArtifactWriter
 	// ModalFallbackUsageObserver receives bounded usage metadata for a
 	// modality-to-text fallback request. It is kept separate from normal model
 	// usage so fallback cost is visible without changing the user transcript.
@@ -141,6 +149,9 @@ type Config struct {
 	// fallback text to a user-facing Runtime channel. It never receives media
 	// bytes or the original provider response object.
 	ModalFallbackOutputObserver ModalFallbackOutputObserver
+	// RuntimeActionHandler 是 Bot Runtime 动作的唯一宿主边界，例如创建
+	// Follow-up；Kernel 只负责把模型结构化调用交给宿主，不直接操作平台或数据库。
+	RuntimeActionHandler RuntimeActionHandler
 
 	// EnableCompaction 打开 ADK 的 Tail retention 上下文压缩。
 	EnableCompaction    bool
@@ -358,6 +369,9 @@ type CompactionFailureObserver func(context.Context, string, error, int)
 // retained as an execution instruction or used to trigger side effects.
 type CompactionUsageObserver func(context.Context, string, map[string]any)
 
+// CompactionSuccessObserver 只传递压缩事件标识和时间，不向 Runtime 暴露摘要正文。
+type CompactionSuccessObserver func(context.Context, string, string, time.Time)
+
 // WorkspacePolicy 是 Agent 传给工作区宿主的最小权限集合，避免 Agent 直接依赖配置包。
 type WorkspacePolicy struct {
 	Enabled               bool
@@ -387,12 +401,12 @@ type SubAgentOptions struct {
 // RuntimeOptions 是配置中心解析后的 Agent 运行参数。零值只适合作为 Resolver 的错误返回，不代表完整配置。
 type RuntimeOptions struct {
 	AIEnabled bool
-	// SubAgentEnabled controls whether the main Agent may launch any child Agent.
-	// nil preserves the historical enabled behavior for callers that construct
-	// partial RuntimeOptions values.
-	SubAgentEnabled                *bool
-	ProviderID                     string
-	ModelID                        string
+	// SubAgentEnabled 控制主 Agent 是否允许委派给通用子 Agent；未显式装配时默认关闭，避免不完整的嵌入配置绕过安全开关。
+	SubAgentEnabled *bool
+	ProviderID      string
+	ModelID         string
+	// Timezone 是当前 Bot Runtime 解释“现在”的 IANA 时区；空值时使用服务器本地时区。
+	Timezone                       string
 	AITemperature                  float64
 	AIReasoningEffort              string
 	AITopP                         float64
@@ -464,6 +478,11 @@ type AttachmentRef struct {
 // before constructing ADK InlineData.
 type AttachmentResolver func(context.Context, string, AttachmentRef) (io.ReadCloser, error)
 
+// DerivedArtifactWriter 保存文档解析产生的派生图片。原始附件保持不可变，
+// 图片分析只拿到带父引用和来源定位的派生 ArtifactRef，避免把裸 bytes 写进
+// Runtime 状态或事件。
+type DerivedArtifactWriter func(context.Context, string, string, string, AttachmentRef, document.Image) (AttachmentRef, error)
+
 // AttachmentListResolver loads the current Invocation's attachments after the
 // Runtime has established its user boundary. Implementations must return
 // immutable refs and reject cross-user or cross-invocation access.
@@ -489,6 +508,7 @@ type Kernel struct {
 	instruction                   string
 	tools                         []tool.Tool
 	webSearchToolFactory          func(context.Context, RuntimeOptions, string, string) (tool.Tool, error)
+	retrievalToolFactory          func(context.Context, RuntimeOptions, string, string, string, string) (tool.Tool, error)
 	workspaceTools                func(context.Context, string) ([]tool.Tool, error)
 	workspaceToolsForConversation func(context.Context, string, string) ([]tool.Tool, error)
 	workspaceToolsWithPolicy      func(context.Context, string, string, WorkspacePolicy) ([]tool.Tool, error)
@@ -500,6 +520,7 @@ type Kernel struct {
 	toolBudgetObserver            ToolBudgetObserver
 	contextRecoveryObserver       ContextRecoveryObserver
 	compactionFailureObserver     CompactionFailureObserver
+	compactionSuccessObserver     CompactionSuccessObserver
 	compactionUsageObserver       CompactionUsageObserver
 	contextManifestObserver       ContextManifestObserver
 	toolRegistry                  *ToolRegistry
@@ -513,9 +534,12 @@ type Kernel struct {
 	memoryTools                   func(context.Context, string) ([]tool.Tool, error)
 	attachmentResolver            AttachmentResolver
 	attachmentListResolver        AttachmentListResolver
+	derivedArtifactWriter         DerivedArtifactWriter
 	subAgentRunner                SubAgentRunner
+	subAgentManager               SubAgentGroupRunner
 	modalFallbackUsageObserver    ModalFallbackUsageObserver
 	modalFallbackOutputObserver   ModalFallbackOutputObserver
+	runtimeActionHandler          RuntimeActionHandler
 	defaultRuntime                RuntimeOptions
 	compaction                    compactionOptions
 	locksMu                       sync.Mutex
@@ -659,13 +683,20 @@ func (t *compactionFailureTracker) noteEvent() {
 // the existing session implementation and persistence semantics intact.
 type compactionObservingSessionService struct {
 	session.Service
-	tracker *compactionFailureTracker
+	tracker      *compactionFailureTracker
+	onSuccess    CompactionSuccessObserver
+	invocationID string
 }
 
 func (s *compactionObservingSessionService) AppendEvent(ctx context.Context, sess session.Session, event *session.Event) error {
 	err := s.Service.AppendEvent(ctx, sess, event)
-	if err != nil && event != nil && event.Actions.Compaction != nil {
-		s.tracker.noteAppendFailure(ctx, err)
+	if event != nil && event.Actions.Compaction != nil {
+		if err != nil {
+			s.tracker.noteAppendFailure(ctx, err)
+		} else if s.onSuccess != nil {
+			// 只有摘要落库成功才通知 Runtime，避免压缩调用失败时显示虚假的成功状态。
+			s.onSuccess(ctx, s.invocationID, event.ID, event.Timestamp)
+		}
 	}
 	return err
 }
@@ -690,6 +721,13 @@ type ChatRequest struct {
 	IdempotencyKey string
 	// QueueIfBusy 仅由 Bot 消息入口启用；同一对话后续请求按接收顺序等待。
 	QueueIfBusy bool
+	// Proactive 标记由 Follow-up/主动任务发起的 Agent 请求；主动任务只能
+	// 使用显式允许的工具，并在 Runtime 层复用同一预算边界。
+	Proactive bool
+	// AllowedTools 是本轮请求的工具白名单；为空表示使用当前有效工具策略。
+	AllowedTools []string
+	// ToolBudget 是本轮最多允许的工具调用次数；零表示沿用运行时默认值。
+	ToolBudget int
 	// BotDelivery 仅用于重启后恢复平台回复目标，模型不会看到这些元数据。
 	BotDelivery *BotDeliveryTarget
 	// BotID 用于解析机器人级配置绑定；WebUI 对话可以留空。
@@ -711,8 +749,6 @@ type ChatRequest struct {
 	Message    string
 	// GroupContext 仅作为低信任背景输入，不参与任务目标和工具授权判断。
 	GroupContext string
-	// Proactive 标识未唤醒群聊的概率回复；该轮不能调用任何工具。
-	Proactive bool
 	// ResumeContent is an ADK user content containing structured FunctionResponse
 	// parts (currently used by the Runtime approval resume path). When set, the
 	// runner receives it instead of constructing a new text message.
@@ -721,6 +757,9 @@ type ChatRequest struct {
 	// HTTP input and contains only the bounded metadata projection generated by
 	// Kernel on the first turn of a durable Invocation.
 	ConfigSnapshot string
+	// RuntimeOverride 是 Runtime 内部排队恢复用的完整无秘密运行参数。HTTP
+	// 层不会填充它；没有快照时仍由 RuntimeConfigResolver 解析当前配置。
+	RuntimeOverride *RuntimeOptions
 	// Attachments 是本轮消息携带的图片或文件。Durable Runtime 请求只保存
 	// Artifact Ref；Data 仅供未装配 Artifact 服务的直接调用方兼容使用。
 	Attachments []Attachment
@@ -735,6 +774,8 @@ type BotDeliveryTarget struct {
 	UserID         string
 	MessageID      string
 	ReplyMessageID string
+	SourceUMO      string
+	TurnID         string
 	UniqueSession  bool
 }
 
@@ -828,6 +869,7 @@ func NewKernel(config Config) (*Kernel, error) {
 		instruction:                   config.Instruction,
 		tools:                         append([]tool.Tool(nil), config.Tools...),
 		webSearchToolFactory:          config.WebSearchToolFactory,
+		retrievalToolFactory:          config.RetrievalToolFactory,
 		workspaceTools:                config.WorkspaceTools,
 		workspaceToolsForConversation: config.WorkspaceToolsForConversation,
 		workspaceToolsWithPolicy:      config.WorkspaceToolsForConversationWithPolicy,
@@ -839,6 +881,7 @@ func NewKernel(config Config) (*Kernel, error) {
 		toolBudgetObserver:            config.ToolBudgetObserver,
 		contextRecoveryObserver:       config.ContextRecoveryObserver,
 		compactionFailureObserver:     config.CompactionFailureObserver,
+		compactionSuccessObserver:     config.CompactionSuccessObserver,
 		compactionUsageObserver:       config.CompactionUsageObserver,
 		contextManifestObserver:       config.ContextManifestObserver,
 		toolRegistry:                  config.ToolRegistry,
@@ -852,8 +895,10 @@ func NewKernel(config Config) (*Kernel, error) {
 		memoryTools:                   config.MemoryTools,
 		attachmentResolver:            config.AttachmentResolver,
 		attachmentListResolver:        config.AttachmentListResolver,
+		derivedArtifactWriter:         config.DerivedArtifactWriter,
 		modalFallbackUsageObserver:    config.ModalFallbackUsageObserver,
 		modalFallbackOutputObserver:   config.ModalFallbackOutputObserver,
+		runtimeActionHandler:          config.RuntimeActionHandler,
 		defaultRuntime:                defaultRuntime,
 		compaction:                    compactionOptions{enabled: config.EnableCompaction, ratio: ratio, safety: safety, retention: retention, interval: interval, overlap: overlap},
 		sessionLocks:                  make(map[string]*sessionLockEntry),
@@ -914,6 +959,16 @@ func (k *Kernel) SetCompactionFailureObserver(observer CompactionFailureObserver
 	}
 	k.locksMu.Lock()
 	k.compactionFailureObserver = observer
+	k.locksMu.Unlock()
+}
+
+// SetCompactionSuccessObserver 安装摘要落库后的观察器，供 Runtime 记录可见的成功事件。
+func (k *Kernel) SetCompactionSuccessObserver(observer CompactionSuccessObserver) {
+	if k == nil {
+		return
+	}
+	k.locksMu.Lock()
+	k.compactionSuccessObserver = observer
 	k.locksMu.Unlock()
 }
 
@@ -1222,17 +1277,14 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 		}
 		var projectInstructions []ProjectInstruction
 		tools := append([]tool.Tool(nil), k.tools...)
-		// 主动插话只生成文本，不继承当前会话的工作区和任何工具能力。
-		if request.Proactive {
-			workspaceID = ""
-			tools = nil
-		}
 		var workspaceToolsForRegistry []tool.Tool
 		var memoryToolsForRegistry []tool.Tool
 		var sessionAttachmentToolsForRegistry []tool.Tool
 		var webSearchToolsForRegistry []tool.Tool
+		var retrievalToolsForRegistry []tool.Tool
 		var subAgentToolsForRegistry []tool.Tool
-		if runtime.WebSearchEnabled && !request.Proactive && k.webSearchToolFactory != nil {
+		var runtimeActionToolsForRegistry []tool.Tool
+		if runtime.WebSearchEnabled && k.webSearchToolFactory != nil {
 			webSearchTool, toolErr := k.webSearchToolFactory(ctx, runtime, request.InvocationID, request.ConversationID)
 			if toolErr != nil {
 				yield(nil, fmt.Errorf("创建网页搜索工具失败: %w", toolErr))
@@ -1241,6 +1293,19 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 			if webSearchTool != nil {
 				webSearchToolsForRegistry = append(webSearchToolsForRegistry, webSearchTool)
 				tools = append(tools, webSearchTool)
+			}
+		}
+		// 统一检索是会话级只读能力，不依赖是否绑定工作区；否则普通私聊即使
+		// 已开启记忆、会话或联网来源，也拿不到 retrieval_search 工具。
+		if k.retrievalToolFactory != nil {
+			retrievalTool, toolErr := k.retrievalToolFactory(ctx, runtime, request.UserID, request.ConversationID, request.SessionID, request.InvocationID)
+			if toolErr != nil {
+				yield(nil, fmt.Errorf("创建统一检索工具失败: %w", toolErr))
+				return
+			}
+			if retrievalTool != nil {
+				retrievalToolsForRegistry = append(retrievalToolsForRegistry, retrievalTool)
+				tools = append(tools, retrievalTool)
 			}
 		}
 		if workspaceID != "" {
@@ -1287,7 +1352,7 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 			tools = append(tools, workspaceTools...)
 		}
 		var memoryService adkmemory.Service
-		if runtime.MemoryEnabled && !request.Proactive {
+		if runtime.MemoryEnabled {
 			memoryService = k.memoryService
 			if k.memoryServiceResolver != nil {
 				memoryService = k.memoryServiceResolver(ctx, runtime)
@@ -1315,7 +1380,7 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 				tools = append(tools, memoryTools...)
 			}
 		}
-		if strings.TrimSpace(request.InvocationID) != "" && k.attachmentListResolver != nil && !request.Proactive {
+		if strings.TrimSpace(request.InvocationID) != "" && k.attachmentListResolver != nil {
 			attachmentTool, toolErr := newSessionAttachmentsTool(request.UserID, request.InvocationID, k.attachmentListResolver, k.attachmentResolver)
 			if toolErr != nil {
 				yield(nil, fmt.Errorf("创建会话附件工具失败: %w", toolErr))
@@ -1323,6 +1388,15 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 			}
 			sessionAttachmentToolsForRegistry = append(sessionAttachmentToolsForRegistry, attachmentTool)
 			tools = append(tools, attachmentTool)
+		}
+		if k.runtimeActionHandler != nil && request.BotDelivery != nil {
+			runtimeActionTool, toolErr := newCreateFollowUpTool(k.runtimeActionHandler, request)
+			if toolErr != nil {
+				yield(nil, fmt.Errorf("创建 Runtime 动作工具失败: %w", toolErr))
+				return
+			}
+			runtimeActionToolsForRegistry = append(runtimeActionToolsForRegistry, runtimeActionTool)
+			tools = append(tools, runtimeActionTool)
 		}
 		resolved, err := k.providers.Resolve(ctx, providerID, modelID)
 		if err != nil {
@@ -1337,8 +1411,8 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 		profile = agentToolProfile(profile, resolved.Provider, resolved.Model)
 		// 子 Agent 只能由主 Agent 显式调用；只有主模型确认支持工具调用时
 		// 才公开入口，避免启用子 Agent 后让纯文本模型整轮请求失败。
-		if !request.Proactive && runtime.SubAgentsEnabled() && (profile.ToolCalling.State == provider.SupportSupported || profile.ToolCalling.State == provider.SupportDegraded) {
-			if runner := k.genericSubAgentRunner(); runner != nil {
+		if runtime.SubAgentsEnabled() && (profile.ToolCalling.State == provider.SupportSupported || profile.ToolCalling.State == provider.SupportDegraded) {
+			if runner := k.subAgentToolRunner(); runner != nil {
 				childTools := k.prepareSubAgentTools(tools, runtime.SubAgent.AllowedTools)
 				subAgentTool, toolErr := newRunSubAgentTool(runner, SubAgentRequest{
 					InvocationID: request.InvocationID, UserID: request.UserID, ConversationID: request.ConversationID,
@@ -1382,8 +1456,7 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 		toolRegistry := k.toolRegistry
 		toolSetSnapshotObserver := k.toolSetSnapshotObserver
 		k.locksMu.Unlock()
-		// Tool Registry 的空白名单代表“不限制”，主动回复必须彻底跳过选择器。
-		if toolRegistry != nil && !request.Proactive {
+		if toolRegistry != nil {
 			if err := toolRegistry.RegisterRuntimeTools(k.tools, ToolSourceBuiltin); err != nil {
 				yield(nil, fmt.Errorf("注册内置工具失败: %w", err))
 				return
@@ -1404,8 +1477,16 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 				yield(nil, fmt.Errorf("注册网页搜索工具失败: %w", err))
 				return
 			}
+			if err := toolRegistry.RegisterRuntimeTools(retrievalToolsForRegistry, ToolSourceBuiltin); err != nil {
+				yield(nil, fmt.Errorf("注册统一检索工具失败: %w", err))
+				return
+			}
 			if err := toolRegistry.RegisterRuntimeTools(subAgentToolsForRegistry, ToolSourceBuiltin); err != nil {
 				yield(nil, fmt.Errorf("注册通用子 Agent 工具失败: %w", err))
+				return
+			}
+			if err := toolRegistry.RegisterRuntimeTools(runtimeActionToolsForRegistry, ToolSourceBuiltin); err != nil {
+				yield(nil, fmt.Errorf("注册 Runtime 动作工具失败: %w", err))
 				return
 			}
 			maxSchemaTokens := runtime.ToolSchemaBudgetTokens
@@ -1418,8 +1499,18 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 					availableNames = append(availableNames, item.Name())
 				}
 			}
+			allowedToolNames := availableNames
+			if len(request.AllowedTools) > 0 {
+				if request.Proactive {
+					allowedToolNames = readOnlyToolNames(toolRegistry.List(), request.AllowedTools, availableNames)
+				} else {
+					allowedToolNames = normalizeToolNames(request.AllowedTools)
+				}
+			} else if request.Proactive {
+				allowedToolNames = proactiveToolNames(toolRegistry.List(), availableNames)
+			}
 			selection, selectErr := toolRegistry.Select(ToolSelectionRequest{
-				InvocationID: request.InvocationID, MaxSchemaTokens: maxSchemaTokens, AllowedTools: availableNames,
+				InvocationID: request.InvocationID, MaxSchemaTokens: maxSchemaTokens, AllowedTools: allowedToolNames,
 				ModelProfile: negotiation.ProfileSnapshotID,
 				Compatible: func(_ ToolDescriptor) (bool, string) {
 					if negotiation.Profile.ToolCalling.State == provider.SupportSupported || negotiation.Profile.ToolCalling.State == provider.SupportDegraded {
@@ -1441,6 +1532,13 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 						return
 					}
 				}
+			}
+		}
+		if toolRegistry == nil {
+			if len(request.AllowedTools) > 0 {
+				tools = filterToolsByNames(tools, request.AllowedTools)
+			} else if request.Proactive {
+				tools = filterProactiveToolsByName(tools)
 			}
 		}
 		// Freeze the effective, non-secret runtime configuration before building
@@ -1473,8 +1571,13 @@ func (k *Kernel) Run(ctx context.Context, request ChatRequest) iter.Seq2[*sessio
 		// The negotiated request plan is the provider-neutral boundary. Apply
 		// only safe request-shape changes here; adapters decide how their
 		// protocol represents the resulting GenerateContentConfig.
-		if negotiation.RequestPlan.MaxOutputTokens > 0 && (runtime.AIMaxOutputTokens <= 0 || runtime.AIMaxOutputTokens > negotiation.RequestPlan.MaxOutputTokens) {
-			runtime.AIMaxOutputTokens = negotiation.RequestPlan.MaxOutputTokens
+		// 未手动指定时取不超过 8192 token 的单次默认输出，避免把 384K 能力上限直接送给每次请求。
+		if negotiation.RequestPlan.MaxOutputTokens > 0 {
+			if runtime.AIMaxOutputTokens <= 0 {
+				runtime.AIMaxOutputTokens = min(negotiation.RequestPlan.MaxOutputTokens, 8192)
+			} else if runtime.AIMaxOutputTokens > negotiation.RequestPlan.MaxOutputTokens {
+				runtime.AIMaxOutputTokens = negotiation.RequestPlan.MaxOutputTokens
+			}
 		}
 		runner, compactionTracker, err := k.buildRunner(ctx, resolved, tools, runtime, memoryService, projectInstructions, request.UserID, request.ConversationID, request.InvocationID, taskContract, runtimeSnapshot, workingSet, toolSetSnapshot, negotiation.RequestPlan)
 		if err != nil {
@@ -1740,6 +1843,15 @@ func (k *Kernel) resolveRuntimeOptions(ctx context.Context, request ChatRequest,
 		}
 		runtime = resolved
 	}
+	if request.RuntimeOverride != nil {
+		// Follow-up/排队恢复必须使用创建时冻结的运行策略；指令正文不在快照
+		// 中保存，因此继续使用当前已解析 persona 的 instruction。
+		instruction := runtime.Instruction
+		runtime = *request.RuntimeOverride
+		if runtime.Instruction == "" {
+			runtime.Instruction = instruction
+		}
+	}
 	if runtime.Instruction == "" {
 		runtime.Instruction = k.defaultRuntime.Instruction
 	}
@@ -1788,6 +1900,17 @@ func (k *Kernel) resolveRuntimeOptions(ctx context.Context, request ChatRequest,
 	}
 	if runtime.AgentMaxToolCalls <= 0 {
 		runtime.AgentMaxToolCalls = k.defaultRuntime.AgentMaxToolCalls
+	}
+	if request.Proactive {
+		// 主动任务不能因单轮配置异常扩大工具预算；显式预算只允许收紧
+		// 当前运行时上限，避免 Follow-up 变成无限工具循环。
+		if request.ToolBudget > 0 && request.ToolBudget < runtime.AgentMaxToolCalls {
+			runtime.AgentMaxToolCalls = request.ToolBudget
+		}
+		// 主动任务只允许读取，工作区写入、执行命令和 Git 副作用全部关闭。
+		runtime.WorkspaceWriteEnabled = false
+		runtime.WorkspaceExecEnabled = false
+		runtime.WorkspaceGitEnabled = false
 	}
 	if runtime.ToolSchemaBudgetTokens < 256 {
 		runtime.ToolSchemaBudgetTokens = k.defaultRuntime.ToolSchemaBudgetTokens
@@ -1844,7 +1967,7 @@ func (k *Kernel) resolveRuntimeOptions(ctx context.Context, request ChatRequest,
 // constructed ToolRegistry is empty until the first Runner is built, and an
 // empty catalog revision would otherwise make every persisted invocation look
 // changed before the registry has had a chance to warm up.
-func (k *Kernel) warmRuntimeToolCatalog(ctx context.Context, runtime RuntimeOptions, workspaceID, conversationID, userID, invocationID string, proactive bool) error {
+func (k *Kernel) warmRuntimeToolCatalog(ctx context.Context, runtime RuntimeOptions, request ChatRequest, workspaceID, conversationID, userID, invocationID string) error {
 	if k == nil || k.toolRegistry == nil {
 		return nil
 	}
@@ -1914,7 +2037,16 @@ func (k *Kernel) warmRuntimeToolCatalog(ctx context.Context, runtime RuntimeOpti
 			return fmt.Errorf("注册会话附件工具失败: %w", err)
 		}
 	}
-	if runtime.WebSearchEnabled && !proactive && k.webSearchToolFactory != nil {
+	if k.runtimeActionHandler != nil && request.BotDelivery != nil {
+		runtimeActionTool, err := newCreateFollowUpTool(k.runtimeActionHandler, request)
+		if err != nil {
+			return fmt.Errorf("创建 Runtime 动作工具失败: %w", err)
+		}
+		if err := registry.RegisterRuntimeTools([]tool.Tool{runtimeActionTool}, ToolSourceBuiltin); err != nil {
+			return fmt.Errorf("注册 Runtime 动作工具失败: %w", err)
+		}
+	}
+	if runtime.WebSearchEnabled && k.webSearchToolFactory != nil {
 		webSearchTool, err := k.webSearchToolFactory(ctx, runtime, invocationID, conversationID)
 		if err != nil {
 			return fmt.Errorf("创建网页搜索工具失败: %w", err)
@@ -1925,9 +2057,20 @@ func (k *Kernel) warmRuntimeToolCatalog(ctx context.Context, runtime RuntimeOpti
 			}
 		}
 	}
+	if k.retrievalToolFactory != nil {
+		retrievalTool, err := k.retrievalToolFactory(ctx, runtime, userID, conversationID, request.SessionID, invocationID)
+		if err != nil {
+			return fmt.Errorf("创建统一检索工具失败: %w", err)
+		}
+		if retrievalTool != nil {
+			if err := registry.RegisterRuntimeTools([]tool.Tool{retrievalTool}, ToolSourceBuiltin); err != nil {
+				return fmt.Errorf("注册统一检索工具失败: %w", err)
+			}
+		}
+	}
 	// Resume 前的 Runtime 快照必须看到和真实 Run 相同的子 Agent 工具目录，
 	// 否则首次运行保存的 catalog revision 会在恢复时被误判为配置变化。
-	if runner := k.genericSubAgentRunner(); runner != nil {
+	if runner := k.subAgentToolRunner(); runner != nil {
 		// 目录只需要固定的 schema 和 revision；是否把工具实际交给主模型，
 		// 仍由 Run 根据主模型能力和会话开关决定。
 		placeholder, toolErr := newRunSubAgentTool(runner, SubAgentRequest{
@@ -2073,10 +2216,24 @@ func (k *Kernel) ResolveRuntimeConfigSnapshot(ctx context.Context, request ChatR
 	if err != nil {
 		return RuntimeConfigSnapshot{}, "", err
 	}
-	if err := k.warmRuntimeToolCatalog(ctx, runtime, workspaceID, request.ConversationID, request.UserID, request.InvocationID, request.Proactive); err != nil {
+	if err := k.warmRuntimeToolCatalog(ctx, runtime, request, workspaceID, request.ConversationID, request.UserID, request.InvocationID); err != nil {
 		return RuntimeConfigSnapshot{}, "", err
 	}
 	return BuildRuntimeConfigSnapshot(k.appName, runtime, resolved, workspaceID, request.TargetPath, k.CurrentToolCatalogRevision())
+}
+
+// runtimeCurrentTime 将当前时间固定到 Bot Runtime 配置的时区，避免服务器系统时区变化
+// 或树莓派默认 UTC 导致 Agent 回答“现在几点”时与平台用户看到的时间不一致。
+func runtimeCurrentTime(runtime RuntimeOptions) string {
+	location := time.Local
+	zoneName := strings.TrimSpace(runtime.Timezone)
+	if zoneName != "" {
+		if loaded, err := time.LoadLocation(zoneName); err == nil {
+			location = loaded
+		}
+	}
+	current := time.Now().In(location)
+	return current.Format(time.RFC3339) + "（" + location.String() + "）"
 }
 
 func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedModel, tools []tool.Tool, runtime RuntimeOptions, memoryService adkmemory.Service, projectInstructions []ProjectInstruction, userID, conversationID, invocationID string, taskContract *TaskContractProjection, runtimeSnapshot *RuntimeSnapshotProjection, workingSet []WorkingSetItem, toolSetSnapshot *ToolSetSnapshot, requestPlan provider.RequestPlan) (*adkrunner.Runner, *compactionFailureTracker, error) {
@@ -2121,7 +2278,6 @@ func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedMode
 	contextRecoveryObserver := k.contextRecoveryObserver
 	k.locksMu.Unlock()
 	var modelCallSequence atomic.Int64
-	var contextTrimAttempts atomic.Int32
 	var modelCallIDsMu sync.Mutex
 	modelCallIDs := make(map[*adkmodel.LLMRequest]string)
 	// A model catalog may omit context_window. The same conservative fallback
@@ -2186,7 +2342,7 @@ func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedMode
 		return id
 	}
 	trimRequest := func(agentContext adkagent.Context, request *adkmodel.LLMRequest) bool {
-		if request == nil || !contextTrimAttempts.CompareAndSwap(0, 1) {
+		if request == nil {
 			return false
 		}
 		modelCallID := modelCallIDFor(request)
@@ -2224,7 +2380,8 @@ func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedMode
 		model = &attachmentMaterializingLLM{
 			delegate: model, resolver: k.attachmentResolver, userID: strings.TrimSpace(userID),
 			invocationID: strings.TrimSpace(invocationID), conversationID: strings.TrimSpace(conversationID),
-			runtime: runtime, subAgentRunner: k.genericSubAgentRunner(),
+			runtime: runtime, subAgentRunner: k.genericSubAgentRunner(), subAgentManager: k.subAgentGroupRunner(),
+			artifactWriter: k.derivedArtifactWriter,
 		}
 	}
 	if manifestModel.ContextWindow > 0 {
@@ -2253,8 +2410,8 @@ func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedMode
 		Name:        "abot_assistant",
 		Description: "Abot 的通用中文对话 Agent",
 		Model:       model,
-		// 在每轮开始时提供服务器当前时间，时间问题无需等待模型主动选择工具。
-		Instruction:           effectiveInstructionWithWorkingSet(runtime.Instruction, projectInstructions, taskContract, runtimeSnapshot, workingSet) + "\n\n当前服务器时间：" + time.Now().In(time.Local).Format(time.RFC3339) + "（" + time.Local.String() + "）。涉及其他时区或要求精确刷新时调用 current_time。",
+		// 在每轮开始时提供服务器当前时间；工具结果只作为内部事实，最终答复仍需贴合用户的问题。
+		Instruction:           effectiveInstructionWithWorkingSet(runtime.Instruction, projectInstructions, taskContract, runtimeSnapshot, workingSet) + "\n\n当前服务器时间：" + runtimeCurrentTime(runtime) + "。涉及其他时区或要求精确刷新时调用 current_time。工具返回值是内部事实，不是面向用户的最终答复；根据用户的问题用自然语言回答，不要原样输出工具响应对象、字段名或无关的时间戳。用户明确要求原始格式时除外。",
 		Tools:                 tools,
 		GenerateContentConfig: generationConfig,
 	}
@@ -2289,7 +2446,8 @@ func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedMode
 		manifestObserverCallback := func(agentContext adkagent.Context, request *adkmodel.LLMRequest) (*adkmodel.LLMResponse, error) {
 			manifest := buildManifest(request, modelCallIDFor(request))
 			manifest = applyProviderTokenCount(agentContext, request, manifest)
-			if manifest.ContextWindow > 0 && manifest.EstimatedInput+manifest.OutputReserve+manifest.SafetyReserve > manifest.ContextWindow && contextTrimAttempts.CompareAndSwap(0, 1) {
+			// 工具调用可能不断增加上下文，每次模型调用都要重新尝试安全裁剪。
+			if manifest.ContextWindow > 0 && manifest.EstimatedInput+manifest.OutputReserve+manifest.SafetyReserve > manifest.ContextWindow {
 				removed := TrimContextHistory(request, manifest)
 				if len(removed) > 0 {
 					manifest = buildManifest(request, modelCallIDFor(request))
@@ -2317,12 +2475,13 @@ func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedMode
 	}
 	k.locksMu.Lock()
 	compactionObserver := k.compactionFailureObserver
+	compactionSuccessObserver := k.compactionSuccessObserver
 	compactionUsageObserver := k.compactionUsageObserver
 	k.locksMu.Unlock()
 	compactionTracker := newCompactionFailureTracker(compactionObserver, invocationID)
 	sessionService := k.sessions
-	if compactionObserver != nil {
-		sessionService = &compactionObservingSessionService{Service: k.sessions, tracker: compactionTracker}
+	if compactionObserver != nil || compactionSuccessObserver != nil {
+		sessionService = &compactionObservingSessionService{Service: k.sessions, tracker: compactionTracker, onSuccess: compactionSuccessObserver, invocationID: strings.TrimSpace(invocationID)}
 	}
 	runnerConfig := adkrunner.Config{
 		AppName:           k.appName,
@@ -2340,11 +2499,8 @@ func (k *Kernel) buildRunner(ctx context.Context, resolved provider.ResolvedMode
 				contextWindow = k.defaultRuntime.CompactionUnknownWindowTokens
 			}
 		}
-		maxOutput := resolved.Model.MaxOutputTokens
-		if runtime.AIMaxOutputTokens > 0 {
-			// 手动输出上限优先参与压缩阈值计算，避免可用上下文被高估。
-			maxOutput = runtime.AIMaxOutputTokens
-		}
+		// 压缩阈值按本次请求的输出预留量计算，不能拿模型理论最大输出量直接相减。
+		maxOutput := outputReserveTokens(runtime.AIMaxOutputTokens, resolved.Model.MaxOutputTokens, contextWindow)
 		thresholdByRatio := int(float64(contextWindow) * runtime.CompactionRatio)
 		thresholdByBudget := contextWindow - maxOutput - runtime.CompactionSafetyTokens
 		threshold := thresholdByRatio

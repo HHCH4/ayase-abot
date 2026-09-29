@@ -23,20 +23,66 @@ var (
 const (
 	// 以下键是独立可清除的会话覆盖项；它们对应 WebUI 表单字段和 Runtime
 	// 能理解的内置配置，不包含任何外部插件执行器。
-	OverrideProcessEnabled  = "process_enabled"
-	OverrideLLMEnabled      = "llm_enabled"
-	OverrideTTSEnabled      = "tts_enabled"
-	OverrideNote            = "note"
-	OverrideChatModel       = "chat_model"
-	OverrideSTTModel        = "stt_model"
-	OverrideTTSModel        = "tts_model"
-	OverrideFollowProfile   = "follow_profile"
-	OverrideProfileID       = "profile_id"
-	OverridePersonaID       = "persona_id"
-	OverrideDisabledPlugins = "disabled_plugins"
-	OverrideKnowledgeBases  = "knowledge_bases"
-	OverrideKnowledgeTopK   = "knowledge_top_k"
-	OverrideKnowledgeRerank = "knowledge_rerank"
+	OverrideProcessEnabled              = "process_enabled"
+	OverrideLLMEnabled                  = "llm_enabled"
+	OverrideTTSEnabled                  = "tts_enabled"
+	OverrideNote                        = "note"
+	OverrideChatModel                   = "chat_model"
+	OverrideSTTModel                    = "stt_model"
+	OverrideTTSModel                    = "tts_model"
+	OverrideFollowProfile               = "follow_profile"
+	OverrideProfileID                   = "profile_id"
+	OverridePersonaID                   = "persona_id"
+	OverrideDisabledPlugins             = "disabled_plugins"
+	OverrideKnowledgeBases              = "knowledge_bases"
+	OverrideKnowledgeTopK               = "knowledge_top_k"
+	OverrideKnowledgeRerank             = "knowledge_rerank"
+	OverridePrivateMode                 = "private_mode"
+	OverrideGroupParticipationMode      = "group_participation_mode"
+	OverrideRecordUnaddressedMessages   = "record_unaddressed_messages"
+	OverrideReactionEnabled             = "reaction_enabled"
+	OverrideGroupContextEnabled         = "group_context_enabled"
+	OverrideProactiveEnabled            = "proactive_enabled"
+	OverridePrivateHourlyReplyLimit     = "private_hourly_reply_limit"
+	OverrideGroupHourlyReplyLimit       = "group_hourly_reply_limit"
+	OverrideQuietHoursTimezone          = "quiet_hours_timezone"
+	OverrideQuietHoursStart             = "quiet_hours_start"
+	OverrideQuietHoursEnd               = "quiet_hours_end"
+	OverrideEmergencyBypassQuietHours   = "emergency_bypass_quiet_hours"
+	OverrideReplyQuote                  = "reply_quote"
+	OverridePrivateReplyQuote           = "private_reply_quote"
+	OverrideFollowUpEnabled             = "follow_up_enabled"
+	OverrideRelationEnabled             = "relation_enabled"
+	OverrideRuntimeEnabled              = "runtime_enabled"
+	OverrideRuntimeMaxConcurrency       = "runtime_max_concurrency"
+	OverrideSourceQueueLimit            = "source_queue_limit"
+	OverrideTurnWaitMilliseconds        = "turn_wait_ms"
+	OverrideGroupTurnWaitMilliseconds   = "group_turn_wait_ms"
+	OverrideAttachmentWaitMilliseconds  = "attachment_wait_ms"
+	OverrideMaxTurnMessages             = "max_turn_messages"
+	OverrideGroupMessageMaxCount        = "group_message_max_count"
+	OverrideGroupImageCaption           = "group_image_caption"
+	OverrideGroupImageCaptionModel      = "group_image_caption_model"
+	OverrideProactiveDegree             = "proactive_degree"
+	OverrideCooldownSeconds             = "cooldown_seconds"
+	OverrideHeartbeatSeconds            = "heartbeat_seconds"
+	OverrideRelationRetentionSeconds    = "relation_retention_seconds"
+	OverrideFollowUpMax                 = "follow_up_max"
+	OverrideFollowUpMaxRetries          = "follow_up_max_retries"
+	OverrideFollowUpRetryDelaySeconds   = "follow_up_retry_delay_seconds"
+	OverrideFollowUpMaxDelaySeconds     = "follow_up_max_delay_seconds"
+	OverrideFollowUpAllowedSources      = "follow_up_allowed_sources"
+	OverrideExpressionEnabled           = "expression_enabled"
+	OverrideExpressionMaxSegments       = "expression_max_segments"
+	OverrideExpressionLongThreshold     = "expression_long_threshold"
+	OverrideExpressionDelayMilliseconds = "expression_delay_ms"
+	OverrideReplyMention                = "reply_mention"
+	OverrideAgentOnDemandEnabled        = "agent_on_demand_enabled"
+	OverrideAllowedReadOnlyTools        = "allowed_read_only_tools"
+	OverrideToolBudget                  = "tool_budget"
+	OverrideSubAgentEnabled             = "subagent_enabled"
+	OverrideActionPermissions           = "action_permissions"
+	OverrideMessageStyle                = "message_style"
 )
 
 // Rule 是一个消息会话来源的独立覆盖规则。来源使用 UMO 或 /sid 返回的稳定标识。
@@ -56,9 +102,59 @@ type Rule struct {
 	KnowledgeBases  []string `json:"knowledge_bases,omitempty"`
 	KnowledgeTopK   int      `json:"knowledge_top_k"`
 	KnowledgeRerank bool     `json:"knowledge_rerank"`
+	// 以下字段是按来源生效的 Bot Runtime 策略。它们与模型/人格同属会话规则，
+	// 通过 ConfiguredFields 区分“明确关闭”与“继续继承机器人配置”。
+	PrivateMode               string `json:"private_mode,omitempty"`
+	GroupParticipationMode    string `json:"group_participation_mode,omitempty"`
+	RecordUnaddressedMessages bool   `json:"record_unaddressed_messages"`
+	ReactionEnabled           bool   `json:"reaction_enabled"`
+	GroupContextEnabled       bool   `json:"group_context_enabled"`
+	ProactiveEnabled          bool   `json:"proactive_enabled"`
+	PrivateHourlyReplyLimit   int    `json:"private_hourly_reply_limit"`
+	GroupHourlyReplyLimit     int    `json:"group_hourly_reply_limit"`
+	QuietHoursTimezone        string `json:"quiet_hours_timezone,omitempty"`
+	QuietHoursStart           string `json:"quiet_hours_start,omitempty"`
+	QuietHoursEnd             string `json:"quiet_hours_end,omitempty"`
+	EmergencyBypassQuietHours bool   `json:"emergency_bypass_quiet_hours"`
+	ReplyQuote                bool   `json:"reply_quote"`
+	PrivateReplyQuote         bool   `json:"private_reply_quote"`
+	FollowUpEnabled           bool   `json:"follow_up_enabled"`
+	RelationEnabled           bool   `json:"relation_enabled"`
+	// 以下字段把机器人级 Bot Runtime 的可覆盖项完整映射到会话来源，
+	// 这样 WebUI 规则不会出现“可以保存但运行时不生效”的假配置。
+	RuntimeEnabled              bool            `json:"runtime_enabled"`
+	RuntimeMaxConcurrency       int             `json:"runtime_max_concurrency"`
+	SourceQueueLimit            int             `json:"source_queue_limit"`
+	TurnWaitMilliseconds        int             `json:"turn_wait_ms"`
+	GroupTurnWaitMilliseconds   int             `json:"group_turn_wait_ms"`
+	AttachmentWaitMilliseconds  int             `json:"attachment_wait_ms"`
+	MaxTurnMessages             int             `json:"max_turn_messages"`
+	GroupMessageMaxCount        int             `json:"group_message_max_count"`
+	GroupImageCaption           bool            `json:"group_image_caption"`
+	GroupImageCaptionModel      string          `json:"group_image_caption_model,omitempty"`
+	ProactiveDegree             string          `json:"proactive_degree,omitempty"`
+	CooldownSeconds             int             `json:"cooldown_seconds"`
+	HeartbeatSeconds            int             `json:"heartbeat_seconds"`
+	RelationRetentionSeconds    int             `json:"relation_retention_seconds"`
+	FollowUpMax                 int             `json:"follow_up_max"`
+	FollowUpMaxRetries          int             `json:"follow_up_max_retries"`
+	FollowUpRetryDelaySeconds   int             `json:"follow_up_retry_delay_seconds"`
+	FollowUpMaxDelaySeconds     int             `json:"follow_up_max_delay_seconds"`
+	FollowUpAllowedSources      []string        `json:"follow_up_allowed_sources,omitempty"`
+	ExpressionEnabled           bool            `json:"expression_enabled"`
+	ExpressionMaxSegments       int             `json:"expression_max_segments"`
+	ExpressionLongThreshold     int             `json:"expression_long_threshold"`
+	ExpressionDelayMilliseconds int             `json:"expression_delay_ms"`
+	ReplyMention                bool            `json:"reply_mention"`
+	AgentOnDemandEnabled        bool            `json:"agent_on_demand_enabled"`
+	AllowedReadOnlyTools        []string        `json:"allowed_read_only_tools,omitempty"`
+	ToolBudget                  int             `json:"tool_budget"`
+	SubAgentEnabled             bool            `json:"subagent_enabled"`
+	ActionPermissions           map[string]bool `json:"action_permissions,omitempty"`
+	MessageStyle                string          `json:"message_style,omitempty"`
 	// ConfiguredFields 区分“该字段覆盖了全局配置”和“该字段恢复继承”。
-	// nil 表示旧版本整行规则，读取时按所有字段兼容；非 nil（包括空切片）
-	// 表示新版本逐项覆盖状态。
+	// 空值表示本条规则没有任何显式覆盖；所有运行时字段都必须通过该集合
+	// 明确开启，避免旧配置零值在破坏性迁移后意外关闭新行为。
 	ConfiguredFields []string  `json:"configured_fields,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
@@ -170,11 +266,6 @@ func (s *Service) Save(ctx context.Context, item Rule) (Rule, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	item = normalizeRule(item)
-	if item.ConfiguredFields == nil {
-		// 旧调用方直接构造 Rule 时保持原有“整行覆盖”语义；HTTP 新建规则
-		// 会显式传入空切片，从而可以真正支持逐项清除。
-		item.ConfiguredFields = allOverrideKeys()
-	}
 	if err := validateRule(item); err != nil {
 		return Rule{}, err
 	}
@@ -211,10 +302,6 @@ func (s *Service) ResetField(ctx context.Context, source, key string) error {
 	item, err := s.repository.Get(ctx, source)
 	if err != nil {
 		return err
-	}
-	if item.ConfiguredFields == nil {
-		// 旧数据没有逐项掩码，先把它视为所有字段已配置，再移除当前项。
-		item.ConfiguredFields = allOverrideKeys()
 	}
 	item.ConfiguredFields = removeString(item.ConfiguredFields, key)
 	if len(item.ConfiguredFields) == 0 {
@@ -434,8 +521,28 @@ func normalizeRule(item Rule) Rule {
 	item.TTSModel = strings.TrimSpace(item.TTSModel)
 	item.ProfileID = strings.TrimSpace(item.ProfileID)
 	item.PersonaID = strings.TrimSpace(item.PersonaID)
+	item.PrivateMode = strings.TrimSpace(item.PrivateMode)
+	item.GroupParticipationMode = strings.TrimSpace(item.GroupParticipationMode)
+	item.QuietHoursTimezone = strings.TrimSpace(item.QuietHoursTimezone)
+	item.QuietHoursStart = strings.TrimSpace(item.QuietHoursStart)
+	item.QuietHoursEnd = strings.TrimSpace(item.QuietHoursEnd)
+	item.GroupImageCaptionModel = strings.TrimSpace(item.GroupImageCaptionModel)
+	item.ProactiveDegree = strings.TrimSpace(item.ProactiveDegree)
+	item.MessageStyle = strings.TrimSpace(item.MessageStyle)
 	item.DisabledPlugins = uniqueStrings(item.DisabledPlugins)
 	item.KnowledgeBases = uniqueStrings(item.KnowledgeBases)
+	item.FollowUpAllowedSources = uniqueStrings(item.FollowUpAllowedSources)
+	item.AllowedReadOnlyTools = uniqueStrings(item.AllowedReadOnlyTools)
+	if item.ActionPermissions != nil {
+		permissions := make(map[string]bool, len(item.ActionPermissions))
+		for key, enabled := range item.ActionPermissions {
+			key = strings.TrimSpace(key)
+			if key != "" {
+				permissions[key] = enabled
+			}
+		}
+		item.ActionPermissions = permissions
+	}
 	if item.ConfiguredFields != nil {
 		item.ConfiguredFields = uniqueStrings(item.ConfiguredFields)
 	}
@@ -445,12 +552,9 @@ func normalizeRule(item Rule) Rule {
 	return item
 }
 
-// HasOverride 判断一个规则字段是否真正覆盖全局配置；旧数据没有掩码时按
-// 全部字段兼容，避免升级后历史规则突然失效。
+// HasOverride 判断一个规则字段是否真正覆盖全局配置。破坏性迁移后不再根据
+// 旧规则的整行零值猜测覆盖范围，只有 WebUI/HTTP 明确标记的字段才会生效。
 func (item Rule) HasOverride(key string) bool {
-	if item.ConfiguredFields == nil {
-		return isOverrideKey(key)
-	}
 	for _, configured := range item.ConfiguredFields {
 		if configured == key {
 			return true
@@ -459,22 +563,15 @@ func (item Rule) HasOverride(key string) bool {
 	return false
 }
 
-// MarkOverride 将一个 HTTP 表单字段标记为显式覆盖；旧规则没有掩码时先
-// 按兼容语义初始化为全量覆盖，避免部分更新把历史字段意外清空。
+// MarkOverride 将一个 HTTP 表单字段标记为显式覆盖；未标记的字段保持继承。
 func (item *Rule) MarkOverride(key string) {
 	if item == nil || !isOverrideKey(key) {
 		return
 	}
-	item.ConfiguredFields = addString(item.ConfiguredFields, key)
-}
-
-func allOverrideKeys() []string {
-	return []string{
-		OverrideProcessEnabled, OverrideLLMEnabled, OverrideTTSEnabled, OverrideNote,
-		OverrideChatModel, OverrideSTTModel, OverrideTTSModel, OverrideFollowProfile,
-		OverrideProfileID, OverridePersonaID, OverrideDisabledPlugins, OverrideKnowledgeBases,
-		OverrideKnowledgeTopK, OverrideKnowledgeRerank,
+	if item.ConfiguredFields == nil {
+		item.ConfiguredFields = make([]string, 0, 1)
 	}
+	item.ConfiguredFields = addString(item.ConfiguredFields, key)
 }
 
 func isOverrideKey(key string) bool {
@@ -486,10 +583,33 @@ func isOverrideKey(key string) bool {
 	return false
 }
 
-func addString(values []string, value string) []string {
-	if values == nil {
-		values = allOverrideKeys()
+// allOverrideKeys 只用于校验 HTTP 清除字段，字段是否真正生效仍由
+// ConfiguredFields 决定，不会把整条规则误判为全量覆盖。
+func allOverrideKeys() []string {
+	return []string{
+		OverrideProcessEnabled, OverrideLLMEnabled, OverrideTTSEnabled, OverrideNote,
+		OverrideChatModel, OverrideSTTModel, OverrideTTSModel, OverrideFollowProfile,
+		OverrideProfileID, OverridePersonaID, OverrideDisabledPlugins, OverrideKnowledgeBases,
+		OverrideKnowledgeTopK, OverrideKnowledgeRerank, OverridePrivateMode, OverrideGroupParticipationMode,
+		OverrideRecordUnaddressedMessages, OverrideReactionEnabled, OverrideGroupContextEnabled,
+		OverrideProactiveEnabled, OverridePrivateHourlyReplyLimit, OverrideGroupHourlyReplyLimit,
+		OverrideQuietHoursTimezone, OverrideQuietHoursStart, OverrideQuietHoursEnd,
+		OverrideEmergencyBypassQuietHours, OverrideReplyQuote, OverridePrivateReplyQuote,
+		OverrideFollowUpEnabled, OverrideRelationEnabled, OverrideRuntimeEnabled,
+		OverrideRuntimeMaxConcurrency, OverrideSourceQueueLimit, OverrideTurnWaitMilliseconds,
+		OverrideGroupTurnWaitMilliseconds, OverrideAttachmentWaitMilliseconds, OverrideMaxTurnMessages,
+		OverrideGroupMessageMaxCount, OverrideGroupImageCaption, OverrideGroupImageCaptionModel,
+		OverrideProactiveDegree, OverrideCooldownSeconds, OverrideHeartbeatSeconds,
+		OverrideRelationRetentionSeconds, OverrideFollowUpMax, OverrideFollowUpMaxRetries,
+		OverrideFollowUpRetryDelaySeconds, OverrideFollowUpMaxDelaySeconds, OverrideFollowUpAllowedSources,
+		OverrideExpressionEnabled, OverrideExpressionMaxSegments, OverrideExpressionLongThreshold,
+		OverrideExpressionDelayMilliseconds, OverrideReplyMention, OverrideAgentOnDemandEnabled,
+		OverrideAllowedReadOnlyTools, OverrideToolBudget, OverrideSubAgentEnabled,
+		OverrideActionPermissions, OverrideMessageStyle,
 	}
+}
+
+func addString(values []string, value string) []string {
 	for _, item := range values {
 		if item == value {
 			return values
@@ -525,6 +645,79 @@ func validateRule(item Rule) error {
 	}
 	if item.KnowledgeTopK < 1 || item.KnowledgeTopK > 100 {
 		return fmt.Errorf("%w: 知识库 Top K 必须在 1-100 之间", ErrInvalidRequest)
+	}
+	if item.PrivateMode != "" && item.PrivateMode != "responsive" && item.PrivateMode != "observe_only" {
+		return fmt.Errorf("%w: private_mode 无效", ErrInvalidRequest)
+	}
+	if item.GroupParticipationMode != "" && item.GroupParticipationMode != "addressed_only" && item.GroupParticipationMode != "observe_only" {
+		return fmt.Errorf("%w: group_participation_mode 无效", ErrInvalidRequest)
+	}
+	if item.PrivateHourlyReplyLimit < 0 || item.PrivateHourlyReplyLimit > 100000 || item.GroupHourlyReplyLimit < 0 || item.GroupHourlyReplyLimit > 100000 {
+		return fmt.Errorf("%w: 每小时主动回复上限必须在 0-100000 之间", ErrInvalidRequest)
+	}
+	if item.QuietHoursTimezone != "" {
+		if _, err := time.LoadLocation(item.QuietHoursTimezone); err != nil {
+			return fmt.Errorf("%w: quiet_hours_timezone 无效", ErrInvalidRequest)
+		}
+	}
+	if item.ProactiveDegree != "" && item.ProactiveDegree != "off" && item.ProactiveDegree != "low" && item.ProactiveDegree != "normal" && item.ProactiveDegree != "high" {
+		return fmt.Errorf("%w: proactive_degree 无效", ErrInvalidRequest)
+	}
+	if item.MessageStyle != "" && item.MessageStyle != "natural" && item.MessageStyle != "structured" {
+		return fmt.Errorf("%w: message_style 无效", ErrInvalidRequest)
+	}
+	intRanges := []struct {
+		name  string
+		value int
+		min   int
+		max   int
+	}{
+		{"runtime_max_concurrency", item.RuntimeMaxConcurrency, 1, 64},
+		{"source_queue_limit", item.SourceQueueLimit, 1, 10000},
+		{"turn_wait_ms", item.TurnWaitMilliseconds, 0, 120000},
+		{"group_turn_wait_ms", item.GroupTurnWaitMilliseconds, 0, 120000},
+		{"attachment_wait_ms", item.AttachmentWaitMilliseconds, 0, 180000},
+		{"max_turn_messages", item.MaxTurnMessages, 1, 100},
+		{"group_message_max_count", item.GroupMessageMaxCount, 1, 300},
+		{"cooldown_seconds", item.CooldownSeconds, 0, 604800},
+		{"heartbeat_seconds", item.HeartbeatSeconds, 5, 86400},
+		{"relation_retention_seconds", item.RelationRetentionSeconds, 3600, 31536000},
+		{"follow_up_max", item.FollowUpMax, 1, 10000},
+		{"follow_up_max_retries", item.FollowUpMaxRetries, 0, 10},
+		{"follow_up_retry_delay_seconds", item.FollowUpRetryDelaySeconds, 0, 86400},
+		{"follow_up_max_delay_seconds", item.FollowUpMaxDelaySeconds, 0, 604800},
+		{"expression_max_segments", item.ExpressionMaxSegments, 1, 8},
+		{"expression_long_threshold", item.ExpressionLongThreshold, 100, 10000},
+		{"expression_delay_ms", item.ExpressionDelayMilliseconds, 0, 5000},
+		{"tool_budget", item.ToolBudget, 0, 100},
+	}
+	for _, candidate := range intRanges {
+		// 新规则只有显式标记的字段才校验零值；未配置字段使用零值占位，
+		// 不能因为继承状态而被错误判成超出最小值。非零历史值仍然校验，
+		// 防止旧数据把明显越界的配置带入运行时。
+		if candidate.value == 0 && !item.HasOverride(candidate.name) {
+			continue
+		}
+		if candidate.value < candidate.min || candidate.value > candidate.max {
+			return fmt.Errorf("%w: %s 必须在 %d-%d 之间", ErrInvalidRequest, candidate.name, candidate.min, candidate.max)
+		}
+	}
+	knownActions := map[string]struct{}{"send_text": {}, "send_image": {}, "send_audio": {}, "send_file": {}, "add_reaction": {}, "poke": {}, "recall_message": {}, "start_agent": {}, "create_follow_up": {}, "update_relation": {}, "update_source_state": {}}
+	for action := range item.ActionPermissions {
+		if _, ok := knownActions[action]; !ok {
+			return fmt.Errorf("%w: action_permissions 包含未知动作 %q", ErrInvalidRequest, action)
+		}
+	}
+	if item.QuietHoursStart != "" || item.QuietHoursEnd != "" {
+		if item.QuietHoursStart == "" || item.QuietHoursEnd == "" {
+			return fmt.Errorf("%w: 安静时段开始和结束必须同时设置", ErrInvalidRequest)
+		}
+		if _, err := time.Parse("15:04", item.QuietHoursStart); err != nil {
+			return fmt.Errorf("%w: quiet_hours_start 必须是 HH:MM", ErrInvalidRequest)
+		}
+		if _, err := time.Parse("15:04", item.QuietHoursEnd); err != nil {
+			return fmt.Errorf("%w: quiet_hours_end 必须是 HH:MM", ErrInvalidRequest)
+		}
 	}
 	return nil
 }

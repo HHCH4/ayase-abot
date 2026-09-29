@@ -11,6 +11,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"Abot/internal/provider"
 )
@@ -66,6 +67,7 @@ type RuntimeOptionsSnapshot struct {
 	// Pointer distinguishes an explicit false from a malformed/incomplete snapshot;
 	// runtime validation requires the switch to be present and match current settings.
 	SubAgentEnabled                *bool    `json:"subagent_enabled,omitempty"`
+	Timezone                       string   `json:"timezone,omitempty"`
 	AITemperature                  float64  `json:"ai_temperature"`
 	AIReasoningEffort              string   `json:"ai_reasoning_effort,omitempty"`
 	AITopP                         float64  `json:"ai_top_p"`
@@ -187,6 +189,7 @@ func runtimeOptionsSnapshot(runtime RuntimeOptions) RuntimeOptionsSnapshot {
 	return RuntimeOptionsSnapshot{
 		AIEnabled:                      runtime.AIEnabled,
 		SubAgentEnabled:                &subAgentEnabled,
+		Timezone:                       strings.TrimSpace(runtime.Timezone),
 		AITemperature:                  runtime.AITemperature,
 		AIReasoningEffort:              runtime.AIReasoningEffort,
 		AITopP:                         runtime.AITopP,
@@ -341,12 +344,18 @@ func validateRuntimeOptionsSnapshot(options RuntimeOptionsSnapshot) error {
 	}
 	for name, value := range map[string]string{
 		"ai_reasoning_effort":         options.AIReasoningEffort,
+		"timezone":                    options.Timezone,
 		"modal_fallback_provider_id":  options.ModalFallbackProviderID,
 		"modal_fallback_vision_model": options.ModalFallbackVisionModel,
 		"modal_fallback_audio_model":  options.ModalFallbackAudioModel,
 	} {
 		if len(value) > 128 {
 			return fmt.Errorf("%w: %s 超出长度限制", ErrInvalidRuntimeConfigSnapshot, name)
+		}
+	}
+	if options.Timezone != "" {
+		if _, err := time.LoadLocation(options.Timezone); err != nil {
+			return fmt.Errorf("%w: timezone 无效", ErrInvalidRuntimeConfigSnapshot)
 		}
 	}
 	if value := options.SubAgent; value != nil {

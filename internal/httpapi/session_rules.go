@@ -11,21 +11,67 @@ import (
 
 // sessionRulePayload 使用指针字段支持编辑页只提交发生变化的开关。
 type sessionRulePayload struct {
-	Source          string    `json:"source"`
-	ProcessEnabled  *bool     `json:"process_enabled"`
-	LLMEnabled      *bool     `json:"llm_enabled"`
-	TTSEnabled      *bool     `json:"tts_enabled"`
-	Note            *string   `json:"note"`
-	ChatModel       *string   `json:"chat_model"`
-	STTModel        *string   `json:"stt_model"`
-	TTSModel        *string   `json:"tts_model"`
-	FollowProfile   *bool     `json:"follow_profile"`
-	ProfileID       *string   `json:"profile_id"`
-	PersonaID       *string   `json:"persona_id"`
-	DisabledPlugins *[]string `json:"disabled_plugins"`
-	KnowledgeBases  *[]string `json:"knowledge_bases"`
-	KnowledgeTopK   *int      `json:"knowledge_top_k"`
-	KnowledgeRerank *bool     `json:"knowledge_rerank"`
+	Source                      string           `json:"source"`
+	ProcessEnabled              *bool            `json:"process_enabled"`
+	LLMEnabled                  *bool            `json:"llm_enabled"`
+	TTSEnabled                  *bool            `json:"tts_enabled"`
+	Note                        *string          `json:"note"`
+	ChatModel                   *string          `json:"chat_model"`
+	STTModel                    *string          `json:"stt_model"`
+	TTSModel                    *string          `json:"tts_model"`
+	FollowProfile               *bool            `json:"follow_profile"`
+	ProfileID                   *string          `json:"profile_id"`
+	PersonaID                   *string          `json:"persona_id"`
+	DisabledPlugins             *[]string        `json:"disabled_plugins"`
+	KnowledgeBases              *[]string        `json:"knowledge_bases"`
+	KnowledgeTopK               *int             `json:"knowledge_top_k"`
+	KnowledgeRerank             *bool            `json:"knowledge_rerank"`
+	PrivateMode                 *string          `json:"private_mode"`
+	GroupParticipationMode      *string          `json:"group_participation_mode"`
+	RecordUnaddressedMessages   *bool            `json:"record_unaddressed_messages"`
+	ReactionEnabled             *bool            `json:"reaction_enabled"`
+	GroupContextEnabled         *bool            `json:"group_context_enabled"`
+	ProactiveEnabled            *bool            `json:"proactive_enabled"`
+	PrivateHourlyReplyLimit     *int             `json:"private_hourly_reply_limit"`
+	GroupHourlyReplyLimit       *int             `json:"group_hourly_reply_limit"`
+	QuietHoursTimezone          *string          `json:"quiet_hours_timezone"`
+	QuietHoursStart             *string          `json:"quiet_hours_start"`
+	QuietHoursEnd               *string          `json:"quiet_hours_end"`
+	EmergencyBypassQuietHours   *bool            `json:"emergency_bypass_quiet_hours"`
+	ReplyQuote                  *bool            `json:"reply_quote"`
+	PrivateReplyQuote           *bool            `json:"private_reply_quote"`
+	FollowUpEnabled             *bool            `json:"follow_up_enabled"`
+	RelationEnabled             *bool            `json:"relation_enabled"`
+	RuntimeEnabled              *bool            `json:"runtime_enabled"`
+	RuntimeMaxConcurrency       *int             `json:"runtime_max_concurrency"`
+	SourceQueueLimit            *int             `json:"source_queue_limit"`
+	TurnWaitMilliseconds        *int             `json:"turn_wait_ms"`
+	GroupTurnWaitMilliseconds   *int             `json:"group_turn_wait_ms"`
+	AttachmentWaitMilliseconds  *int             `json:"attachment_wait_ms"`
+	MaxTurnMessages             *int             `json:"max_turn_messages"`
+	GroupMessageMaxCount        *int             `json:"group_message_max_count"`
+	GroupImageCaption           *bool            `json:"group_image_caption"`
+	GroupImageCaptionModel      *string          `json:"group_image_caption_model"`
+	ProactiveDegree             *string          `json:"proactive_degree"`
+	CooldownSeconds             *int             `json:"cooldown_seconds"`
+	HeartbeatSeconds            *int             `json:"heartbeat_seconds"`
+	RelationRetentionSeconds    *int             `json:"relation_retention_seconds"`
+	FollowUpMax                 *int             `json:"follow_up_max"`
+	FollowUpMaxRetries          *int             `json:"follow_up_max_retries"`
+	FollowUpRetryDelaySeconds   *int             `json:"follow_up_retry_delay_seconds"`
+	FollowUpMaxDelaySeconds     *int             `json:"follow_up_max_delay_seconds"`
+	FollowUpAllowedSources      *[]string        `json:"follow_up_allowed_sources"`
+	ExpressionEnabled           *bool            `json:"expression_enabled"`
+	ExpressionMaxSegments       *int             `json:"expression_max_segments"`
+	ExpressionLongThreshold     *int             `json:"expression_long_threshold"`
+	ExpressionDelayMilliseconds *int             `json:"expression_delay_ms"`
+	ReplyMention                *bool            `json:"reply_mention"`
+	AgentOnDemandEnabled        *bool            `json:"agent_on_demand_enabled"`
+	AllowedReadOnlyTools        *[]string        `json:"allowed_read_only_tools"`
+	ToolBudget                  *int             `json:"tool_budget"`
+	SubAgentEnabled             *bool            `json:"subagent_enabled"`
+	ActionPermissions           *map[string]bool `json:"action_permissions"`
+	MessageStyle                *string          `json:"message_style"`
 }
 
 func (s *Server) requireSessionRules() (*sessionrule.Service, error) {
@@ -290,5 +336,189 @@ func mergeSessionRulePayload(item *sessionrule.Rule, payload sessionRulePayload)
 	if payload.KnowledgeRerank != nil {
 		item.KnowledgeRerank = *payload.KnowledgeRerank
 		item.MarkOverride("knowledge_rerank")
+	}
+	if payload.PrivateMode != nil {
+		item.PrivateMode = *payload.PrivateMode
+		item.MarkOverride(sessionrule.OverridePrivateMode)
+	}
+	if payload.GroupParticipationMode != nil {
+		item.GroupParticipationMode = *payload.GroupParticipationMode
+		item.MarkOverride(sessionrule.OverrideGroupParticipationMode)
+	}
+	if payload.RecordUnaddressedMessages != nil {
+		item.RecordUnaddressedMessages = *payload.RecordUnaddressedMessages
+		item.MarkOverride(sessionrule.OverrideRecordUnaddressedMessages)
+	}
+	if payload.ReactionEnabled != nil {
+		item.ReactionEnabled = *payload.ReactionEnabled
+		item.MarkOverride(sessionrule.OverrideReactionEnabled)
+	}
+	if payload.GroupContextEnabled != nil {
+		item.GroupContextEnabled = *payload.GroupContextEnabled
+		item.MarkOverride(sessionrule.OverrideGroupContextEnabled)
+	}
+	if payload.ProactiveEnabled != nil {
+		item.ProactiveEnabled = *payload.ProactiveEnabled
+		item.MarkOverride(sessionrule.OverrideProactiveEnabled)
+	}
+	if payload.PrivateHourlyReplyLimit != nil {
+		item.PrivateHourlyReplyLimit = *payload.PrivateHourlyReplyLimit
+		item.MarkOverride(sessionrule.OverridePrivateHourlyReplyLimit)
+	}
+	if payload.GroupHourlyReplyLimit != nil {
+		item.GroupHourlyReplyLimit = *payload.GroupHourlyReplyLimit
+		item.MarkOverride(sessionrule.OverrideGroupHourlyReplyLimit)
+	}
+	if payload.QuietHoursTimezone != nil {
+		item.QuietHoursTimezone = *payload.QuietHoursTimezone
+		item.MarkOverride(sessionrule.OverrideQuietHoursTimezone)
+	}
+	if payload.QuietHoursStart != nil {
+		item.QuietHoursStart = *payload.QuietHoursStart
+		item.MarkOverride(sessionrule.OverrideQuietHoursStart)
+	}
+	if payload.QuietHoursEnd != nil {
+		item.QuietHoursEnd = *payload.QuietHoursEnd
+		item.MarkOverride(sessionrule.OverrideQuietHoursEnd)
+	}
+	if payload.EmergencyBypassQuietHours != nil {
+		item.EmergencyBypassQuietHours = *payload.EmergencyBypassQuietHours
+		item.MarkOverride(sessionrule.OverrideEmergencyBypassQuietHours)
+	}
+	if payload.ReplyQuote != nil {
+		item.ReplyQuote = *payload.ReplyQuote
+		item.MarkOverride(sessionrule.OverrideReplyQuote)
+	}
+	if payload.PrivateReplyQuote != nil {
+		item.PrivateReplyQuote = *payload.PrivateReplyQuote
+		item.MarkOverride(sessionrule.OverridePrivateReplyQuote)
+	}
+	if payload.FollowUpEnabled != nil {
+		item.FollowUpEnabled = *payload.FollowUpEnabled
+		item.MarkOverride(sessionrule.OverrideFollowUpEnabled)
+	}
+	if payload.RelationEnabled != nil {
+		item.RelationEnabled = *payload.RelationEnabled
+		item.MarkOverride(sessionrule.OverrideRelationEnabled)
+	}
+	if payload.RuntimeEnabled != nil {
+		item.RuntimeEnabled = *payload.RuntimeEnabled
+		item.MarkOverride(sessionrule.OverrideRuntimeEnabled)
+	}
+	if payload.RuntimeMaxConcurrency != nil {
+		item.RuntimeMaxConcurrency = *payload.RuntimeMaxConcurrency
+		item.MarkOverride(sessionrule.OverrideRuntimeMaxConcurrency)
+	}
+	if payload.SourceQueueLimit != nil {
+		item.SourceQueueLimit = *payload.SourceQueueLimit
+		item.MarkOverride(sessionrule.OverrideSourceQueueLimit)
+	}
+	if payload.TurnWaitMilliseconds != nil {
+		item.TurnWaitMilliseconds = *payload.TurnWaitMilliseconds
+		item.MarkOverride(sessionrule.OverrideTurnWaitMilliseconds)
+	}
+	if payload.GroupTurnWaitMilliseconds != nil {
+		item.GroupTurnWaitMilliseconds = *payload.GroupTurnWaitMilliseconds
+		item.MarkOverride(sessionrule.OverrideGroupTurnWaitMilliseconds)
+	}
+	if payload.AttachmentWaitMilliseconds != nil {
+		item.AttachmentWaitMilliseconds = *payload.AttachmentWaitMilliseconds
+		item.MarkOverride(sessionrule.OverrideAttachmentWaitMilliseconds)
+	}
+	if payload.MaxTurnMessages != nil {
+		item.MaxTurnMessages = *payload.MaxTurnMessages
+		item.MarkOverride(sessionrule.OverrideMaxTurnMessages)
+	}
+	if payload.GroupMessageMaxCount != nil {
+		item.GroupMessageMaxCount = *payload.GroupMessageMaxCount
+		item.MarkOverride(sessionrule.OverrideGroupMessageMaxCount)
+	}
+	if payload.GroupImageCaption != nil {
+		item.GroupImageCaption = *payload.GroupImageCaption
+		item.MarkOverride(sessionrule.OverrideGroupImageCaption)
+	}
+	if payload.GroupImageCaptionModel != nil {
+		item.GroupImageCaptionModel = *payload.GroupImageCaptionModel
+		item.MarkOverride(sessionrule.OverrideGroupImageCaptionModel)
+	}
+	if payload.ProactiveDegree != nil {
+		item.ProactiveDegree = *payload.ProactiveDegree
+		item.MarkOverride(sessionrule.OverrideProactiveDegree)
+	}
+	if payload.CooldownSeconds != nil {
+		item.CooldownSeconds = *payload.CooldownSeconds
+		item.MarkOverride(sessionrule.OverrideCooldownSeconds)
+	}
+	if payload.HeartbeatSeconds != nil {
+		item.HeartbeatSeconds = *payload.HeartbeatSeconds
+		item.MarkOverride(sessionrule.OverrideHeartbeatSeconds)
+	}
+	if payload.RelationRetentionSeconds != nil {
+		item.RelationRetentionSeconds = *payload.RelationRetentionSeconds
+		item.MarkOverride(sessionrule.OverrideRelationRetentionSeconds)
+	}
+	if payload.FollowUpMax != nil {
+		item.FollowUpMax = *payload.FollowUpMax
+		item.MarkOverride(sessionrule.OverrideFollowUpMax)
+	}
+	if payload.FollowUpMaxRetries != nil {
+		item.FollowUpMaxRetries = *payload.FollowUpMaxRetries
+		item.MarkOverride(sessionrule.OverrideFollowUpMaxRetries)
+	}
+	if payload.FollowUpRetryDelaySeconds != nil {
+		item.FollowUpRetryDelaySeconds = *payload.FollowUpRetryDelaySeconds
+		item.MarkOverride(sessionrule.OverrideFollowUpRetryDelaySeconds)
+	}
+	if payload.FollowUpMaxDelaySeconds != nil {
+		item.FollowUpMaxDelaySeconds = *payload.FollowUpMaxDelaySeconds
+		item.MarkOverride(sessionrule.OverrideFollowUpMaxDelaySeconds)
+	}
+	if payload.FollowUpAllowedSources != nil {
+		item.FollowUpAllowedSources = *payload.FollowUpAllowedSources
+		item.MarkOverride(sessionrule.OverrideFollowUpAllowedSources)
+	}
+	if payload.ExpressionEnabled != nil {
+		item.ExpressionEnabled = *payload.ExpressionEnabled
+		item.MarkOverride(sessionrule.OverrideExpressionEnabled)
+	}
+	if payload.ExpressionMaxSegments != nil {
+		item.ExpressionMaxSegments = *payload.ExpressionMaxSegments
+		item.MarkOverride(sessionrule.OverrideExpressionMaxSegments)
+	}
+	if payload.ExpressionLongThreshold != nil {
+		item.ExpressionLongThreshold = *payload.ExpressionLongThreshold
+		item.MarkOverride(sessionrule.OverrideExpressionLongThreshold)
+	}
+	if payload.ExpressionDelayMilliseconds != nil {
+		item.ExpressionDelayMilliseconds = *payload.ExpressionDelayMilliseconds
+		item.MarkOverride(sessionrule.OverrideExpressionDelayMilliseconds)
+	}
+	if payload.ReplyMention != nil {
+		item.ReplyMention = *payload.ReplyMention
+		item.MarkOverride(sessionrule.OverrideReplyMention)
+	}
+	if payload.AgentOnDemandEnabled != nil {
+		item.AgentOnDemandEnabled = *payload.AgentOnDemandEnabled
+		item.MarkOverride(sessionrule.OverrideAgentOnDemandEnabled)
+	}
+	if payload.AllowedReadOnlyTools != nil {
+		item.AllowedReadOnlyTools = *payload.AllowedReadOnlyTools
+		item.MarkOverride(sessionrule.OverrideAllowedReadOnlyTools)
+	}
+	if payload.ToolBudget != nil {
+		item.ToolBudget = *payload.ToolBudget
+		item.MarkOverride(sessionrule.OverrideToolBudget)
+	}
+	if payload.SubAgentEnabled != nil {
+		item.SubAgentEnabled = *payload.SubAgentEnabled
+		item.MarkOverride(sessionrule.OverrideSubAgentEnabled)
+	}
+	if payload.ActionPermissions != nil {
+		item.ActionPermissions = *payload.ActionPermissions
+		item.MarkOverride(sessionrule.OverrideActionPermissions)
+	}
+	if payload.MessageStyle != nil {
+		item.MessageStyle = *payload.MessageStyle
+		item.MarkOverride(sessionrule.OverrideMessageStyle)
 	}
 }

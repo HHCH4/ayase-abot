@@ -120,6 +120,7 @@ type Service struct {
 	appName            string
 	artifactDeletion   func(context.Context, string) error
 	invocationDeletion func(context.Context, string, string) error
+	runtimeDeletion    func(context.Context, string, string) error
 	workspaceValidator WorkspaceValidator
 	sourceNameResolver SourceNameResolver
 	mu                 sync.Mutex
@@ -150,6 +151,14 @@ func (s *Service) SetArtifactDeletionHook(hook func(context.Context, string) err
 func (s *Service) SetInvocationDeletionHook(hook func(context.Context, string, string) error) {
 	s.mu.Lock()
 	s.invocationDeletion = hook
+	s.mu.Unlock()
+}
+
+// SetRuntimeDeletionHook 在物理删除会话前清理与该会话关联的 Bot Runtime
+// 投影；来源上下文和关系状态由 Runtime 自己判断是否保留。
+func (s *Service) SetRuntimeDeletionHook(hook func(context.Context, string, string) error) {
+	s.mu.Lock()
+	s.runtimeDeletion = hook
 	s.mu.Unlock()
 }
 
@@ -223,6 +232,27 @@ func (s *Service) Get(ctx context.Context, userID, id string) (Conversation, err
 		return Conversation{}, fmt.Errorf("%w: user_id 和 conversation_id 不能为空", ErrInvalidRequest)
 	}
 	item, err := s.repository.Get(ctx, userID, id)
+	if err != nil {
+		return Conversation{}, err
+	}
+	if item.AppName == "" {
+		item.AppName = s.appName
+	}
+	if err := s.enrichConversation(ctx, &item); err != nil {
+		return Conversation{}, err
+	}
+	return item, nil
+}
+
+// GetByID 读取已知会话的来源元数据，供 Bot Runtime 在尚未拿到用户字段的
+// 配置解析阶段定位 UMO 规则；调用方只能拿到会话配置，不会因此获得删除或
+// 修改权限，破坏性操作仍必须走带 user_id 的接口。
+func (s *Service) GetByID(ctx context.Context, id string) (Conversation, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Conversation{}, fmt.Errorf("%w: conversation_id 不能为空", ErrInvalidRequest)
+	}
+	item, err := s.repository.GetByID(ctx, id)
 	if err != nil {
 		return Conversation{}, err
 	}
@@ -595,6 +625,14 @@ func (s *Service) Delete(ctx context.Context, userID, id string) error {
 	if invocationDeletion != nil {
 		if err := invocationDeletion(ctx, item.UserID, item.ID); err != nil {
 			return fmt.Errorf("取消会话运行中任务失败: %w", err)
+		}
+	}
+	s.mu.Lock()
+	runtimeDeletion := s.runtimeDeletion
+	s.mu.Unlock()
+	if runtimeDeletion != nil {
+		if err := runtimeDeletion(ctx, item.UserID, item.ID); err != nil {
+			return fmt.Errorf("清理会话 Bot Runtime 状态失败: %w", err)
 		}
 	}
 	// 回调期间可能发生并发状态变化，重新读取并加锁后再次校验，避免误删被恢复的会话。

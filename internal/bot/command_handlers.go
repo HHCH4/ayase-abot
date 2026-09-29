@@ -218,6 +218,20 @@ func (m *Manager) dispatchBotCommand(ctx context.Context, bot Bot, message Messa
 		return m.commandSubAgent(ctx, bot, message, authorization)
 	case "workspace":
 		return m.commandWorkspace(ctx, bot, message, authorization)
+	case "sessions":
+		return m.commandSessions(ctx, bot, message, authorization.Arg)
+	case "session archive":
+		return m.commandSessionArchive(ctx, bot, message, authorization.Arg)
+	case "session restore":
+		return m.commandSessionRestore(ctx, bot, message, authorization.Arg)
+	case "session delete":
+		return m.commandSessionDelete(ctx, bot, message, authorization.Arg)
+	case "approvals":
+		return m.commandApprovals(ctx, bot, message, authorization.Arg)
+	case "approve":
+		return m.commandApprovalDecision(ctx, bot, message, authorization.Arg, true)
+	case "reject":
+		return m.commandApprovalDecision(ctx, bot, message, authorization.Arg, false)
 	case "admin list":
 		return m.commandAdminList(ctx, bot, message)
 	case "admin add":
@@ -234,7 +248,7 @@ func (m *Manager) dispatchBotCommand(ctx context.Context, bot Bot, message Messa
 func (m *Manager) commandHelp(ctx context.Context, bot Bot, message Message, authorization commandAuthorization) error {
 	commands, err := m.effectiveCommands(ctx, bot.ID)
 	if err != nil {
-		return err
+		return m.send(ctx, message, "读取指令列表失败："+runtimeUserFacingError(err))
 	}
 	isGroup := isGroupChatType(message.ChatType)
 	text := helpTextFor(commands, isGroup, authorization.GlobalAdmin, authorization.GroupAdmin)
@@ -276,7 +290,7 @@ func (m *Manager) commandSourceName(ctx context.Context, message Message, argume
 	if argument == "" {
 		alias, err := m.sourceName(ctx, source)
 		if err != nil {
-			return m.send(ctx, message, "读取来源名称失败："+trimError(err))
+			return m.send(ctx, message, "读取来源名称失败："+runtimeUserFacingError(err))
 		}
 		if alias == "" {
 			return m.send(ctx, message, "当前来源尚未设置显示名称。\nUMO："+source+"\n用法：/name <显示名称>")
@@ -284,10 +298,10 @@ func (m *Manager) commandSourceName(ctx context.Context, message Message, argume
 		return m.send(ctx, message, "当前来源显示名称："+alias+"\nUMO："+source)
 	}
 	if err := validateSourceName(argument); err != nil {
-		return m.send(ctx, message, "设置来源名称失败："+trimError(err))
+		return m.send(ctx, message, "设置来源名称失败："+runtimeUserFacingError(err))
 	}
 	if err := m.setSourceName(ctx, source, argument); err != nil {
-		return m.send(ctx, message, "设置来源名称失败："+trimError(err))
+		return m.send(ctx, message, "设置来源名称失败："+runtimeUserFacingError(err))
 	}
 	m.recordAudit(ctx, CommandAudit{
 		AdapterID: message.AdapterID, ChatID: message.ChatID, UserID: message.UserID,
@@ -300,7 +314,7 @@ func (m *Manager) commandSourceName(ctx context.Context, message Message, argume
 func (m *Manager) commandStats(ctx context.Context, message Message) error {
 	_, conversationID, err := m.conversationForMessage(ctx, message)
 	if err != nil {
-		return err
+		return m.send(ctx, message, "读取当前会话失败："+runtimeUserFacingError(err))
 	}
 	statsProvider, ok := m.runtimeStatsProvider()
 	if !ok {
@@ -308,7 +322,7 @@ func (m *Manager) commandStats(ctx context.Context, message Message) error {
 	}
 	stats, err := statsProvider.ConversationUsage(ctx, bindingUserID(message), conversationID)
 	if err != nil {
-		return m.send(ctx, message, "读取会话用量失败："+trimError(err))
+		return m.send(ctx, message, "读取会话用量失败："+runtimeUserFacingError(err))
 	}
 	lines := []string{"当前会话 Token 用量：", "会话：" + conversationID, fmt.Sprintf("模型调用：%d", stats.ModelCalls)}
 	if stats.InvocationCount > 0 {
@@ -358,7 +372,7 @@ func (m *Manager) commandDashboardUpdate(ctx context.Context, message Message) e
 	}
 	result, err := updater.UpdateDashboard(ctx)
 	if err != nil {
-		return m.send(ctx, message, "管理台更新检查失败："+trimError(err))
+		return m.send(ctx, message, "管理台更新检查失败："+runtimeUserFacingError(err))
 	}
 	m.recordAudit(ctx, CommandAudit{
 		AdapterID: message.AdapterID, ChatID: message.ChatID, UserID: message.UserID,
@@ -378,7 +392,7 @@ func (m *Manager) commandDashboardUpdate(ctx context.Context, message Message) e
 func (m *Manager) commandConfig(ctx context.Context, bot Bot, message Message, authorization commandAuthorization) error {
 	userID, conversationID, err := m.conversationForMessage(ctx, message)
 	if err != nil {
-		return err
+		return m.send(ctx, message, "读取当前会话失败："+runtimeUserFacingError(err))
 	}
 	lines := []string{"当前会话配置：", "会话：" + conversationID}
 	if info, ok := m.runtimeInfoProvider(); ok {
@@ -431,11 +445,11 @@ func (m *Manager) commandSubAgent(ctx context.Context, bot Bot, message Message,
 	}
 	userID, conversationID, err := m.conversationForMessage(ctx, message)
 	if err != nil {
-		return err
+		return m.send(ctx, message, "读取当前会话失败："+runtimeUserFacingError(err))
 	}
 	enabled, override, defaultEnabled, err := info.SubAgentStatus(ctx, bot.ID, userID, conversationID)
 	if err != nil {
-		return m.send(ctx, message, "读取子 Agent 开关失败："+trimError(err))
+		return m.send(ctx, message, "读取子 Agent 开关失败："+runtimeUserFacingError(err))
 	}
 	argument := strings.ToLower(strings.TrimSpace(authorization.Arg))
 	if argument == "" {
@@ -468,7 +482,7 @@ func (m *Manager) commandSubAgent(ctx context.Context, bot Bot, message Message,
 		return m.send(ctx, message, "当前部署不允许在聊天中切换子 Agent。")
 	}
 	if err := admin.SetSubAgentEnabled(ctx, bot.ID, userID, conversationID, next); err != nil {
-		return m.send(ctx, message, "切换子 Agent 失败："+trimError(err))
+		return m.send(ctx, message, "切换子 Agent 失败："+runtimeUserFacingError(err))
 	}
 	effective := defaultEnabled
 	mode := "跟随全局默认"
@@ -503,17 +517,17 @@ func (m *Manager) commandModel(ctx context.Context, bot Bot, message Message, au
 	}
 	userID, conversationID, err := m.conversationForMessage(ctx, message)
 	if err != nil {
-		return err
+		return m.send(ctx, message, "读取当前会话失败："+runtimeUserFacingError(err))
 	}
 	argument := strings.TrimSpace(authorization.Arg)
 	if argument == "" {
 		_, modelID, modelErr := info.CurrentModel(ctx, bot.ID, userID, conversationID)
 		if modelErr != nil {
-			return err
+			return m.send(ctx, message, "读取当前模型失败："+runtimeUserFacingError(modelErr))
 		}
 		options, optionErr := info.AvailableModels(ctx)
 		if optionErr != nil {
-			return optionErr
+			return m.send(ctx, message, "读取可用模型失败："+runtimeUserFacingError(optionErr))
 		}
 		lines := []string{"当前模型：" + orPlaceholder(modelID)}
 		if len(options) > 0 {
@@ -531,14 +545,14 @@ func (m *Manager) commandModel(ctx context.Context, bot Bot, message Message, au
 	}
 	options, err := info.AvailableModels(ctx)
 	if err != nil {
-		return err
+		return m.send(ctx, message, "读取可用模型失败："+runtimeUserFacingError(err))
 	}
 	selected, found := matchCommandOption(options, argument)
 	if !found {
 		return m.send(ctx, message, "没有找到模型 "+argument+"。发送 /model 查看可用模型。")
 	}
 	if err := admin.SetModel(ctx, bot.ID, userID, conversationID, selected.ID); err != nil {
-		return m.send(ctx, message, "切换模型失败："+trimError(err))
+		return m.send(ctx, message, "切换模型失败："+runtimeUserFacingError(err))
 	}
 	m.recordAudit(ctx, CommandAudit{
 		AdapterID: bot.ID, ChatID: message.ChatID, UserID: message.UserID, Command: "model",
@@ -554,17 +568,17 @@ func (m *Manager) commandPersona(ctx context.Context, bot Bot, message Message, 
 	}
 	userID, conversationID, err := m.conversationForMessage(ctx, message)
 	if err != nil {
-		return err
+		return m.send(ctx, message, "读取当前会话失败："+runtimeUserFacingError(err))
 	}
 	argument := strings.TrimSpace(authorization.Arg)
 	if argument == "" {
 		_, name, personaErr := info.CurrentPersona(ctx, bot.ID, userID, conversationID)
 		if personaErr != nil {
-			return personaErr
+			return m.send(ctx, message, "读取当前人格失败："+runtimeUserFacingError(personaErr))
 		}
 		options, optionErr := info.AvailablePersonas(ctx)
 		if optionErr != nil {
-			return optionErr
+			return m.send(ctx, message, "读取可用人格失败："+runtimeUserFacingError(optionErr))
 		}
 		lines := []string{"当前人格：" + orPlaceholder(name)}
 		if len(options) > 0 {
@@ -582,14 +596,14 @@ func (m *Manager) commandPersona(ctx context.Context, bot Bot, message Message, 
 	}
 	options, err := info.AvailablePersonas(ctx)
 	if err != nil {
-		return err
+		return m.send(ctx, message, "读取可用人格失败："+runtimeUserFacingError(err))
 	}
 	selected, found := matchCommandOption(options, argument)
 	if !found {
 		return m.send(ctx, message, "没有找到人格 "+argument+"。发送 /persona 查看可用人格。")
 	}
 	if err := admin.SetPersona(ctx, bot.ID, userID, conversationID, selected.ID); err != nil {
-		return m.send(ctx, message, "切换人格失败："+trimError(err))
+		return m.send(ctx, message, "切换人格失败："+runtimeUserFacingError(err))
 	}
 	m.recordAudit(ctx, CommandAudit{
 		AdapterID: bot.ID, ChatID: message.ChatID, UserID: message.UserID, Command: "persona",
@@ -605,13 +619,13 @@ func (m *Manager) commandWorkspace(ctx context.Context, bot Bot, message Message
 	}
 	userID, conversationID, err := m.conversationForMessage(ctx, message)
 	if err != nil {
-		return err
+		return m.send(ctx, message, "读取当前会话失败："+runtimeUserFacingError(err))
 	}
 	argument := strings.TrimSpace(authorization.Arg)
 	if argument == "" {
 		workspaceID, name, workspaceErr := info.CurrentWorkspace(ctx, userID, conversationID)
 		if workspaceErr != nil {
-			return workspaceErr
+			return m.send(ctx, message, "读取当前工作区失败："+runtimeUserFacingError(workspaceErr))
 		}
 		current := strings.TrimSpace(name)
 		if current == "" {
@@ -619,7 +633,7 @@ func (m *Manager) commandWorkspace(ctx context.Context, bot Bot, message Message
 		}
 		options, optionErr := info.AvailableWorkspaces(ctx)
 		if optionErr != nil {
-			return optionErr
+			return m.send(ctx, message, "读取可用工作区失败："+runtimeUserFacingError(optionErr))
 		}
 		lines := []string{"当前工作区：" + orPlaceholder(current)}
 		if len(options) > 0 {
@@ -637,14 +651,14 @@ func (m *Manager) commandWorkspace(ctx context.Context, bot Bot, message Message
 	}
 	options, err := info.AvailableWorkspaces(ctx)
 	if err != nil {
-		return err
+		return m.send(ctx, message, "读取可用工作区失败："+runtimeUserFacingError(err))
 	}
 	selected, found := matchCommandOption(options, argument)
 	if !found {
 		return m.send(ctx, message, "没有找到工作区 "+argument+"。发送 /workspace 查看可用工作区。")
 	}
 	if err := admin.SetWorkspace(ctx, userID, conversationID, selected.ID); err != nil {
-		return m.send(ctx, message, "绑定工作区失败："+trimError(err))
+		return m.send(ctx, message, "绑定工作区失败："+runtimeUserFacingError(err))
 	}
 	m.recordAudit(ctx, CommandAudit{
 		AdapterID: bot.ID, ChatID: message.ChatID, UserID: message.UserID, Command: "workspace",
@@ -656,7 +670,7 @@ func (m *Manager) commandWorkspace(ctx context.Context, bot Bot, message Message
 func (m *Manager) commandAdminList(ctx context.Context, bot Bot, message Message) error {
 	admins, err := m.groupAdmins(ctx, bot.ID, message.ChatID)
 	if err != nil {
-		return err
+		return m.send(ctx, message, "读取群管理员失败："+runtimeUserFacingError(err))
 	}
 	lines := []string{"本群管理员："}
 	for _, admin := range admins {
@@ -694,7 +708,7 @@ func (m *Manager) commandAdminAdd(ctx context.Context, bot Bot, message Message,
 	if err := repository.AddGroupAdmin(ctx, GroupAdmin{
 		AdapterID: bot.ID, ChatID: message.ChatID, UserID: target, AddedBy: message.UserID,
 	}); err != nil {
-		return m.send(ctx, message, "添加群管理员失败："+trimError(err))
+		return m.send(ctx, message, "添加群管理员失败："+runtimeUserFacingError(err))
 	}
 	m.recordAudit(ctx, CommandAudit{
 		AdapterID: bot.ID, ChatID: message.ChatID, UserID: message.UserID, Command: "admin add",

@@ -1274,6 +1274,9 @@ func (r *MemoryRepository) CommitApprovalResume(_ context.Context, commit Approv
 	}
 	approval.Status = commit.ApprovalToStatus
 	approval.DecisionReason = strings.TrimSpace(commit.Reason)
+	approval.SelectedChoices = append([]string(nil), commit.ApprovalSelectedChoices...)
+	approval.Scope = strings.TrimSpace(commit.ApprovalScope)
+	approval.Supplement = strings.TrimSpace(commit.ApprovalSupplement)
 	approval.UpdatedAt = now
 	resolvedAt := now
 	approval.ResolvedAt = &resolvedAt
@@ -1779,7 +1782,7 @@ func workflowContinuationInvocationMatches(existing, expected Invocation) bool {
 
 func isActiveInvocationStatus(status InvocationStatus) bool {
 	switch status {
-	case InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationCancelling:
+	case InvocationQueued, InvocationRunning, InvocationWaitingApproval, InvocationWaitingTool, InvocationWaitingUser, InvocationWaitingSubagents, InvocationCancelling:
 		return true
 	default:
 		return false

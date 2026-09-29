@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"Abot/internal/bot"
+	"Abot/internal/schedule"
 )
 
 type botPayload struct {
@@ -25,32 +28,34 @@ type botPayload struct {
 	GroupTriggerMode string  `json:"group_trigger_mode"`
 	// AdminUserIDs is the root of trust for chat commands. It is accepted only
 	// here (the WebUI), never from a chat message.
-	AdminUserIDs      *[]string `json:"admin_user_ids"`
-	TelegramToken     *string   `json:"telegram_token"`
-	OneBotAccessToken *string   `json:"onebot_access_token"`
-	Enabled           *bool     `json:"enabled"`
+	AdminUserIDs      *[]string             `json:"admin_user_ids"`
+	RuntimeConfig     *bot.BotRuntimeConfig `json:"runtime_config"`
+	TelegramToken     *string               `json:"telegram_token"`
+	OneBotAccessToken *string               `json:"onebot_access_token"`
+	Enabled           *bool                 `json:"enabled"`
 }
 
 type botView struct {
-	ID                      string     `json:"id"`
-	Name                    string     `json:"name"`
-	Type                    bot.Type   `json:"type"`
-	Endpoint                string     `json:"endpoint,omitempty"`
-	OneBotMode              string     `json:"onebot_mode,omitempty"`
-	ListenHost              string     `json:"listen_host,omitempty"`
-	ListenPort              int        `json:"listen_port,omitempty"`
-	ListenPath              string     `json:"listen_path,omitempty"`
-	OneBotFileRoot          string     `json:"onebot_file_root,omitempty"`
-	GroupTriggerMode        string     `json:"group_trigger_mode,omitempty"`
-	AdminUserIDs            []string   `json:"admin_user_ids,omitempty"`
-	TelegramTokenConfigured bool       `json:"telegram_token_configured"`
-	OneBotTokenConfigured   bool       `json:"onebot_access_token_configured"`
-	Enabled                 bool       `json:"enabled"`
-	Status                  bot.Status `json:"status"`
-	StatusMessage           string     `json:"status_message,omitempty"`
-	LastCheckedAt           any        `json:"last_checked_at,omitempty"`
-	CreatedAt               any        `json:"created_at,omitempty"`
-	UpdatedAt               any        `json:"updated_at,omitempty"`
+	ID                      string               `json:"id"`
+	Name                    string               `json:"name"`
+	Type                    bot.Type             `json:"type"`
+	Endpoint                string               `json:"endpoint,omitempty"`
+	OneBotMode              string               `json:"onebot_mode,omitempty"`
+	ListenHost              string               `json:"listen_host,omitempty"`
+	ListenPort              int                  `json:"listen_port,omitempty"`
+	ListenPath              string               `json:"listen_path,omitempty"`
+	OneBotFileRoot          string               `json:"onebot_file_root,omitempty"`
+	GroupTriggerMode        string               `json:"group_trigger_mode,omitempty"`
+	AdminUserIDs            []string             `json:"admin_user_ids,omitempty"`
+	RuntimeConfig           bot.BotRuntimeConfig `json:"runtime_config"`
+	TelegramTokenConfigured bool                 `json:"telegram_token_configured"`
+	OneBotTokenConfigured   bool                 `json:"onebot_access_token_configured"`
+	Enabled                 bool                 `json:"enabled"`
+	Status                  bot.Status           `json:"status"`
+	StatusMessage           string               `json:"status_message,omitempty"`
+	LastCheckedAt           any                  `json:"last_checked_at,omitempty"`
+	CreatedAt               any                  `json:"created_at,omitempty"`
+	UpdatedAt               any                  `json:"updated_at,omitempty"`
 }
 
 func (s *Server) requireBots() (*bot.Manager, error) {
@@ -152,14 +157,19 @@ func (s *Server) saveBot(writer http.ResponseWriter, request *http.Request, path
 		payload.GroupTriggerMode = old.GroupTriggerMode
 	}
 	adminUserIDs := []string(nil)
+	runtimeConfig := bot.BotRuntimeConfig{}
 	if haveOld {
 		// An omitted field keeps the configured administrators; an explicit
 		// empty list clears them. A partial update must never silently drop the
 		// only account that can manage this bot.
 		adminUserIDs = append([]string(nil), old.AdminUserIDs...)
+		runtimeConfig = old.RuntimeConfig
 	}
 	if payload.AdminUserIDs != nil {
 		adminUserIDs = normalizeAdminUserIDs(*payload.AdminUserIDs)
+	}
+	if payload.RuntimeConfig != nil {
+		runtimeConfig = payload.RuntimeConfig.NormalizeRuntimeConfig()
 	}
 	fileRoot := ""
 	if payload.OneBotFileRoot != nil {
@@ -168,7 +178,7 @@ func (s *Server) saveBot(writer http.ResponseWriter, request *http.Request, path
 		fileRoot = old.OneBotFileRoot
 	}
 	item, err := service.Save(request.Context(), bot.SaveRequest{
-		Bot:           bot.Bot{ID: payload.ID, Name: payload.Name, Type: payload.Type, Endpoint: payload.Endpoint, OneBotMode: payload.OneBotMode, ListenHost: payload.ListenHost, ListenPort: payload.ListenPort, ListenPath: payload.ListenPath, OneBotFileRoot: fileRoot, GroupTriggerMode: payload.GroupTriggerMode, AdminUserIDs: adminUserIDs, Enabled: enabled},
+		Bot:           bot.Bot{ID: payload.ID, Name: payload.Name, Type: payload.Type, Endpoint: payload.Endpoint, OneBotMode: payload.OneBotMode, ListenHost: payload.ListenHost, ListenPort: payload.ListenPort, ListenPath: payload.ListenPath, OneBotFileRoot: fileRoot, GroupTriggerMode: payload.GroupTriggerMode, AdminUserIDs: adminUserIDs, RuntimeConfig: runtimeConfig, Enabled: enabled},
 		TelegramToken: payload.TelegramToken, OneBotAccessToken: payload.OneBotAccessToken,
 	})
 	if err != nil {
@@ -303,9 +313,175 @@ func (s *Server) restartBot(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusOK, publicBot(item))
 }
 
+// getBotRuntimeOverview 返回 Bot Runtime 的有界只读投影，供 WebUI 展示来源积压、
+// 行为原因码和最近动作；该接口不会触发模型、工具或平台动作。
+func (s *Server) getBotRuntimeOverview(writer http.ResponseWriter, request *http.Request) {
+	service, err := s.requireBots()
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	limit := 20
+	if raw := strings.TrimSpace(request.URL.Query().Get("limit")); raw != "" {
+		if parsed, parseErr := strconv.Atoi(raw); parseErr == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	overview, err := service.GetRuntimeOverview(request.Context(), request.PathValue("id"), limit)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+
+	// 后续任务复用持久化调度器，按机器人过滤后和运行态一起返回，确保重启后仍能在 WebUI 看到任务。
+	followUps := make([]schedule.Task, 0)
+	if s.schedules != nil {
+		tasks, listErr := s.schedules.List(request.Context(), "")
+		if listErr != nil {
+			writeError(writer, listErr)
+			return
+		}
+		for _, task := range tasks {
+			if task.AdapterID != request.PathValue("id") {
+				continue
+			}
+			followUps = append(followUps, task)
+			if len(followUps) >= limit {
+				break
+			}
+		}
+	}
+
+	// 使用显式响应对象保持 RuntimeOverview 原有字段兼容，同时增加 Follow-up 投影。
+	writeJSON(writer, http.StatusOK, map[string]any{
+		"bot_id":     overview.BotID,
+		"instance":   overview.Instance,
+		"sources":    overview.Sources,
+		"decisions":  overview.Decisions,
+		"actions":    overview.Actions,
+		"relations":  overview.Relations,
+		"follow_ups": followUps,
+	})
+}
+
+// runtimeRelationPayload 是关系管理接口的稳定输入模型；revision 用于 CAS，
+// 防止 WebUI 打开的旧页面覆盖运行时刚刚写入的事实。
+type runtimeRelationPayload struct {
+	PreferredName     string     `json:"preferred_name"`
+	StablePreferences string     `json:"stable_preferences"`
+	InteractionStyle  string     `json:"interaction_style"`
+	TrustLevel        string     `json:"trust_level"`
+	RecentTopics      string     `json:"recent_topics"`
+	Commitments       string     `json:"commitments"`
+	LastInteractionAt *time.Time `json:"last_interaction_at,omitempty"`
+	Revision          int64      `json:"revision"`
+}
+
+// listBotRuntimeRelations 返回完整但有界的关系目录，供 WebUI 分页或刷新编辑。
+func (s *Server) listBotRuntimeRelations(writer http.ResponseWriter, request *http.Request) {
+	service, err := s.requireBots()
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	botID := request.PathValue("id")
+	if _, err := service.Get(botID); err != nil {
+		writeError(writer, err)
+		return
+	}
+	limit := 100
+	if raw := strings.TrimSpace(request.URL.Query().Get("limit")); raw != "" {
+		parsed, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || parsed <= 0 {
+			writeError(writer, fmt.Errorf("limit 必须是正整数"))
+			return
+		}
+		limit = parsed
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	relations, err := service.ListRuntimeRelations(request.Context(), botID, limit)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"bot_id": botID, "relations": relations})
+}
+
+// saveBotRuntimeRelation 保存关系的可解释字段；Bot Runtime 的消息入口仍可同时
+// 更新关系，revision 冲突时返回 409 让前端重新读取，而不是静默丢失事实。
+func (s *Server) saveBotRuntimeRelation(writer http.ResponseWriter, request *http.Request) {
+	service, err := s.requireBots()
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	botID := strings.TrimSpace(request.PathValue("id"))
+	if _, err := service.Get(botID); err != nil {
+		writeError(writer, err)
+		return
+	}
+	var payload runtimeRelationPayload
+	if err := decodeJSON(writer, request, &payload); err != nil {
+		writeError(writer, err)
+		return
+	}
+	scopeType := strings.TrimSpace(request.PathValue("scope_type"))
+	scopeID := strings.TrimSpace(request.PathValue("scope_id"))
+	if scopeType == "" || scopeID == "" || payload.Revision < 0 {
+		writeError(writer, fmt.Errorf("关系范围和 revision 无效"))
+		return
+	}
+	state := bot.RelationState{
+		BotID: botID, ScopeType: scopeType, ScopeID: scopeID,
+		PreferredName: payload.PreferredName, StablePreferences: payload.StablePreferences,
+		InteractionStyle: payload.InteractionStyle, TrustLevel: payload.TrustLevel,
+		RecentTopics: payload.RecentTopics, Commitments: payload.Commitments,
+		Revision: payload.Revision,
+	}
+	if payload.LastInteractionAt != nil {
+		state.LastInteractionAt = payload.LastInteractionAt.UTC()
+	}
+	if err := service.SaveRuntimeRelation(request.Context(), state, payload.Revision); err != nil {
+		writeError(writer, err)
+		return
+	}
+	state.Revision = payload.Revision + 1
+	if state.LastInteractionAt.IsZero() {
+		state.LastInteractionAt = time.Now().UTC()
+	}
+	writeJSON(writer, http.StatusOK, state)
+}
+
+// deleteBotRuntimeRelation 只删除关系投影，不删除 Conversation、来源上下文或附件。
+func (s *Server) deleteBotRuntimeRelation(writer http.ResponseWriter, request *http.Request) {
+	service, err := s.requireBots()
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	botID := strings.TrimSpace(request.PathValue("id"))
+	if _, err := service.Get(botID); err != nil {
+		writeError(writer, err)
+		return
+	}
+	rawRevision := strings.TrimSpace(request.URL.Query().Get("revision"))
+	revision, parseErr := strconv.ParseInt(rawRevision, 10, 64)
+	if parseErr != nil || revision <= 0 {
+		writeError(writer, fmt.Errorf("删除关系必须提供正 revision"))
+		return
+	}
+	if err := service.DeleteRuntimeRelation(request.Context(), botID, request.PathValue("scope_type"), request.PathValue("scope_id"), revision); err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusNoContent, map[string]any{"deleted": true})
+}
+
 func publicBot(item bot.Bot) botView {
 	return botView{
-		ID: item.ID, Name: item.Name, Type: item.Type, Endpoint: item.Endpoint, OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath, OneBotFileRoot: item.OneBotFileRoot, GroupTriggerMode: item.GroupTriggerMode, AdminUserIDs: item.AdminUserIDs,
+		ID: item.ID, Name: item.Name, Type: item.Type, Endpoint: item.Endpoint, OneBotMode: item.OneBotMode, ListenHost: item.ListenHost, ListenPort: item.ListenPort, ListenPath: item.ListenPath, OneBotFileRoot: item.OneBotFileRoot, GroupTriggerMode: item.GroupTriggerMode, AdminUserIDs: item.AdminUserIDs, RuntimeConfig: item.RuntimeConfig.NormalizeRuntimeConfig(),
 		TelegramTokenConfigured: strings.TrimSpace(item.TelegramToken) != "",
 		OneBotTokenConfigured:   strings.TrimSpace(item.OneBotAccessToken) != "",
 		Enabled:                 item.Enabled, Status: item.Status, StatusMessage: item.StatusMessage,

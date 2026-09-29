@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"encoding/binary"
 	"encoding/csv"
 	"encoding/xml"
 	"errors"
@@ -17,13 +18,16 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	pdf "github.com/ledongthuc/pdf"
+	"github.com/richardlehane/mscfb"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -93,10 +97,11 @@ type Result struct {
 }
 
 // IsDocumentAttachment 判断一个附件是否应该进入文档解析路径。
-// 旧版 .doc/.xls 也返回 true，这样它们不会被误当作可直接阅读的二进制送给模型，
-// 而是得到明确的“不支持该格式”的提示。
+// 纯文本和 Markdown 保留原文读取语义；它们虽然也能被 Parse 规范化为带定位的
+// 文本块，但不应因为接入解析层而失去原有的字节/换行语义。
 func IsDocumentAttachment(name, mimeType string) bool {
-	return isDocumentKind(documentKind(name, mimeType))
+	kind := documentKind(name, mimeType)
+	return kind != "txt" && kind != "md" && isDocumentKind(kind)
 }
 
 // Parse 按文件类型执行本地解析。解析失败会保留在 Result.Warnings 中，
@@ -124,7 +129,11 @@ func Parse(ctx context.Context, name, mimeType string, data []byte) (Result, err
 
 	// 文件签名优先于上传时的 MIME，避免客户端错误标注导致错误解析器被调用。
 	if sniffed := sniffDocumentKind(data); sniffed != "" {
-		result.Kind = sniffed
+		// OLE 容器同时承载 DOC/XLS/PPT，优先保留用户提供的明确扩展名；
+		// 没有扩展名时再由流名称推断具体旧版 Office 类型。
+		if sniffed != "ole" || !isLegacyOfficeKind(result.Kind) {
+			result.Kind = sniffed
+		}
 	}
 
 	switch result.Kind {
@@ -134,14 +143,14 @@ func Parse(ctx context.Context, name, mimeType string, data []byte) (Result, err
 		parseDOCX(ctx, data, &result)
 	case "xlsx", "xlsm":
 		parseXLSX(ctx, data, &result)
+	case "pptx":
+		parsePPTX(ctx, data, &result)
+	case "doc", "xls", "ppt", "ole":
+		parseLegacyOffice(ctx, data, &result)
 	case "csv", "tsv":
 		parseCSV(ctx, data, result.Kind == "tsv", &result)
-	case "doc":
-		result.addWarning("旧版 .doc 二进制格式未接入本地解析器，请先转换为 .docx 或 PDF")
-	case "xls":
-		result.addWarning("旧版 .xls 二进制格式未接入本地解析器，请先转换为 .xlsx 或 CSV")
-	case "ole":
-		result.addWarning("旧版 Office 二进制格式未接入本地解析器，请先转换为 .docx、.xlsx 或 PDF")
+	case "txt", "md":
+		parsePlainText(ctx, data, &result)
 	default:
 		result.addWarning("该附件类型没有可用的本地文档解析器")
 	}
@@ -214,6 +223,10 @@ func CanonicalMIMEType(kind string) string {
 		return "application/vnd.ms-word.document.macroenabled.12"
 	case "doc":
 		return "application/msword"
+	case "pptx":
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	case "ppt":
+		return "application/vnd.ms-powerpoint"
 	case "xlsx":
 		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 	case "xlsm":
@@ -224,6 +237,10 @@ func CanonicalMIMEType(kind string) string {
 		return "text/csv"
 	case "tsv":
 		return "text/tab-separated-values"
+	case "txt":
+		return "text/plain"
+	case "md":
+		return "text/markdown"
 	case "ole":
 		return "application/x-ole-storage"
 	default:
@@ -235,7 +252,7 @@ func CanonicalMIMEType(kind string) string {
 // 各自维护一套列表后再次出现分支不一致。
 func isDocumentKind(kind string) bool {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case "pdf", "docx", "docm", "doc", "xlsx", "xlsm", "xls", "csv", "tsv", "ole":
+	case "pdf", "docx", "docm", "doc", "xlsx", "xlsm", "xls", "pptx", "ppt", "csv", "tsv", "txt", "md", "ole":
 		return true
 	default:
 		return false
@@ -268,6 +285,7 @@ func sniffDocumentKind(data []byte) string {
 	}
 	hasWord := false
 	hasSpreadsheet := false
+	hasPresentation := false
 	hasMacro := false
 	for _, file := range archive.File {
 		name := strings.ReplaceAll(file.Name, "\\", "/")
@@ -276,6 +294,8 @@ func sniffDocumentKind(data []byte) string {
 			hasWord = true
 		case name == "xl/workbook.xml":
 			hasSpreadsheet = true
+		case name == "ppt/presentation.xml":
+			hasPresentation = true
 		case name == "word/vbaProject.bin" || name == "xl/vbaProject.bin":
 			hasMacro = true
 		}
@@ -291,6 +311,9 @@ func sniffDocumentKind(data []byte) string {
 			return "xlsm"
 		}
 		return "xlsx"
+	}
+	if hasPresentation {
+		return "pptx"
 	}
 	return ""
 }
@@ -416,12 +439,20 @@ func documentKind(name, mimeType string) string {
 		return "doc"
 	case "application/vnd.ms-excel":
 		return "xls"
+	case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+		return "pptx"
+	case "application/vnd.ms-powerpoint":
+		return "ppt"
 	case "application/x-ole-storage":
 		return "ole"
 	case "text/csv", "application/csv":
 		return "csv"
 	case "text/tab-separated-values":
 		return "tsv"
+	case "text/plain":
+		return "txt"
+	case "text/markdown", "text/x-markdown":
+		return "md"
 	}
 
 	switch strings.ToLower(filepath.Ext(strings.TrimSpace(name))) {
@@ -439,12 +470,31 @@ func documentKind(name, mimeType string) string {
 		return "doc"
 	case ".xls":
 		return "xls"
+	case ".pptx":
+		return "pptx"
+	case ".ppt":
+		return "ppt"
 	case ".csv":
 		return "csv"
 	case ".tsv":
 		return "tsv"
+	case ".txt":
+		return "txt"
+	case ".md", ".markdown":
+		return "md"
 	default:
 		return "unknown"
+	}
+}
+
+// isLegacyOfficeKind 只识别 OLE 容器中可以走对应 BIFF/PowerPoint/Word
+// 解析分支的三种旧格式，避免未知 OLE 文件被误当成普通办公文档。
+func isLegacyOfficeKind(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "doc", "xls", "ppt":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -606,6 +656,28 @@ func limitUTF8(value string, maxBytes int) (string, bool) {
 		end--
 	}
 	return string(data[:end]), true
+}
+
+// parsePlainText 将纯文本和 Markdown 按行保留定位信息；它仍使用 Result 的
+// 统一大小上限，避免把看似简单的日志或导出文件无限复制进模型上下文。
+func parsePlainText(ctx context.Context, data []byte, result *Result) {
+	if err := ctx.Err(); err != nil {
+		result.addWarning("文本解析被取消")
+		return
+	}
+	text := strings.ToValidUTF8(string(data), "�")
+	lines := strings.Split(strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n"), "\n")
+	for index, line := range lines {
+		if err := ctx.Err(); err != nil {
+			result.addWarning("文本解析被取消")
+			return
+		}
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		result.addBlock(fmt.Sprintf("第 %d 行", index+1), line)
+	}
+	result.Parsed = len(result.Blocks) > 0 || len(data) == 0
 }
 
 func parsePDF(ctx context.Context, data []byte, result *Result) {
@@ -1123,6 +1195,517 @@ func parseDOCX(ctx context.Context, data []byte, result *Result) {
 	}
 	if len(result.Blocks) == 0 {
 		result.addWarning("Word 文档没有提取到段落或表格文本")
+	}
+}
+
+// parsePPTX 读取演示文稿中的幻灯片文字和 media 部件。解析只读取 XML 文本
+// 和图片二进制，不执行宏、外部链接或嵌入对象，避免把演示文稿当成可执行内容。
+func parsePPTX(ctx context.Context, data []byte, result *Result) {
+	archive, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		result.addWarning("PPTX ZIP 容器读取失败：" + err.Error())
+		return
+	}
+	result.Parsed = true
+	extractOOXMLImages(ctx, archive, "ppt/media/", "PPT 图片", result)
+	type slide struct {
+		file   *zip.File
+		number int
+	}
+	slides := make([]slide, 0)
+	for _, file := range archive.File {
+		name := strings.ReplaceAll(file.Name, "\\", "/")
+		if !strings.HasPrefix(name, "ppt/slides/slide") || !strings.HasSuffix(name, ".xml") {
+			continue
+		}
+		base := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(name), "slide"), ".xml")
+		number := 0
+		for _, value := range base {
+			if value < '0' || value > '9' {
+				number = 0
+				break
+			}
+			number = number*10 + int(value-'0')
+		}
+		if number <= 0 {
+			continue
+		}
+		slides = append(slides, slide{file: file, number: number})
+	}
+	sort.SliceStable(slides, func(i, j int) bool { return slides[i].number < slides[j].number })
+	if len(slides) > maxOOXMLMembers {
+		slides = slides[:maxOOXMLMembers]
+		result.Truncated = true
+		result.addWarning(fmt.Sprintf("PPTX 幻灯片超过 %d 页，仅解析前面的幻灯片", maxOOXMLMembers))
+	}
+	for _, item := range slides {
+		if err := ctx.Err(); err != nil {
+			result.addWarning("PPTX 文档解析被取消")
+			return
+		}
+		member, readErr := readZipMember(item.file)
+		if readErr != nil {
+			result.addWarning(fmt.Sprintf("PPTX 第 %d 页读取失败：%s", item.number, readErr.Error()))
+			continue
+		}
+		if parseErr := parsePresentationXML(ctx, member, item.number, result); parseErr != nil {
+			if ctx.Err() != nil {
+				result.addWarning("PPTX 文档解析被取消")
+				return
+			}
+			result.addWarning(fmt.Sprintf("PPTX 第 %d 页解析失败：%s", item.number, parseErr.Error()))
+		}
+	}
+	if len(slides) == 0 {
+		result.addWarning("PPTX 中没有找到可读取的幻灯片 XML")
+	}
+	result.PageCount = len(slides)
+	if len(result.Blocks) == 0 {
+		result.addWarning("PPTX 没有提取到文本框内容")
+	}
+}
+
+// parsePresentationXML 按 a:p 段落边界输出文字，保留幻灯片定位而不把 XML
+// 标签、关系地址或绘图元数据泄露给主 Agent。
+func parsePresentationXML(ctx context.Context, data []byte, slideNumber int, result *Result) error {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	var paragraph strings.Builder
+	paragraphNumber := 0
+	inParagraph := false
+	flush := func() {
+		text := cleanExtractedText(paragraph.String())
+		paragraph.Reset()
+		if text == "" {
+			return
+		}
+		paragraphNumber++
+		result.addBlock(fmt.Sprintf("PPT 第 %d 页文本框 %d", slideNumber, paragraphNumber), text)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		token, err := decoder.Token()
+		if err == io.EOF {
+			flush()
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		switch item := token.(type) {
+		case xml.StartElement:
+			switch item.Name.Local {
+			case "p":
+				if inParagraph {
+					flush()
+				}
+				inParagraph = true
+			case "br":
+				if inParagraph {
+					paragraph.WriteByte('\n')
+				}
+			}
+		case xml.CharData:
+			if inParagraph {
+				// 只有文本节点会进入 a:p；关系 URL 和属性不会被写入正文。
+				paragraph.Write([]byte(item))
+			}
+		case xml.EndElement:
+			if item.Name.Local == "p" && inParagraph {
+				flush()
+				inParagraph = false
+			}
+		}
+	}
+}
+
+const (
+	maxLegacyOfficeStreamBytes = 32 << 20
+	maxLegacyOfficeRecords     = 200000
+)
+
+// parseLegacyOffice 为 OLE 容器提供确定性的最小解析器：DOC 读取 WordDocument
+// 的 Unicode/ANSI 文本片段，XLS 读取 BIFF 单元格和共享字符串，PPT 读取文本
+// Atom。它不执行宏，也不会把未知 OLE 流直接交给模型。
+func parseLegacyOffice(ctx context.Context, data []byte, result *Result) {
+	reader, err := mscfb.New(bytes.NewReader(data))
+	if err != nil {
+		result.addWarning("旧版 Office OLE 容器读取失败：" + err.Error())
+		return
+	}
+	streams := make(map[string][]byte)
+	for _, file := range reader.File {
+		if err := ctx.Err(); err != nil {
+			result.addWarning("旧版 Office 文档解析被取消")
+			return
+		}
+		if file == nil || file.Size <= 0 || file.Size > maxLegacyOfficeStreamBytes {
+			continue
+		}
+		streamData, readErr := io.ReadAll(io.LimitReader(file, maxLegacyOfficeStreamBytes+1))
+		if readErr != nil || len(streamData) > maxLegacyOfficeStreamBytes {
+			result.addWarning(fmt.Sprintf("旧版 Office 流 %s 读取失败或超过限制", displayName(file.Name)))
+			continue
+		}
+		streams[strings.ToLower(strings.TrimSpace(file.Name))] = streamData
+	}
+	if result.Kind == "ole" {
+		switch {
+		case streams["worddocument"] != nil:
+			result.Kind = "doc"
+		case streams["workbook"] != nil || streams["book"] != nil:
+			result.Kind = "xls"
+		case streams["powerpoint document"] != nil:
+			result.Kind = "ppt"
+		}
+	}
+	switch result.Kind {
+	case "doc":
+		if stream := streams["worddocument"]; len(stream) > 0 {
+			parseLegacyWord(ctx, stream, result)
+		} else {
+			result.addWarning("旧版 DOC 中没有 WordDocument 流")
+		}
+	case "xls":
+		stream := streams["workbook"]
+		if len(stream) == 0 {
+			stream = streams["book"]
+		}
+		if len(stream) > 0 {
+			parseLegacyXLS(ctx, stream, result)
+		} else {
+			result.addWarning("旧版 XLS 中没有 Workbook 流")
+		}
+	case "ppt":
+		if stream := streams["powerpoint document"]; len(stream) > 0 {
+			parseLegacyPPT(ctx, stream, result)
+		} else {
+			result.addWarning("旧版 PPT 中没有 PowerPoint Document 流")
+		}
+	default:
+		result.addWarning("未知 OLE 文件，无法确定 DOC、XLS 或 PPT 类型")
+	}
+	for name, stream := range streams {
+		if strings.Contains(name, "worddocument") || strings.Contains(name, "workbook") || strings.Contains(name, "powerpoint") {
+			continue
+		}
+		extractLegacyImages(ctx, name, stream, result)
+	}
+	if len(result.Blocks) == 0 {
+		result.addWarning("旧版 Office 文档没有提取到可用文本")
+	}
+	result.Parsed = true
+}
+
+// parseLegacyWord 从旧 DOC 的文本流提取连续可读片段。旧 DOC 的 piece table
+// 可能把正文拆到多个位置；这里同时支持 UTF-16LE 和压缩 ANSI 片段，避免因
+// 不同 Word 版本只采用一种编码而返回空正文。
+func parseLegacyWord(ctx context.Context, data []byte, result *Result) {
+	if err := ctx.Err(); err != nil {
+		result.addWarning("DOC 文档解析被取消")
+		return
+	}
+	blocks := legacyTextRuns(data, true)
+	if len(blocks) == 0 {
+		blocks = legacyTextRuns(data, false)
+	}
+	for index, text := range blocks {
+		if err := ctx.Err(); err != nil {
+			result.addWarning("DOC 文档解析被取消")
+			return
+		}
+		result.addBlock(fmt.Sprintf("DOC 正文片段 %d", index+1), text)
+	}
+	result.addWarning("DOC 中的宏不会被执行，仅读取可识别的正文片段")
+}
+
+// legacyTextRuns 提取连续可读 Unicode/ANSI 片段，并丢弃 OLE/FIB 二进制控制字节。
+func legacyTextRuns(data []byte, unicodeLE bool) []string {
+	result := make([]string, 0)
+	minimum := 4
+	for offset := 0; offset < len(data); {
+		start := offset
+		var runes []rune
+		for offset < len(data) {
+			var value rune
+			if unicodeLE {
+				if offset+1 >= len(data) {
+					break
+				}
+				value = rune(binary.LittleEndian.Uint16(data[offset : offset+2]))
+			} else {
+				value = rune(data[offset])
+			}
+			if value == '\r' || value == '\n' || value == '\t' || unicode.IsLetter(value) || unicode.IsDigit(value) || unicode.IsPunct(value) || unicode.IsSymbol(value) || (value >= 0x20 && value != 0x7f) {
+				runes = append(runes, value)
+				offset += 2
+				if !unicodeLE {
+					offset = start + len(runes)
+				}
+				continue
+			}
+			break
+		}
+		if len(runes) >= minimum {
+			text := cleanExtractedText(string(runes))
+			if text != "" {
+				result = append(result, text)
+			}
+		}
+		if offset <= start {
+			offset = start + 1
+		}
+	}
+	return result
+}
+
+// parseLegacyXLS 解析 BIFF8 的常见文字/数字记录。它不计算公式，只使用文件
+// 中已经保存的缓存值，保证解析过程没有宏和外部引用副作用。
+func parseLegacyXLS(ctx context.Context, data []byte, result *Result) {
+	shared := make([]string, 0)
+	position := 0
+	records := 0
+	for position+4 <= len(data) && records < maxLegacyOfficeRecords {
+		if err := ctx.Err(); err != nil {
+			result.addWarning("XLS 文档解析被取消")
+			return
+		}
+		recordID := binary.LittleEndian.Uint16(data[position : position+2])
+		recordLength := int(binary.LittleEndian.Uint16(data[position+2 : position+4]))
+		position += 4
+		if recordLength < 0 || position+recordLength > len(data) {
+			result.addWarning("XLS BIFF 记录边界无效，已停止解析")
+			break
+		}
+		payload := data[position : position+recordLength]
+		position += recordLength
+		records++
+		switch recordID {
+		case 0x00fc:
+			shared = parseBIFFSST(payload, result)
+		case 0x0204, 0x00fd:
+			row, column, text, ok := parseBIFFTextCell(recordID, payload, shared)
+			if ok {
+				result.addBlock(fmt.Sprintf("XLS 工作表 1!%s", excelCellName(column+1, row+1)), text)
+			}
+		case 0x0203:
+			if len(payload) >= 14 {
+				row := int(binary.LittleEndian.Uint16(payload[0:2]))
+				column := int(binary.LittleEndian.Uint16(payload[2:4]))
+				value := math.Float64frombits(binary.LittleEndian.Uint64(payload[6:14]))
+				if !math.IsNaN(value) && !math.IsInf(value, 0) {
+					result.addBlock(fmt.Sprintf("XLS 工作表 1!%s", excelCellName(column+1, row+1)), fmt.Sprintf("%v", value))
+				}
+			}
+		case 0x027e:
+			if len(payload) >= 10 {
+				row := int(binary.LittleEndian.Uint16(payload[0:2]))
+				column := int(binary.LittleEndian.Uint16(payload[2:4]))
+				value, ok := decodeBIFFRK(binary.LittleEndian.Uint32(payload[6:10]))
+				if ok {
+					result.addBlock(fmt.Sprintf("XLS 工作表 1!%s", excelCellName(column+1, row+1)), fmt.Sprintf("%v", value))
+				}
+			}
+		case 0x0006:
+			if len(payload) >= 14 {
+				row := int(binary.LittleEndian.Uint16(payload[0:2]))
+				column := int(binary.LittleEndian.Uint16(payload[2:4]))
+				value := math.Float64frombits(binary.LittleEndian.Uint64(payload[6:14]))
+				if !math.IsNaN(value) && !math.IsInf(value, 0) {
+					result.addBlock(fmt.Sprintf("XLS 工作表 1!%s（公式缓存）", excelCellName(column+1, row+1)), fmt.Sprintf("%v", value))
+				}
+			}
+		}
+	}
+	result.addWarning("XLS 公式和宏不会被执行，仅读取 BIFF 文件中的缓存值")
+}
+
+func parseBIFFSST(payload []byte, result *Result) []string {
+	if len(payload) < 8 {
+		return nil
+	}
+	unique := int(binary.LittleEndian.Uint32(payload[4:8]))
+	if unique < 0 || unique > maxXLSXNonEmptyCells {
+		result.addWarning("XLS 共享字符串数量超过限制")
+		return nil
+	}
+	values := make([]string, 0, unique)
+	position := 8
+	for len(values) < unique && position < len(payload) {
+		value, next, ok := readBIFFUnicodeString(payload, position)
+		if !ok || next <= position {
+			break
+		}
+		values = append(values, value)
+		position = next
+	}
+	return values
+}
+
+func parseBIFFTextCell(recordID uint16, payload []byte, shared []string) (int, int, string, bool) {
+	if len(payload) < 8 {
+		return 0, 0, "", false
+	}
+	row := int(binary.LittleEndian.Uint16(payload[0:2]))
+	column := int(binary.LittleEndian.Uint16(payload[2:4]))
+	if recordID == 0x00fd {
+		if len(payload) < 10 {
+			return 0, 0, "", false
+		}
+		index := int(binary.LittleEndian.Uint32(payload[6:10]))
+		if index < 0 || index >= len(shared) {
+			return 0, 0, "", false
+		}
+		return row, column, shared[index], strings.TrimSpace(shared[index]) != ""
+	}
+	value, _, ok := readBIFFUnicodeString(payload, 6)
+	return row, column, value, ok && strings.TrimSpace(value) != ""
+}
+
+func readBIFFUnicodeString(data []byte, offset int) (string, int, bool) {
+	if offset < 0 || offset+3 > len(data) {
+		return "", offset, false
+	}
+	length := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	options := data[offset+2]
+	offset += 3
+	if options&0x08 != 0 {
+		if offset+2 > len(data) {
+			return "", offset, false
+		}
+		richRuns := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		if richRuns > 8192 || offset+richRuns*4 > len(data) {
+			return "", offset, false
+		}
+		offset += richRuns * 4
+	}
+	extendedBytes := 0
+	if options&0x04 != 0 {
+		if offset+4 > len(data) {
+			return "", offset, false
+		}
+		extendedBytes = int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+		offset += 4
+		if extendedBytes > len(data)-offset {
+			return "", offset, false
+		}
+	}
+	if length < 0 || length > maxXLSXCellBytes*8 {
+		return "", offset, false
+	}
+	if options&0x01 != 0 {
+		byteCount := length * 2
+		if byteCount > len(data)-offset {
+			return "", offset, false
+		}
+		units := make([]uint16, length)
+		for index := range units {
+			units[index] = binary.LittleEndian.Uint16(data[offset+index*2 : offset+index*2+2])
+		}
+		return cleanExtractedText(string(utf16.Decode(units))), offset + byteCount + extendedBytes, true
+	}
+	if length > len(data)-offset {
+		return "", offset, false
+	}
+	return cleanExtractedText(string(data[offset : offset+length])), offset + length + extendedBytes, true
+}
+
+func decodeBIFFRK(value uint32) (float64, bool) {
+	if value&0x02 != 0 {
+		return float64(int32(value) >> 2), true
+	}
+	bits := uint64(value &^ 0x03)
+	return math.Float64frombits(bits<<32) / func() float64 {
+		if value&0x01 != 0 {
+			return 100
+		}
+		return 1
+	}(), true
+}
+
+// parseLegacyPPT 读取 PowerPoint Document 流中的 TextCharsAtom/TextBytesAtom。
+func parseLegacyPPT(ctx context.Context, data []byte, result *Result) {
+	position := 0
+	atom := 0
+	for position+8 <= len(data) && atom < maxLegacyOfficeRecords {
+		if err := ctx.Err(); err != nil {
+			result.addWarning("PPT 文档解析被取消")
+			return
+		}
+		atom++
+		recordType := binary.LittleEndian.Uint16(data[position+2 : position+4])
+		recordLength := int(binary.LittleEndian.Uint32(data[position+4 : position+8]))
+		position += 8
+		if recordLength < 0 || recordLength > len(data)-position {
+			break
+		}
+		payload := data[position : position+recordLength]
+		position += recordLength
+		switch recordType {
+		case 0x0fa0:
+			result.addBlock(fmt.Sprintf("PPT 文本片段 %d", atom), cleanExtractedText(decodeUTF16LE(payload)))
+		case 0x0fa8:
+			result.addBlock(fmt.Sprintf("PPT 文本片段 %d", atom), cleanExtractedText(string(payload)))
+		}
+	}
+	result.addWarning("PPT 中的宏和嵌入对象不会被执行，仅读取文本 Atom")
+}
+
+func decodeUTF16LE(data []byte) string {
+	if len(data) < 2 {
+		return ""
+	}
+	units := make([]uint16, 0, len(data)/2)
+	for index := 0; index+1 < len(data); index += 2 {
+		units = append(units, binary.LittleEndian.Uint16(data[index:index+2]))
+	}
+	return string(utf16.Decode(units))
+}
+
+// extractLegacyImages 只保留能确认边界的 PNG/JPEG/GIF 签名，避免把未知 OLE
+// 流误当成图片，也避免将整个流复制到视觉模型。
+func extractLegacyImages(ctx context.Context, streamName string, data []byte, result *Result) {
+	for offset := 0; offset < len(data); {
+		if err := ctx.Err(); err != nil {
+			result.addWarning("旧版 Office 图片解析被取消")
+			return
+		}
+		pngStart := bytes.Index(data[offset:], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+		jpegStart := bytes.Index(data[offset:], []byte{0xff, 0xd8, 0xff})
+		gifStart := bytes.Index(data[offset:], []byte("GIF89a"))
+		start, mimeType := -1, ""
+		for candidate, kind := range map[int]string{pngStart: "image/png", jpegStart: "image/jpeg", gifStart: "image/gif"} {
+			if candidate >= 0 && (start < 0 || candidate < start) {
+				start, mimeType = candidate, kind
+			}
+		}
+		if start < 0 {
+			return
+		}
+		start += offset
+		end := start
+		switch mimeType {
+		case "image/png":
+			if endIndex := bytes.Index(data[start:], []byte("IEND\xaeB`\x82")); endIndex >= 0 {
+				end = start + endIndex + len("IEND\xaeB`\x82")
+			}
+		case "image/jpeg":
+			if endIndex := bytes.Index(data[start+3:], []byte{0xff, 0xd9}); endIndex >= 0 {
+				end = start + 3 + endIndex + 2
+			}
+		case "image/gif":
+			if endIndex := bytes.Index(data[start+6:], []byte{0x3b}); endIndex >= 0 {
+				end = start + 6 + endIndex + 1
+			}
+		}
+		if end <= start || end-start > maxEmbeddedImageBytes {
+			offset = start + 3
+			continue
+		}
+		result.addImage(fmt.Sprintf("OLE 流 %s 图片", displayName(streamName)), fmt.Sprintf("ole-image-%d", len(result.Images)+1), mimeType, data[start:end])
+		offset = end
 	}
 }
 

@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { NButton, NCard, NEmpty, NInput, NModal, NSelect, NSpace, NTabPane, NTag, NTabs, useMessage } from 'naive-ui'
-import { archiveStoredConversation, deleteStoredConversation, openDataLogStream, readConversationMessages, readDataConversations, readDataTraces, readDashboardStats, readInvocationTrace, unarchiveStoredConversation } from '@/api'
+import { archiveStoredConversation, deleteStoredConversation, openDataLogStream, openRuntimeEventStream, readConversationMessages, readDataConversations, readDataTraces, readDashboardStats, readInvocationSubAgents, readSubAgentEvidence, readSubAgentGroup, readInvocationTrace, searchRuntimeRetrieval, unarchiveStoredConversation } from '@/api'
 import AppIcon from '@/components/AppIcon.vue'
-import type { Conversation, ConversationMessage, DashboardStats, DataLogEntry, InvocationTrace } from '@/types'
+import type { Conversation, ConversationMessage, DashboardStats, DataLogEntry, EvidenceItem, InvocationTrace, RetrievalResult, RuntimeEvent, SubAgentGroup, SubAgentRun } from '@/types'
 
 const message = useMessage()
 const activeTab = ref('overview')
@@ -22,11 +22,30 @@ const conversationStatus = ref('')
 const traceQuery = ref('')
 const selectedTrace = ref<InvocationTrace | null>(null)
 const traceLoading = ref(false)
+const runtimeInvocationID = ref('')
+const runtimeUserID = ref('')
+const runtimeConversationID = ref('')
+const runtimeGroups = ref<SubAgentGroup[]>([])
+const selectedRuntimeGroup = ref<SubAgentGroup | null>(null)
+const runtimeRuns = ref<SubAgentRun[]>([])
+const runtimeEvidence = ref<EvidenceItem[]>([])
+const runtimeEvents = ref<RuntimeEvent[]>([])
+const runtimeEventConnected = ref(false)
+const runtimeEventAutoScroll = ref(true)
+const runtimeEventTerminal = ref<HTMLElement | null>(null)
+const runtimeLoading = ref(false)
+const retrievalQuery = ref('')
+const retrievalSourceKinds = ref<string[]>(['conversation'])
+const retrievalTopK = ref('5')
+const retrievalLoading = ref(false)
+const retrievalResult = ref<RetrievalResult | null>(null)
 const logConnected = ref(false)
 const autoScrollLogs = ref(true)
 const logTerminal = ref<HTMLElement | null>(null)
 let closeLogStream: (() => void) | undefined
 let logStreamGeneration = 0
+let closeRuntimeEventStream: (() => void) | undefined
+let runtimeEventGeneration = 0
 const logLevels = ['DEBUG', 'INFO', 'WARN', 'ERROR', 'CRITICAL']
 const selectedLogLevels = ref([...logLevels])
 const displayTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '本地时区'
@@ -42,6 +61,14 @@ const statusOptions = [
   { label: '全部状态', value: '' },
   { label: '进行中', value: 'active' },
   { label: '已归档', value: 'archived' },
+]
+const retrievalSourceOptions = [
+  { label: '长期记忆', value: 'memory' },
+  { label: '会话消息', value: 'conversation' },
+  { label: '网页搜索', value: 'web' },
+  { label: '工作区', value: 'workspace' },
+  { label: '结构化文件', value: 'structured' },
+  { label: '知识来源', value: 'knowledge' },
 ]
 // 仪表盘分成独立请求，单个数据源异常时仍保留其他可用区域。
 async function loadStats() {
@@ -210,13 +237,127 @@ function startLogStream() {
 async function openTrace(item: Record<string, unknown>) {
   const id = String(item.invocation_id || item.id || '')
   if (!id) return
+  runtimeInvocationID.value = id
+  runtimeUserID.value = String(item.user_id || selectedConversation.value?.user_id || 'webui')
+  runtimeConversationID.value = String(item.conversation_id || selectedConversation.value?.id || '')
+  stopRuntimeEventStream()
+  runtimeEvents.value = []
   traceLoading.value = true
   try {
     selectedTrace.value = await readInvocationTrace(id)
+    await loadRuntimeGroups(id)
+    if (activeTab.value === 'runtime') startRuntimeEventStream()
   } catch (error) {
     message.error(error instanceof Error ? error.message : '读取追踪详情失败')
   } finally {
     traceLoading.value = false
+  }
+}
+
+function stopRuntimeEventStream() {
+  runtimeEventGeneration += 1
+  closeRuntimeEventStream?.()
+  closeRuntimeEventStream = undefined
+  runtimeEventConnected.value = false
+}
+
+function appendRuntimeEvent(event: RuntimeEvent) {
+  if (!event || event.invocation_id !== runtimeInvocationID.value) return
+  if (runtimeEvents.value.some((item) => item.sequence === event.sequence)) return
+  runtimeEvents.value = [...runtimeEvents.value, event].sort((left, right) => left.sequence - right.sequence).slice(-200)
+  void nextTick(() => {
+    if (runtimeEventAutoScroll.value && runtimeEventTerminal.value) runtimeEventTerminal.value.scrollTop = runtimeEventTerminal.value.scrollHeight
+  })
+  if (event.type.startsWith('subagent.') && ['subagent.completed', 'subagent.failed', 'subagent.cancelled', 'subagent.expired'].includes(event.type)) {
+    void loadRuntimeGroups()
+  }
+}
+
+function startRuntimeEventStream() {
+  if (activeTab.value !== 'runtime' || !runtimeInvocationID.value || closeRuntimeEventStream) return
+  const generation = ++runtimeEventGeneration
+  const after = runtimeEvents.value.length ? runtimeEvents.value[runtimeEvents.value.length - 1].sequence : 0
+  closeRuntimeEventStream = openRuntimeEventStream(runtimeInvocationID.value, after, (event) => {
+    if (generation !== runtimeEventGeneration) return
+    appendRuntimeEvent(event)
+    runtimeEventConnected.value = true
+  }, () => {
+    if (generation === runtimeEventGeneration) runtimeEventConnected.value = false
+  })
+}
+
+function formatRuntimeEvent(event: RuntimeEvent) {
+  const safeKeys = new Set(['group_id', 'run_id', 'parent_node_id', 'profile', 'stage', 'status', 'ordinal', 'error_code', 'error_retryable', 'reason', 'source_kind', 'item_count', 'failure_count', 'failed_count', 'cancelled_count', 'before_count', 'after_count', 'cached', 'partial', 'usage_summary', 'result_digest', 'query_digest', 'permission_digest'])
+  const dataEntries = Object.entries(event.data || {}).filter(([key]) => safeKeys.has(key))
+  const data = dataEntries.length ? ` ${JSON.stringify(Object.fromEntries(dataEntries))}` : ''
+  return `${formatLocalDateTime(event.timestamp, true)} ${event.type}${data}`
+}
+
+async function loadRuntimeGroups(invocationID = runtimeInvocationID.value) {
+  if (!invocationID) {
+    runtimeGroups.value = []
+    selectedRuntimeGroup.value = null
+    runtimeRuns.value = []
+    runtimeEvidence.value = []
+    return
+  }
+  runtimeLoading.value = true
+  try {
+    runtimeGroups.value = await readInvocationSubAgents(invocationID)
+    const current = runtimeGroups.value.find((item) => item.id === selectedRuntimeGroup.value?.id) || runtimeGroups.value[0] || null
+    selectedRuntimeGroup.value = current
+    if (current) await loadRuntimeGroup(current.id)
+    else {
+      runtimeRuns.value = []
+      runtimeEvidence.value = []
+    }
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '读取子 Agent 任务树失败')
+  } finally {
+    runtimeLoading.value = false
+  }
+}
+
+async function loadRuntimeGroup(groupID: string) {
+  runtimeLoading.value = true
+  try {
+    const [detail, evidence] = await Promise.all([readSubAgentGroup(groupID), readSubAgentEvidence(groupID)])
+    selectedRuntimeGroup.value = detail.group
+    runtimeRuns.value = detail.runs || []
+    runtimeEvidence.value = evidence.evidence || []
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '读取子 Agent 详情失败')
+  } finally {
+    runtimeLoading.value = false
+  }
+}
+
+async function runRetrievalSearch() {
+  const query = retrievalQuery.value.trim()
+  if (!query) {
+    message.warning('请输入检索内容')
+    return
+  }
+  if (!retrievalSourceKinds.value.length) {
+    message.warning('至少选择一个检索来源')
+    return
+  }
+  retrievalLoading.value = true
+  try {
+    retrievalResult.value = await searchRuntimeRetrieval({
+      invocation_id: runtimeInvocationID.value || undefined,
+      query,
+      user_id: runtimeUserID.value || selectedConversation.value?.user_id || 'webui',
+      conversation_id: runtimeConversationID.value || selectedConversation.value?.id || undefined,
+      source_kinds: retrievalSourceKinds.value,
+      top_k: Math.min(20, Math.max(1, Number.parseInt(retrievalTopK.value, 10) || 5)),
+      rerank_enabled: true,
+      requested_by: 'webui',
+    })
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '检索失败')
+  } finally {
+    retrievalLoading.value = false
   }
 }
 
@@ -277,6 +418,12 @@ watch(traceQuery, loadTraces)
 watch(activeTab, (tab, previous) => {
   if (previous === 'logs') stopLogStream()
   if (tab === 'logs') startLogStream()
+  if (previous === 'runtime') stopRuntimeEventStream()
+  if (tab === 'runtime') startRuntimeEventStream()
+})
+watch(selectedConversation, (item) => {
+  if (!runtimeUserID.value && item) runtimeUserID.value = item.user_id
+  if (!runtimeConversationID.value && item) runtimeConversationID.value = item.id
 })
 
 onMounted(async () => {
@@ -285,6 +432,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopLogStream()
+  stopRuntimeEventStream()
 })
 
 watch(autoScrollLogs, () => {
@@ -352,6 +500,62 @@ watch(autoScrollLogs, () => {
           <NCard class="detail-card" :bordered="false"><div v-if="traces.length" class="trace-list"><button v-for="item in traces" :key="String(item.id)" type="button" class="trace-list-item" :class="{ active: selectedTrace?.invocation_id === item.id }" @click="openTrace(item)"><span><strong>{{ traceStatus(item.status) }}</strong><code>{{ item.id }}</code></span><small>{{ formatTime(String(item.created_at || '')) }}</small></button></div><NEmpty v-else description="暂无执行追踪" /></NCard>
           <NCard class="detail-card" :bordered="false"><div v-if="selectedTrace" class="trace-detail"><div class="section-heading-row"><div><h3>Trace 详情</h3><p>{{ selectedTrace.invocation_id }}</p></div><NTag size="small" :bordered="false">{{ traceStatus(selectedTrace.status) }}</NTag></div><pre>{{ JSON.stringify(selectedTrace, null, 2) }}</pre></div><NEmpty v-else :description="traceLoading ? '正在读取 Trace…' : '选择左侧记录查看详情'" /></NCard>
         </div>
+      </NTabPane>
+
+      <NTabPane name="runtime" tab="任务树 / 检索">
+        <div class="data-toolbar">
+          <span class="muted">先在“执行追踪”中选择 Invocation，再查看通用子 Agent 的 Group、Run、依赖和证据。</span>
+          <NButton size="small" secondary :loading="runtimeLoading" :disabled="!runtimeInvocationID" @click="loadRuntimeGroups()">刷新任务树</NButton>
+        </div>
+        <div class="data-two-column runtime-layout">
+          <NCard class="detail-card" :bordered="false">
+            <div class="section-heading-row"><div><h3>任务树</h3><p>{{ runtimeInvocationID || '未选择 Invocation' }}</p></div><NTag size="small" :bordered="false">{{ runtimeGroups.length }} 个 Group</NTag></div>
+            <div v-if="runtimeGroups.length" class="trace-list">
+              <button v-for="group in runtimeGroups" :key="group.id" type="button" class="trace-list-item" :class="{ active: selectedRuntimeGroup?.id === group.id }" @click="loadRuntimeGroup(group.id)">
+                <span><strong>{{ traceStatus(group.status) }}</strong><code>{{ group.profile || 'generic' }}</code></span>
+                <small>{{ group.completed_count || 0 }}/{{ group.expected_count || 0 }} · {{ formatTime(group.created_at) }}</small>
+              </button>
+            </div>
+            <NEmpty v-else :description="runtimeLoading ? '正在读取任务树…' : '当前 Invocation 没有子 Agent Group'" />
+          </NCard>
+          <NCard class="detail-card" :bordered="false">
+            <div v-if="selectedRuntimeGroup" class="runtime-detail">
+              <div class="section-heading-row"><div><h3>{{ selectedRuntimeGroup.purpose || '通用子 Agent Group' }}</h3><p>{{ selectedRuntimeGroup.id }}</p></div><NTag size="small" :bordered="false">{{ traceStatus(selectedRuntimeGroup.status) }}</NTag></div>
+              <div class="runtime-counts"><span>排队 {{ selectedRuntimeGroup.queued_count || 0 }}</span><span>运行 {{ selectedRuntimeGroup.running_count || 0 }}</span><span>完成 {{ selectedRuntimeGroup.completed_count || 0 }}</span><span>失败 {{ selectedRuntimeGroup.failed_count || 0 }}</span></div>
+              <div v-if="selectedRuntimeGroup.error_message" class="runtime-error">{{ selectedRuntimeGroup.error_code }}：{{ selectedRuntimeGroup.error_message }}</div>
+              <h4>Run / 依赖</h4>
+              <div v-if="runtimeRuns.length" class="runtime-run-list">
+                <div v-for="run in runtimeRuns" :key="run.id" class="runtime-run-item">
+                  <div><strong>#{{ run.ordinal ?? 0 }} {{ run.stage || run.profile || 'run' }}</strong><NTag size="small" :bordered="false">{{ traceStatus(run.status) }}</NTag></div>
+                  <code>{{ run.id }}</code>
+                  <small v-if="run.depends_on_run_ids?.length">依赖：{{ run.depends_on_run_ids.join('、') }}</small>
+                  <small v-if="run.input_artifact_refs?.length">输入 Artifact：{{ run.input_artifact_refs.map((item) => item.name || item.id).join('、') }}</small>
+                  <small v-if="run.result_artifact_refs?.length">结果 Artifact：{{ run.result_artifact_refs.map((item) => item.name || item.id).join('、') }}</small>
+                  <p v-if="run.error_message" class="runtime-error">{{ run.error_code }}：{{ run.error_message }}</p>
+                  <p v-else-if="run.result_text" class="runtime-result-text">{{ run.result_text }}</p>
+                </div>
+              </div>
+              <NEmpty v-else description="暂无 Run" />
+              <h4>证据</h4>
+              <div v-if="runtimeEvidence.length" class="runtime-evidence-list">
+                <div v-for="item in runtimeEvidence" :key="item.evidence_id" class="runtime-evidence-item"><NTag size="small" :bordered="false">{{ item.source_kind }}</NTag><strong>{{ item.title || item.source_id }}</strong><p>{{ item.excerpt }}</p><small>{{ item.citation || item.locator }}</small></div>
+              </div>
+              <NEmpty v-else description="当前 Group 没有可展示证据" />
+            </div>
+            <NEmpty v-else description="选择左侧 Group 查看 Run、依赖和证据" />
+          </NCard>
+        </div>
+        <NCard class="detail-card runtime-retrieval-card" :bordered="false">
+          <div class="section-heading-row"><div><h3>统一检索</h3><p>调试当前 Runtime 的记忆、会话、网页、工作区和结构化来源；结果只展示带来源证据。</p></div><NTag size="small" :bordered="false">{{ runtimeUserID || 'webui' }}</NTag></div>
+          <div class="data-toolbar runtime-retrieval-toolbar"><NInput v-model:value="retrievalQuery" clearable placeholder="输入要检索的问题或关键词" @keyup.enter="runRetrievalSearch" /><NSelect v-model:value="retrievalSourceKinds" multiple :options="retrievalSourceOptions" placeholder="检索来源" style="min-width: 250px" /><NInput v-model:value="retrievalTopK" style="width: 90px" placeholder="TopK" /><NButton type="primary" :loading="retrievalLoading" @click="runRetrievalSearch">检索</NButton></div>
+          <div v-if="retrievalResult" class="runtime-retrieval-result"><div class="runtime-counts"><span>证据 {{ retrievalResult.items.length }}</span><span>部分成功 {{ retrievalResult.partial ? '是' : '否' }}</span><span>缓存 {{ retrievalResult.cached ? '命中' : '未命中' }}</span></div><div v-if="retrievalResult.failures?.length" class="runtime-error">{{ retrievalResult.failures.map((item) => `${item.source_kind}: ${item.message}`).join('；') }}</div><div v-for="item in retrievalResult.items" :key="item.evidence_id" class="runtime-evidence-item"><NTag size="small" :bordered="false">{{ item.source_kind }}</NTag><strong>{{ item.title || item.source_id }}</strong><p>{{ item.excerpt }}</p><small>{{ item.citation || item.locator }}</small></div></div>
+          <NEmpty v-else description="尚未执行检索" />
+        </NCard>
+        <NCard class="detail-card runtime-event-card" :bordered="false">
+          <div class="section-heading-row"><div><h3>实时事件</h3><p>只展示结构化生命周期、检索和工具状态，不把流式增量拆成聊天消息。</p></div><NSpace align="center"><NButton size="small" secondary @click="runtimeEventAutoScroll = !runtimeEventAutoScroll">{{ runtimeEventAutoScroll ? '自动滚动' : '手动滚动' }}</NButton><NTag size="small" :bordered="false" :type="runtimeEventConnected ? 'success' : 'default'">{{ runtimeEventConnected ? 'LIVE' : '等待连接' }}</NTag></NSpace></div>
+          <div v-if="runtimeEvents.length" ref="runtimeEventTerminal" class="runtime-event-list"><div v-for="event in runtimeEvents" :key="`${event.sequence}-${event.id}`" class="runtime-event-line"><code>{{ event.sequence }}</code><span>{{ formatRuntimeEvent(event) }}</span></div></div>
+          <NEmpty v-else description="暂无实时事件；选择 Invocation 后切换到本页" />
+        </NCard>
       </NTabPane>
 
       <NTabPane name="logs" tab="实时日志">

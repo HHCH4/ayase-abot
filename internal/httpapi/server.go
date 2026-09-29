@@ -52,6 +52,8 @@ type Server struct {
 	webSearch                  *websearch.Manager
 	logs                       *logging.Store
 	runtime                    *agentruntime.Coordinator
+	subAgents                  agent.SubAgentRuntimeStore
+	retrieval                  *agent.RetrievalOrchestrator
 	toolRegistry               *agent.ToolRegistry
 	eventDelivery              http.Handler
 	eventStatus                http.Handler
@@ -161,6 +163,18 @@ func (s *Server) SetLogStore(store *logging.Store) {
 // SetRuntimeCoordinator 装配独立于 HTTP 请求生命周期的 Agent Runtime。
 func (s *Server) SetRuntimeCoordinator(coordinator *agentruntime.Coordinator) {
 	s.runtime = coordinator
+}
+
+// SetSubAgentRuntimeStore 装配只读任务树查询所需的 Group/Run 仓储；执行权限和
+// 子 Agent 生命周期仍由 Kernel/Manager 管理，HTTP 层不直接启动子任务。
+func (s *Server) SetSubAgentRuntimeStore(store agent.SubAgentRuntimeStore) {
+	s.subAgents = store
+}
+
+// SetRetrievalOrchestrator 装配只读检索查询和刷新接口；HTTP 层只负责传递
+// 结构化请求，来源权限、并发和缓存边界仍由编排器执行。
+func (s *Server) SetRetrievalOrchestrator(orchestrator *agent.RetrievalOrchestrator) {
+	s.retrieval = orchestrator
 }
 
 // SetToolRegistry exposes the public, metadata-only catalog used by the
@@ -393,6 +407,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/bots/{id}/start", s.startBot)
 	mux.HandleFunc("POST /api/v1/bots/{id}/stop", s.stopBot)
 	mux.HandleFunc("POST /api/v1/bots/{id}/restart", s.restartBot)
+	mux.HandleFunc("GET /api/v1/bots/{id}/runtime", s.getBotRuntimeOverview)
+	mux.HandleFunc("GET /api/v1/bots/{id}/runtime/relations", s.listBotRuntimeRelations)
+	mux.HandleFunc("PUT /api/v1/bots/{id}/runtime/relations/{scope_type}/{scope_id}", s.saveBotRuntimeRelation)
+	mux.HandleFunc("DELETE /api/v1/bots/{id}/runtime/relations/{scope_type}/{scope_id}", s.deleteBotRuntimeRelation)
 	mux.HandleFunc("GET /api/v1/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/v1/settings/default-model", s.setDefaultModel)
 	mux.HandleFunc("GET /api/v1/config/schema", s.configSchema)
@@ -508,6 +526,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/artifacts", s.listArtifacts)
 	mux.HandleFunc("GET /api/v1/artifacts/usage", s.getArtifactUsage)
 	mux.HandleFunc("POST /api/v1/artifacts/maintenance", s.runArtifactMaintenance)
+	mux.HandleFunc("GET /api/v1/artifacts/{id}/document", s.getArtifactDocument)
 	mux.HandleFunc("GET /api/v1/artifacts/{id}", s.getArtifact)
 	mux.HandleFunc("GET /api/v1/artifacts/{id}/content", s.getArtifactContent)
 	mux.HandleFunc("GET /api/v1/artifacts/{id}/preview", s.getArtifactPreview)
@@ -548,6 +567,26 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/invocations/{id}/contracts", s.listInvocationContracts)
 	mux.HandleFunc("PUT /api/v1/invocations/{id}/contract", s.updateInvocationContract)
 	mux.HandleFunc("GET /api/v1/invocations/{id}/events", s.listInvocationEvents)
+	mux.HandleFunc("GET /api/v1/invocations/{id}/subagents", s.listInvocationSubAgents)
+	mux.HandleFunc("GET /api/v1/runtime/subagent-groups/{id}", s.getSubAgentGroup)
+	mux.HandleFunc("GET /api/v1/runtime/subagent-groups/{id}/evidence", s.listSubAgentEvidence)
+	mux.HandleFunc("POST /api/v1/runtime/retrieval/search", s.searchRetrieval)
+	mux.HandleFunc("POST /api/v1/runtime/retrieval/refresh", s.refreshRetrieval)
+	// 文档中的无版本路径保留为同一进程内别名，避免管理台和外部内网脚本
+	// 因 API 版本前缀差异各自实现一套检索协议。
+	mux.HandleFunc("POST /api/runtime/retrieval/search", s.searchRetrieval)
+	mux.HandleFunc("POST /api/runtime/retrieval/refresh", s.refreshRetrieval)
+	// Runtime 文档使用无版本路径；与 v1 路由指向同一处理器，避免两套
+	// 生命周期协议在管理台和内网脚本中产生语义漂移。
+	// 无版本 Runtime 事件接口按文档提供 SSE；历史 v1 路径仍保留分页 JSON
+	// 列表，避免旧管理台把长连接当成一次性查询。
+	mux.HandleFunc("GET /api/runtime/invocations/{id}/events", s.streamInvocation)
+	mux.HandleFunc("GET /api/runtime/invocations/{id}/subagents", s.listInvocationSubAgents)
+	mux.HandleFunc("GET /api/runtime/subagent-groups/{id}", s.getSubAgentGroup)
+	mux.HandleFunc("GET /api/runtime/subagent-groups/{id}/evidence", s.listSubAgentEvidence)
+	mux.HandleFunc("POST /api/runtime/approvals/{id}/resolve", s.resolveApproval)
+	mux.HandleFunc("POST /api/runtime/invocations/{id}/cancel", s.cancelInvocation)
+	mux.HandleFunc("DELETE /api/conversations/{id}", s.deleteConversation)
 	mux.HandleFunc("GET /api/v1/invocations/{id}/trace", s.getInvocationTrace)
 	mux.HandleFunc("GET /api/v1/invocations/{id}/usage", s.getInvocationUsage)
 	mux.HandleFunc("POST /api/v1/evals/runs", s.createEvalRun)
@@ -693,6 +732,7 @@ func (s *Server) Handler() http.Handler {
 	}
 	mux.HandleFunc("GET /api/v1/approvals", s.listApprovals)
 	mux.HandleFunc("POST /api/v1/approvals/{id}/resolve", s.resolveApproval)
+	mux.HandleFunc("GET /api/runtime/approvals", s.listApprovals)
 	mux.HandleFunc("GET /api/v1/sessions", s.listSessions)
 	mux.HandleFunc("DELETE /api/v1/sessions/{id}", s.deleteSession)
 	mux.Handle("/", webui.Handler())
@@ -1564,6 +1604,8 @@ func writeError(writer http.ResponseWriter, err error) {
 		status = http.StatusConflict
 	case errors.Is(err, bot.ErrClosed):
 		status = http.StatusConflict
+	case errors.Is(err, bot.ErrRelationConflict):
+		status = http.StatusConflict
 	case errors.Is(err, provider.ErrNotFound):
 		status = http.StatusNotFound
 	case errors.Is(err, conversation.ErrNotFound):
@@ -1713,7 +1755,22 @@ func writeError(writer http.ResponseWriter, err error) {
 			status = http.StatusInternalServerError
 		}
 	}
-	writeJSON(writer, status, map[string]string{"error": err.Error()})
+	payload := map[string]any{"error": err.Error()}
+	var runtimeErr *agent.SubAgentRuntimeError
+	if errors.As(err, &runtimeErr) && runtimeErr != nil {
+		payload["code"] = runtimeErr.Code
+		payload["retryable"] = runtimeErr.Retryable
+		if runtimeErr.RequestID != "" {
+			payload["request_id"] = runtimeErr.RequestID
+		}
+		if runtimeErr.GroupID != "" {
+			payload["group_id"] = runtimeErr.GroupID
+		}
+		if runtimeErr.RunID != "" {
+			payload["run_id"] = runtimeErr.RunID
+		}
+	}
+	writeJSON(writer, status, payload)
 }
 
 func isHTTPMaxBytesError(err error) bool {

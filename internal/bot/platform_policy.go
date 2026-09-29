@@ -53,21 +53,13 @@ func (m *Manager) sendPlatformPreAck(ctx context.Context, message Message, polic
 	if !policy.TelegramPreAckEnabled || message.Platform != TypeTelegram {
 		return
 	}
-	m.mu.RLock()
-	entry, running := m.runtimes[message.AdapterID]
-	m.mu.RUnlock()
-	if !running {
-		return
-	}
-	ack, ok := entry.platform.(interface {
-		PreAcknowledge(context.Context, Message, string) error
-	})
-	if !ok {
-		return
-	}
+	// 预回应也是平台副作用，必须进入统一动作计划，不能绕过幂等、权限
+	// 和审计边界直接调用适配器；这样重启或重复事件不会重复发送表情。
 	ackCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := ack.PreAcknowledge(ackCtx, message, policy.TelegramPreAckEmoji); err != nil {
+	if _, err := m.DispatchAction(ackCtx, PlatformAction{
+		Type: "add_reaction", Message: message, TargetID: message.ReplyMessageID, Emoji: policy.TelegramPreAckEmoji,
+	}); err != nil {
 		slog.Warn("Telegram 预回应表情失败", "adapter_id", message.AdapterID, "chat_id", message.ChatID, "error", err)
 	}
 }

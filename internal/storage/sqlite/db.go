@@ -5,8 +5,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"Abot/internal/agent"
 	agentruntime "Abot/internal/agent/runtime"
 	"Abot/internal/artifact"
 	"Abot/internal/bot"
@@ -40,17 +42,77 @@ func Open(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("创建数据目录失败: %w", err)
 	}
 	dbPath := filepath.Join(dataDir, "abot.db")
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{Logger: newDatabaseLogger()})
+	// 业务仓储与 ADK 会话共用同一个连接池，避免同一进程的独立写连接互相争锁。
+	// 锁等待参数必须写入 DSN，才能覆盖连接池以后新建的每条 SQLite 连接。
+	dsn := dbPath + "?_pragma=busy_timeout(15000)&_txlock=immediate"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: newDatabaseLogger()})
 	if err != nil {
 		return nil, fmt.Errorf("打开 SQLite 失败: %w", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("取得 SQLite 连接池失败: %w", err)
+	}
+	// 树莓派内存有限；单连接既限制连接数，也让业务写入和会话事件顺序执行。
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
+	// WAL 允许其他进程的读取与写入并行，并在所有迁移开始前统一数据库日志模式。
+	var journalMode string
+	if err := db.Raw("PRAGMA journal_mode=WAL").Scan(&journalMode).Error; err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("启用 SQLite WAL 失败: %w", err)
+	}
+	if journalMode != "wal" {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("启用 SQLite WAL 失败: 当前模式 %q", journalMode)
+	}
+	backupCreated, err := backupRuntimeMigrationStateIfNeeded(db, dbPath)
+	if err != nil {
+		_ = sqlDB.Close()
+		return nil, err
 	}
 	// 这次破坏性架构切换删除独立子 Agent 编排表及其历史；新执行记录只属于父 Invocation。
 	if err := db.Migrator().DropTable("abot_agent_subagent_evidence", "abot_agent_subagent_runs", "abot_agent_subagent_groups"); err != nil {
 		return nil, fmt.Errorf("删除旧子 Agent 历史表失败: %w", err)
 	}
 	// 所有新增的管理台数据都纳入同一次迁移，保证旧数据目录升级后仍可直接启动。
-	if err := db.AutoMigrate(&providerRow{}, &modelRow{}, &capabilityObservationRow{}, &settingRow{}, &workspaceRow{}, &workspaceOperationRow{}, &workspaceCommandRunRow{}, &workspaceCommandOutputChunkRow{}, &remoteTargetRow{}, &conversationRow{}, &botRow{}, &botSourceNameRow{}, &botMessageSourceRow{}, &configProfileRow{}, &configRevisionRow{}, &configBindingRow{}, &systemSettingsRow{}, &personaRow{}, &personaRevisionRow{}, &personaBindingRow{}, &memoryRow{}, &invocationRow{}, &invocationResumeRow{}, &invocationResumeOutboxRow{}, &worktreeBaselineRow{}, &agentEventRow{}, &runtimeEventOutboxRow{}, &runtimeEventDeliveryInboxRow{}, &runtimeEventDeliveryTransactionRow{}, &runtimeCheckpointDeliveryInboxRow{}, &runtimeCheckpointDeliveryOutboxRow{}, &runtimeCheckpointDeliveryTransactionRow{}, &runtimeApprovalRejectionDeliveryOutboxRow{}, &runtimeApprovalRejectionDeliveryInboxRow{}, &runtimeApprovalRejectionDeliveryTransactionRow{}, &runtimeConfigDeliveryInboxRow{}, &runtimeConfigDeliveryOutboxRow{}, &runtimeConfigDeliveryTransactionRow{}, &runtimeConfigDirectoryRow{}, &runtimeConfigDirectoryOutboxRow{}, &runtimeConfigDirectoryFanoutRow{}, &runtimeConfigDirectoryRebindPlanRow{}, &runtimeConfigDirectoryRebindConfirmationRow{}, &runtimeConfigDirectoryRebindApplyRow{}, &runtimeConfigDirectoryRebindMultiConfirmationRow{}, &runtimeConfigDirectoryRebindMultiApplyRow{}, &runtimeConfigDirectoryRebindInboxRow{}, &runtimeDeliveryAttemptRow{}, &runtimeDeliveryGroupRow{}, &runtimeDeliveryGroupTransactionRow{}, &runtimeDeliveryGroupFenceRow{}, &runtimeDeliveryGroupSettlementRow{}, &runtimeDeliveryGroupSagaRow{}, &runtimeDeliveryCompensationRow{}, &approvalRow{}, &toolCallRow{}, &taskPlanRow{}, &taskContractRow{}, &instructionSnapshotSetRow{}, &contextManifestRow{}, &workingSetRow{}, &verificationRunRow{}, &runtimeSnapshotRow{}, &toolSetSnapshotRow{}, &modelCapabilitySnapshotRow{}, &evalRunRow{}, &artifactRow{}, &artifactObjectDeletionRow{}, &botGroupAdminRow{}, &botCommandPolicyRow{}, &botCommandAuditRow{}, &botSourceNameRow{}, &botMessageSourceRow{}, &sessionRuleRow{}, &sessionRuleGroupRow{}, &scheduledTaskRow{}, &webSearchServiceRow{}, &webSearchUsageRow{}); err != nil {
+	if err := db.AutoMigrate(&providerRow{}, &modelRow{}, &capabilityObservationRow{}, &settingRow{}, &workspaceRow{}, &workspaceOperationRow{}, &workspaceCommandRunRow{}, &workspaceCommandOutputChunkRow{}, &remoteTargetRow{}, &conversationRow{}, &botRow{}, &botSourceNameRow{}, &botMessageSourceRow{}, &configProfileRow{}, &configRevisionRow{}, &configBindingRow{}, &systemSettingsRow{}, &personaRow{}, &personaRevisionRow{}, &personaBindingRow{}, &memoryRow{}, &invocationRow{}, &invocationResumeRow{}, &invocationResumeOutboxRow{}, &worktreeBaselineRow{}, &agentEventRow{}, &runtimeEventOutboxRow{}, &runtimeEventDeliveryInboxRow{}, &runtimeEventDeliveryTransactionRow{}, &runtimeCheckpointDeliveryInboxRow{}, &runtimeCheckpointDeliveryOutboxRow{}, &runtimeCheckpointDeliveryTransactionRow{}, &runtimeApprovalRejectionDeliveryOutboxRow{}, &runtimeApprovalRejectionDeliveryInboxRow{}, &runtimeApprovalRejectionDeliveryTransactionRow{}, &runtimeConfigDeliveryInboxRow{}, &runtimeConfigDeliveryOutboxRow{}, &runtimeConfigDeliveryTransactionRow{}, &runtimeConfigDirectoryRow{}, &runtimeConfigDirectoryOutboxRow{}, &runtimeConfigDirectoryFanoutRow{}, &runtimeConfigDirectoryRebindPlanRow{}, &runtimeConfigDirectoryRebindConfirmationRow{}, &runtimeConfigDirectoryRebindApplyRow{}, &runtimeConfigDirectoryRebindMultiConfirmationRow{}, &runtimeConfigDirectoryRebindMultiApplyRow{}, &runtimeConfigDirectoryRebindInboxRow{}, &runtimeDeliveryAttemptRow{}, &runtimeDeliveryGroupRow{}, &runtimeDeliveryGroupTransactionRow{}, &runtimeDeliveryGroupFenceRow{}, &runtimeDeliveryGroupSettlementRow{}, &runtimeDeliveryGroupSagaRow{}, &runtimeDeliveryCompensationRow{}, &approvalRow{}, &toolCallRow{}, &taskPlanRow{}, &taskContractRow{}, &instructionSnapshotSetRow{}, &contextManifestRow{}, &workingSetRow{}, &verificationRunRow{}, &runtimeSnapshotRow{}, &toolSetSnapshotRow{}, &modelCapabilitySnapshotRow{}, &evalRunRow{}, &artifactRow{}, &artifactObjectDeletionRow{}, &botGroupAdminRow{}, &botCommandPolicyRow{}, &botCommandAuditRow{}, &botSourceNameRow{}, &botMessageSourceRow{}, &botRuntimeInboxRow{}, &botRuntimeContextRow{}, &botAdminRouteRow{}, &botDeleteConfirmationRow{}, &botApprovalMessageBindingRow{}, &sessionRuleRow{}, &sessionRuleGroupRow{}, &scheduledTaskRow{}, &webSearchServiceRow{}, &webSearchUsageRow{}); err != nil {
 		return nil, fmt.Errorf("迁移 Abot 表失败: %w", err)
+	}
+	if err := db.AutoMigrate(&botInstanceStateRow{}, &botRuntimeSourceRow{}, &botRelationRow{}, &botRuntimeTurnRow{}, &botRuntimeTurnEventRow{}, &botRuntimeDecisionRow{}, &botPlatformEventRow{}, &botActionPlanRow{}, &botActionRow{}, &botApprovalDeliveryRow{}, &subAgentGroupRow{}, &subAgentRunRow{}); err != nil {
+		return nil, fmt.Errorf("迁移 Bot Runtime 状态表失败: %w", err)
+	}
+	if !backupCreated {
+		backupCreated, err = backupRuntimeMigrationStateIfNeeded(db, dbPath)
+		if err != nil {
+			_ = sqlDB.Close()
+			return nil, err
+		}
+	}
+	// 审批引用必须按 Bot、平台和聊天联合唯一；旧版本仅按 message_id
+	// 唯一会导致不同 Bot 的相同平台消息 ID 无法建立映射。
+	if db.Migrator().HasIndex(&botApprovalMessageBindingRow{}, "idx_bot_approval_message_ref") {
+		if err := db.Migrator().DropIndex(&botApprovalMessageBindingRow{}, "idx_bot_approval_message_ref"); err != nil {
+			return nil, fmt.Errorf("迁移审批引用联合索引失败: %w", err)
+		}
+	}
+	if err := migrateLegacyScheduledTasks(db); err != nil {
+		return nil, err
+	}
+	// 已经存在于 Follow-up 表中的旧 active 状态也一次性转换，避免升级后
+	// 同一张表同时出现两套生命周期枚举。
+	if err := db.Model(&scheduledTaskRow{}).Where("status = ?", "active").Update("status", string(schedule.StatusScheduled)).Error; err != nil {
+		return nil, fmt.Errorf("迁移 Follow-up active 状态失败: %w", err)
+	}
+	// Inbox 正文消费后已经清空；定期删除旧占位行和行为决策，避免常驻树莓派数据库无限增长。
+	if err := db.Where("status = ? AND updated_at < ?", "processed", time.Now().UTC().AddDate(0, 0, -7)).Delete(&botRuntimeInboxRow{}).Error; err != nil {
+		return nil, fmt.Errorf("清理 Bot Runtime Inbox 失败: %w", err)
+	}
+	if err := db.Where("created_at < ?", time.Now().UTC().AddDate(0, 0, -90)).Delete(&botRuntimeDecisionRow{}).Error; err != nil {
+		return nil, fmt.Errorf("清理 Bot Runtime 行为决策失败: %w", err)
+	}
+	if err := db.Where("received_at < ?", time.Now().UTC().AddDate(0, 0, -90)).Delete(&botPlatformEventRow{}).Error; err != nil {
+		return nil, fmt.Errorf("清理 Bot Runtime 平台事件失败: %w", err)
 	}
 	if err := db.Where("created_at < ?", time.Now().UTC().AddDate(0, 0, -90)).Delete(&webSearchUsageRow{}).Error; err != nil {
 		return nil, fmt.Errorf("清理过期网页搜索用量失败: %w", err)
@@ -67,10 +129,9 @@ func Open(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("终结旧子 Agent 等待任务失败: %w", err)
 	}
 
-	// ADK 自带的 database.Service 负责会话事件、State 和 EventCompaction 的持久化。
-	// ADK 自己创建 gorm 实例；把同一个 logger 传进去，否则它的
-	// "record not found" 仍会以错误级别刷屏。
-	sessionService, err := adksessiondb.NewSessionService(sqlite.Open(dbPath), &gorm.Config{Logger: newDatabaseLogger()})
+	// ADK 保留自己的 GORM 实例，但复用业务仓储的连接池，避免重新打开独立写连接。
+	// 继续传入同一个日志配置，防止正常的 "record not found" 被记录成错误。
+	sessionService, err := adksessiondb.NewSessionService(sqlite.Dialector{Conn: sqlDB}, &gorm.Config{Logger: newDatabaseLogger()})
 	if err != nil {
 		return nil, fmt.Errorf("创建 ADK 会话服务失败: %w", err)
 	}
@@ -78,6 +139,85 @@ func Open(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("迁移 ADK 会话表失败: %w", err)
 	}
 	return &Store{db: db, sessionService: sessionService}, nil
+}
+
+// backupRuntimeMigrationStateIfNeeded 在删除旧表、旧事件或旧状态前创建可直接
+// 恢复的 SQLite 快照。只在确实存在破坏性迁移目标时执行，避免每次普通启动都
+// 留下一份无意义的备份文件；备份失败则阻止启动，不能带着不可恢复的迁移继续。
+func backupRuntimeMigrationStateIfNeeded(db *gorm.DB, dbPath string) (bool, error) {
+	needed, err := runtimeMigrationNeedsBackup(db)
+	if err != nil {
+		return false, fmt.Errorf("检查 SQLite 破坏性迁移目标失败: %w", err)
+	}
+	if !needed {
+		return false, nil
+	}
+	absDBPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		return false, fmt.Errorf("解析 SQLite 路径失败: %w", err)
+	}
+	backupPath := fmt.Sprintf("%s.pre-runtime-migration-%d.db", absDBPath, time.Now().UTC().UnixNano())
+	quotedPath := strings.ReplaceAll(backupPath, "'", "''")
+	if err := db.Exec("VACUUM INTO '" + quotedPath + "'").Error; err != nil {
+		return false, fmt.Errorf("创建 SQLite 迁移备份失败: %w", err)
+	}
+	if err := os.Chmod(backupPath, 0o600); err != nil {
+		return false, fmt.Errorf("设置 SQLite 迁移备份权限失败: %w", err)
+	}
+	stat, err := os.Stat(backupPath)
+	if err != nil {
+		return false, fmt.Errorf("检查 SQLite 迁移备份失败: %w", err)
+	}
+	if stat.Size() == 0 {
+		return false, fmt.Errorf("SQLite 迁移备份为空: %s", backupPath)
+	}
+	log.Printf("已创建 SQLite 破坏性迁移备份: %s", backupPath)
+	return true, nil
+}
+
+// runtimeMigrationNeedsBackup 汇总所有会丢弃历史或改变生命周期的入口。
+// 查询只读取存在的表，兼容从旧版本直接升级到当前版本的数据目录。
+func runtimeMigrationNeedsBackup(db *gorm.DB) (bool, error) {
+	for _, table := range []string{
+		"abot_agent_subagent_evidence",
+		"abot_agent_subagent_runs",
+		"abot_agent_subagent_groups",
+		"abot_scheduled_tasks",
+	} {
+		if db.Migrator().HasTable(table) {
+			return true, nil
+		}
+	}
+
+	cutoffInbox := time.Now().UTC().AddDate(0, 0, -7)
+	cutoffHistory := time.Now().UTC().AddDate(0, 0, -90)
+	checks := []struct {
+		table string
+		query string
+		args  []any
+	}{
+		{"abot_bot_follow_ups", "SELECT EXISTS (SELECT 1 FROM abot_bot_follow_ups WHERE status = 'active')", nil},
+		{"abot_agent_event_outbox", "SELECT EXISTS (SELECT 1 FROM abot_agent_event_outbox WHERE type LIKE ? OR type LIKE ?)", []any{"subagent.%", "retrieval.%"}},
+		{"abot_agent_events", "SELECT EXISTS (SELECT 1 FROM abot_agent_events WHERE type LIKE ? OR type LIKE ?)", []any{"subagent.%", "retrieval.%"}},
+		{"abot_agent_invocations", "SELECT EXISTS (SELECT 1 FROM abot_agent_invocations WHERE status = 'waiting_subagents')", nil},
+		{"abot_bot_runtime_inbox", "SELECT EXISTS (SELECT 1 FROM abot_bot_runtime_inbox WHERE status = 'processed' AND updated_at < ?)", []any{cutoffInbox}},
+		{"abot_bot_runtime_decisions", "SELECT EXISTS (SELECT 1 FROM abot_bot_runtime_decisions WHERE created_at < ?)", []any{cutoffHistory}},
+		{"abot_bot_platform_events", "SELECT EXISTS (SELECT 1 FROM abot_bot_platform_events WHERE received_at < ?)", []any{cutoffHistory}},
+		{"abot_web_search_usage", "SELECT EXISTS (SELECT 1 FROM abot_web_search_usage WHERE created_at < ?)", []any{cutoffHistory}},
+	}
+	for _, check := range checks {
+		if !db.Migrator().HasTable(check.table) {
+			continue
+		}
+		var exists bool
+		if err := db.Raw(check.query, check.args...).Scan(&exists).Error; err != nil {
+			return false, fmt.Errorf("检查表 %s 失败: %w", check.table, err)
+		}
+		if exists {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // RuntimeRepository 返回 Agent Runtime 的 Invocation/Event/Approval/TaskPlan 仓储。
@@ -143,6 +283,17 @@ func (s *Store) ProviderRepository() provider.Repository {
 // BotRepository 返回平台机器人连接仓储。
 func (s *Store) BotRepository() bot.Repository {
 	return &botRepository{db: s.db}
+}
+
+// BotRuntimeRepository 返回平台机器人持久 Inbox、来源上下文和管理员路由仓储。
+func (s *Store) BotRuntimeRepository() bot.RuntimeStateRepository {
+	return &botRuntimeRepository{db: s.db}
+}
+
+// SubAgentRuntimeRepository 返回统一子 Agent Group/Run 的 SQLite 仓储，供
+// Manager 保存队列、结果屏障和重启后的查询状态。
+func (s *Store) SubAgentRuntimeRepository() agent.SubAgentRuntimeStore {
+	return &botRuntimeRepository{db: s.db}
 }
 
 // WorkspaceRepository 返回工作区配置和操作审计仓储。
@@ -223,7 +374,7 @@ func (s *Store) SessionService() session.Service {
 	return s.sessionService
 }
 
-// Close 关闭业务数据库连接；ADK 服务随进程退出释放其连接。
+// Close 关闭业务仓储和 ADK 会话服务共同使用的数据库连接池。
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
